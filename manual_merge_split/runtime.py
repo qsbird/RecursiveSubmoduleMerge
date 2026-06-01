@@ -154,6 +154,22 @@ def add_merge_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--no-confirm-after-conflict-tool",
+        action="store_true",
+        help=(
+            "Continue automatically after the conflict tool exits. "
+            "By default, the workflow waits for manual confirmation before staging the file."
+        ),
+    )
+    parser.add_argument(
+        "--enable-cross-submodule-moves",
+        action="store_true",
+        help=(
+            "Enable experimental detection and merging of files moved across submodule boundaries. "
+            "Disabled by default."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print executed commands and key progress information.",

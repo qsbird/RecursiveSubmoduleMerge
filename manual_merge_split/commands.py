@@ -113,6 +113,25 @@ def can_skip_failed_branch(context: MergeContext, completed: bool) -> bool:
     return all(entry.category == "missing_submodule_commit" for entry in context.report_entries)
 
 
+def refresh_submodules_after_root_checkout(
+    repo_path: Path,
+    ops: ManualRepositoryOps,
+    preserved_dirty_paths_by_repo: dict[Path, set[str]],
+) -> None:
+    preserved_paths = preserved_dirty_paths_by_repo.get(repo_path.resolve(), set())
+    if not preserved_paths:
+        ops.update_submodules(repo_path)
+        return
+
+    update_paths = [
+        submodule_path
+        for submodule_path in ops.get_submodule_paths(repo_path)
+        if submodule_path not in preserved_paths
+    ]
+    if update_paths:
+        ops.update_submodules(repo_path, paths=update_paths)
+
+
 def process_repository(
     repo_path: Path,
     context: MergeContext,
@@ -168,16 +187,20 @@ def process_repository(
             path for path in file_conflicts if path not in resolved_moved_away_set
         ]
 
-    submodule_move_infos = cross_submodule_moves_service.collect_submodule_move_candidate_info(repo_path, submodule_conflicts)
-    submodule_move_info_by_path = {
-        info.path: info
-        for info in submodule_move_infos
-    }
-    cross_submodule_moves = cross_submodule_moves_service.collect_cross_submodule_moves(
-        repo_path,
-        submodule_conflicts,
-        candidate_infos=submodule_move_infos,
-    )
+    submodule_move_infos = []
+    submodule_move_info_by_path = {}
+    cross_submodule_moves = []
+    if context.enable_cross_submodule_moves:
+        submodule_move_infos = cross_submodule_moves_service.collect_submodule_move_candidate_info(repo_path, submodule_conflicts)
+        submodule_move_info_by_path = {
+            info.path: info
+            for info in submodule_move_infos
+        }
+        cross_submodule_moves = cross_submodule_moves_service.collect_cross_submodule_moves(
+            repo_path,
+            submodule_conflicts,
+            candidate_infos=submodule_move_infos,
+        )
     moved_away_by_submodule: dict[str, set[str]] = {}
     moved_here_by_submodule: dict[str, list[CrossSubmoduleMove]] = {}
     for move in cross_submodule_moves:
@@ -452,6 +475,8 @@ def make_merge_context(args: Any, repo_path: Path, ops: ManualRepositoryOps) -> 
         file_conflict_mode=args.file_conflict_mode,
         conflict_tool_command=args.conflict_tool_command,
         conflict_tool_timeout_seconds=None if timeout_seconds <= 0 else timeout_seconds,
+        confirm_after_conflict_tool=not getattr(args, "no_confirm_after_conflict_tool", False),
+        enable_cross_submodule_moves=bool(getattr(args, "enable_cross_submodule_moves", False)),
     )
 
 
@@ -539,6 +564,7 @@ def run_merge(
         initial_context = replace(base_context, merge_branch=merge_branches[0])
         if base_remote_branch:
             ops.create_root_branch(repo_path, base_remote_branch, initial_context.work_branch)
+            refresh_submodules_after_root_checkout(repo_path, ops, preserved_dirty_paths_by_repo)
         checkpoint = ops.collect_repo_snapshot(repo_path)
 
         for index, merge_branch in enumerate(merge_branches):

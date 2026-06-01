@@ -204,6 +204,12 @@ class JsonReport:
         except OSError:
             pass
 
+    def progress(self, message: str) -> None:
+        try:
+            print(f"[{now_iso()}] {message}", flush=True)
+        except OSError:
+            pass
+
     @staticmethod
     def console_tail(value: str, *, max_lines: int = 3, max_chars: int = 500) -> str:
         lines = common.split_lines(value)
@@ -544,6 +550,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help="source branch/ref to merge from; repeat to merge multiple branches sequentially",
     )
+    parser.add_argument(
+        "--multi-source",
+        "--multi_source",
+        dest="multi_source",
+        type=common.parse_bool,
+        default=False,
+        help="split each --source value by comma for multi-branch merge compatibility",
+    )
     parser.add_argument("--target", help="target branch/ref to merge into")
     parser.add_argument("--repo_path", help="main repository path")
     parser.add_argument("--report", default="merge-report.json", help="JSON report path")
@@ -708,10 +722,21 @@ def normalize_args(args: argparse.Namespace, job_id: str) -> None:
     if raw_sources is None:
         sources: list[str] = []
     elif isinstance(raw_sources, list):
-        sources = [str(source).strip() for source in raw_sources if str(source).strip()]
+        sources = []
+        for raw_source in raw_sources:
+            source = str(raw_source).strip()
+            if not source:
+                continue
+            if getattr(args, "multi_source", False):
+                sources.extend(part.strip() for part in source.split(",") if part.strip())
+            else:
+                sources.append(source)
     else:
         source = str(raw_sources).strip()
-        sources = [source] if source else []
+        if getattr(args, "multi_source", False):
+            sources = [part.strip() for part in source.split(",") if part.strip()]
+        else:
+            sources = [source] if source else []
     args.sources = sources
     args.source = sources[0] if sources else None
     if args.publish_only:

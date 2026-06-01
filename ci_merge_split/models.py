@@ -19,6 +19,7 @@ class ExitCode:
     UNDEFINED_STATE = 7
     SYSTEM_EXCEPTION = 8
     PUBLISH_FAILED = 9
+    PARTIAL_SUCCESS = 10
 
 
 class Phase:

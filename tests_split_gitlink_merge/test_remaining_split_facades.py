@@ -172,6 +172,7 @@ class FakeCiReport:
         self.snapshots: list[dict[str, object]] = []
         self.log: list[str] = []
         self.console_messages: list[str] = []
+        self.progress_messages: list[str] = []
 
     def add_conflicts(self, conflicts: list[dict[str, object]]) -> None:
         self.conflicts.extend(conflicts)
@@ -190,6 +191,9 @@ class FakeCiReport:
 
     def console(self, message: str) -> None:
         self.console_messages.append(message)
+
+    def progress(self, message: str) -> None:
+        self.progress_messages.append(message)
 
     def set_success(self) -> None:
         self.data["status"] = "success"
@@ -532,6 +536,77 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             self.assertEqual(local_report.data["publish"], original_report.data["publish"])
             self.assertEqual(set(local_report.data), set(original_report.data))
 
+    def test_ci_runtime_multi_source_argument_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir()
+
+            repeated = ci_runtime.parse_arguments(
+                [
+                    "--source",
+                    "feature-a",
+                    "--source",
+                    "feature-b",
+                    "--target",
+                    "main",
+                    "--repo_path",
+                    str(repo),
+                ]
+            )
+            ci_runtime.normalize_args(repeated, "job-42")
+            ci_runtime.validate_args(repeated)
+            self.assertEqual(repeated.sources, ["feature-a", "feature-b"])
+            self.assertEqual(repeated.source, "feature-a")
+
+            comma_dash = ci_runtime.parse_arguments(
+                [
+                    "--multi-source",
+                    "1",
+                    "--source",
+                    "feature-a, feature-b,feature-c",
+                    "--target",
+                    "main",
+                    "--repo_path",
+                    str(repo),
+                ]
+            )
+            ci_runtime.normalize_args(comma_dash, "job-42")
+            ci_runtime.validate_args(comma_dash)
+            self.assertEqual(comma_dash.sources, ["feature-a", "feature-b", "feature-c"])
+            self.assertEqual(comma_dash.source, "feature-a")
+
+            comma_underscore = ci_runtime.parse_arguments(
+                [
+                    "--multi_source",
+                    "true",
+                    "--source",
+                    "feature-a,feature-b",
+                    "--source",
+                    "feature-c",
+                    "--target",
+                    "main",
+                    "--repo_path",
+                    str(repo),
+                ]
+            )
+            ci_runtime.normalize_args(comma_underscore, "job-42")
+            ci_runtime.validate_args(comma_underscore)
+            self.assertEqual(comma_underscore.sources, ["feature-a", "feature-b", "feature-c"])
+
+            default_single = ci_runtime.parse_arguments(
+                [
+                    "--source",
+                    "feature-a,feature-b",
+                    "--target",
+                    "main",
+                    "--repo_path",
+                    str(repo),
+                ]
+            )
+            ci_runtime.normalize_args(default_single, "job-42")
+            ci_runtime.validate_args(default_single)
+            self.assertEqual(default_single.sources, ["feature-a,feature-b"])
+
     def test_ci_runtime_git_runner_is_local(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo = Path(temp_dir)
@@ -557,6 +632,66 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             self.assertTrue(result.stdout.startswith("git version"))
             self.assertEqual(ctx.report.data["commands"][0]["cmd"][0], "git")
 
+    def _make_batch_context(self, output_dir: Path, *, failure_mode: str = "fail-fast") -> FakeCiContext:
+        ctx = FakeCiContext(output_dir)
+        ctx.args.sources = ["source-one", "source-two"]
+        ctx.args.source = "source-one"
+        ctx.args.batch_failure_mode = failure_mode
+        ctx.report.data["resolved"] = {
+            "source_ref": None,
+            "source_sha": None,
+            "target_ref": None,
+            "target_sha": None,
+            "merge_base_sha": None,
+            "result_sha": None,
+        }
+        ctx.report.data["batch"] = {
+            "enabled": True,
+            "source_count": 2,
+            "initial_target": ctx.args.target,
+            "original_target_ref": None,
+            "original_target_sha": None,
+            "final_result_sha": None,
+            "failure_step": None,
+            "steps": [],
+            "manual_publish": None,
+            "failure_mode": failure_mode,
+            "status": None,
+            "successful_steps": [],
+            "failed_steps": [],
+            "errors": [],
+        }
+        return ctx
+
+    def _batch_services(self) -> object:
+        class BatchGuards:
+            def preflight_check(
+                self,
+                _ctx: object,
+                _repo_path: Path,
+                source: str | None,
+                target: str | None,
+                label: str,
+                resolve_refs: bool,
+            ) -> ci_models.PreflightResult:
+                if not resolve_refs:
+                    return ci_models.PreflightResult(passed=True, checks=[], failed_checks=[])
+                return ci_models.PreflightResult(
+                    passed=True,
+                    checks=[],
+                    failed_checks=[],
+                    source_ref=f"refs/remotes/origin/{source}",
+                    source_sha=f"{source}-sha",
+                    target_ref=str(target),
+                    target_sha=f"{target}-sha",
+                    merge_base_sha=f"{source}-base",
+                )
+
+            def verify_repo_ready(self, _ctx: object, _repo_path: Path) -> tuple[bool, list[str]]:
+                return True, []
+
+        return types.SimpleNamespace(guards=BatchGuards())
+
     def test_ci_command_single_workflow_is_local(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "repo"
@@ -580,6 +715,169 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             self.assertEqual(merge_calls[0]["repo_path"], root)
             self.assertEqual(merge_calls[0]["source_sha"], "sourcesha")
             self.assertEqual(merge_calls[0]["target_sha"], "targetsha")
+            self.assertIn("SINGLE start source=source target=main", ctx.report.progress_messages)
+            self.assertIn("SINGLE success result=resultsha", ctx.report.progress_messages)
+
+    def test_ci_batch_progress_reports_minimal_step_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = self._make_batch_context(Path(temp_dir))
+            calls = 0
+
+            def merge_repo(_ctx: object, _repo_path: Path, **_kwargs: object) -> object:
+                nonlocal calls
+                calls += 1
+                return types.SimpleNamespace(result_sha=f"result-step-{calls}", strategy="recursive_gitlink_merge")
+
+            ci_commands.run_batch_workflow(ctx, self._batch_services(), merge_repo)
+
+            self.assertEqual(
+                ctx.report.progress_messages,
+                [
+                    "BATCH start sources=2 target=main mode=fail-fast",
+                    "STEP 1/2 start source=source-one target=main",
+                    "STEP 1/2 success result=result-step-1",
+                    "STEP 2/2 start source=source-two target=result-step-1",
+                    "STEP 2/2 success result=result-step-2",
+                    "BATCH success steps=[1, 2] result=result-step-2",
+                ],
+            )
+
+    def test_ci_batch_runtime_exception_marks_current_step_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = self._make_batch_context(Path(temp_dir))
+
+            def merge_repo(_ctx: object, _repo_path: Path, **_kwargs: object) -> object:
+                raise RuntimeError("boom")
+
+            with self.assertRaises(RuntimeError):
+                ci_commands.run_batch_workflow(ctx, self._batch_services(), merge_repo)
+
+            batch = ctx.report.data["batch"]
+            step = batch["steps"][0]
+            self.assertEqual(batch["status"], "failed")
+            self.assertEqual(batch["failure_step"], 1)
+            self.assertEqual(batch["successful_steps"], [])
+            self.assertEqual(batch["failed_steps"], [1])
+            self.assertEqual(step["status"], "failed")
+            self.assertIsNotNone(step["ended_at"])
+            self.assertEqual(step["failure"]["reason"], "SYSTEM_EXCEPTION")
+            self.assertEqual(step["failure"]["details"]["type"], "RuntimeError")
+            self.assertEqual(batch["errors"], [step["failure"]])
+
+    def test_ci_batch_ci_error_fail_fast_marks_batch_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = self._make_batch_context(Path(temp_dir))
+
+            def merge_repo(_ctx: object, _repo_path: Path, **_kwargs: object) -> object:
+                raise ci_models.CiMergeError(
+                    ci_models.ExitCode.ROOT_CONFLICT,
+                    ci_models.Phase.MERGING_ROOT,
+                    "TEST_CONFLICT",
+                    "synthetic conflict",
+                    restore_needed=False,
+                )
+
+            with self.assertRaises(ci_models.CiMergeError):
+                ci_commands.run_batch_workflow(ctx, self._batch_services(), merge_repo)
+
+            batch = ctx.report.data["batch"]
+            step = batch["steps"][0]
+            self.assertEqual(batch["status"], "failed")
+            self.assertEqual(batch["failure_step"], 1)
+            self.assertEqual(batch["failed_steps"], [1])
+            self.assertEqual(step["status"], "failed")
+            self.assertIsNotNone(step["ended_at"])
+            self.assertEqual(step["failure"]["reason"], "TEST_CONFLICT")
+            self.assertEqual(batch["errors"], [step["failure"]])
+
+    def test_ci_batch_continue_success_still_continues_after_ci_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = self._make_batch_context(Path(temp_dir), failure_mode="continue-success")
+            calls = 0
+
+            def merge_repo(_ctx: object, _repo_path: Path, **_kwargs: object) -> object:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise ci_models.CiMergeError(
+                        ci_models.ExitCode.ROOT_CONFLICT,
+                        ci_models.Phase.MERGING_ROOT,
+                        "TEST_CONFLICT",
+                        "synthetic conflict",
+                        restore_needed=False,
+                    )
+                return types.SimpleNamespace(result_sha="resultsha", strategy="clean_merge")
+
+            ci_commands.run_batch_workflow(ctx, self._batch_services(), merge_repo)
+
+            batch = ctx.report.data["batch"]
+            self.assertEqual(calls, 2)
+            self.assertEqual(batch["status"], "partial_success")
+            self.assertEqual(batch["failed_steps"], [1])
+            self.assertEqual(batch["successful_steps"], [2])
+            self.assertEqual(batch["steps"][0]["status"], "failed")
+            self.assertTrue(batch["steps"][0]["continued_after_failure"])
+            self.assertEqual(batch["steps"][1]["status"], "success")
+            self.assertEqual(ctx.report.data["status"], "partial_success")
+            self.assertEqual(ctx.report.data["exit_code"], ci_models.ExitCode.PARTIAL_SUCCESS)
+            self.assertIn("STEP 1/2 failed reason=TEST_CONFLICT", ctx.report.progress_messages)
+            self.assertIn("STEP 1/2 skipped continue_from=main-sha", ctx.report.progress_messages)
+            self.assertIn(
+                "BATCH partial_success success=[2] failed=[1] result=resultsha",
+                ctx.report.progress_messages,
+            )
+
+    def test_ci_batch_continue_success_skips_file_conflict_and_merges_later_gitlink_steps(self) -> None:
+        from split_gitlink_merge import Conflict, NonGitlinkConflictError
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = self._make_batch_context(Path(temp_dir), failure_mode="continue-success")
+            ctx.args.sources = [
+                "branch-1-gitlink",
+                "branch-2-gitlink",
+                "branch-3-file-conflict",
+                "branch-4-gitlink",
+                "branch-5-gitlink",
+            ]
+            ctx.args.source = ctx.args.sources[0]
+            ctx.report.data["batch"]["source_count"] = len(ctx.args.sources)
+            calls: list[dict[str, object]] = []
+
+            def merge_repo(_ctx: object, repo_path: Path, **kwargs: object) -> object:
+                step = len(calls) + 1
+                calls.append({"step": step, **kwargs})
+                if step == 3:
+                    conflict = Conflict(repo_path=repo_path, path="root-file.txt", stages=(), kind="file")
+                    raise NonGitlinkConflictError(repo_path, [conflict])
+                return types.SimpleNamespace(result_sha=f"result-step-{step}", strategy="recursive_gitlink_merge")
+
+            ci_commands.run_batch_workflow(ctx, self._batch_services(), merge_repo)
+
+            batch = ctx.report.data["batch"]
+            steps = batch["steps"]
+            self.assertEqual(len(calls), 5)
+            self.assertEqual(batch["status"], "partial_success")
+            self.assertEqual(batch["successful_steps"], [1, 2, 4, 5])
+            self.assertEqual(batch["failed_steps"], [3])
+            self.assertEqual(batch["failure_step"], 3)
+            self.assertEqual(batch["final_result_sha"], "result-step-5")
+            self.assertEqual(ctx.report.data["resolved"]["result_sha"], "result-step-5")
+            self.assertEqual(ctx.report.data["exit_code"], ci_models.ExitCode.PARTIAL_SUCCESS)
+
+            self.assertEqual(steps[2]["status"], "failed")
+            self.assertTrue(steps[2]["continued_after_failure"])
+            self.assertEqual(steps[2]["failure"]["exit_code"], ci_models.ExitCode.ROOT_CONFLICT)
+            self.assertEqual(steps[2]["failure"]["reason"], "NON_GITLINK_CONFLICT")
+            self.assertEqual(steps[2]["failure"]["details"]["type"], "NonGitlinkConflictError")
+            self.assertEqual(steps[2]["failure"]["details"]["conflicts"][0]["path"], "root-file.txt")
+            self.assertEqual(steps[3]["target"], "result-step-2")
+            self.assertEqual(steps[4]["target"], "result-step-4")
+            self.assertIn("STEP 3/5 failed reason=NON_GITLINK_CONFLICT", ctx.report.progress_messages)
+            self.assertIn("STEP 3/5 skipped continue_from=result-step-2", ctx.report.progress_messages)
+            self.assertIn(
+                "BATCH partial_success success=[1, 2, 4, 5] failed=[3] result=result-step-5",
+                ctx.report.progress_messages,
+            )
 
     def test_ci_command_run_workflow_uses_local_cleanup_and_sync(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -602,6 +900,11 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             runner_args = [call[1] for call in runner.calls]
             self.assertIn(("reset", "--hard"), runner_args)
             self.assertIn(("fetch", "origin", "--prune"), runner_args)
+            self.assertIn("CI start mode=single sources=1 target=main", ctx.report.progress_messages)
+            self.assertIn("PREPARE repository start", ctx.report.progress_messages)
+            self.assertIn("PREPARE repository done", ctx.report.progress_messages)
+            self.assertIn("SYNC remote refs start", ctx.report.progress_messages)
+            self.assertIn("SYNC remote refs done", ctx.report.progress_messages)
 
     def test_ci_artifacts_write_patch_and_repository_details_locally(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -978,7 +1281,10 @@ class ExtractedImplementationParityTests(unittest.TestCase):
         ]
         local_merge = manual_runtime.parse_args(merge_argv)
         original_merge = self.manual_merge.parse_args(merge_argv)
-        self.assertEqual(vars(local_merge), vars(original_merge))
+        local_merge_values = vars(local_merge).copy()
+        self.assertFalse(local_merge_values.pop("no_confirm_after_conflict_tool"))
+        self.assertFalse(local_merge_values.pop("enable_cross_submodule_moves"))
+        self.assertEqual(local_merge_values, vars(original_merge))
 
         cleanup_argv = [
             "cleanup",
@@ -1059,6 +1365,85 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertIn(("reset", "--hard", "HEAD"), calls)
             self.assertIn(("submodule", "update", "--init", "--recursive"), calls)
+
+    def test_manual_merge_updates_submodules_after_root_checkout_before_clean_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            calls: list[tuple[str, ...]] = []
+            checked_out_target = False
+            updated_after_checkout = False
+
+            def run_git(_repo_path: Path, args: list[str], **_kwargs: object) -> FakeManualGitResult:
+                nonlocal checked_out_target, updated_after_checkout
+                calls.append(tuple(args))
+                if args == ["rev-parse", "--show-toplevel"]:
+                    return FakeManualGitResult(args, stdout=str(repo) + "\n")
+                if args == ["rev-parse", "-q", "--verify", "MERGE_HEAD"]:
+                    return FakeManualGitResult(args, returncode=1)
+                if args == ["config", "--get", "user.name"]:
+                    return FakeManualGitResult(args, stdout="User\n")
+                if args == ["config", "--get", "user.email"]:
+                    return FakeManualGitResult(args, stdout="user@example.com\n")
+                if args == ["status", "--porcelain", "--ignore-submodules=dirty"]:
+                    return FakeManualGitResult(args)
+                if args == ["status", "--porcelain"]:
+                    return FakeManualGitResult(args, stdout=(" M sub\n" if checked_out_target and not updated_after_checkout else ""))
+                if args == ["remote"]:
+                    return FakeManualGitResult(args, stdout="origin\n")
+                if args == ["checkout", "-B", "work", "refs/remotes/origin/main"]:
+                    checked_out_target = True
+                    return FakeManualGitResult(args)
+                if args == ["submodule", "update", "--init", "--recursive"]:
+                    if checked_out_target:
+                        updated_after_checkout = True
+                    return FakeManualGitResult(args)
+                if args == ["rev-parse", "HEAD"]:
+                    return FakeManualGitResult(args, stdout="headsha\n")
+                if args == ["symbolic-ref", "--quiet", "--short", "HEAD"]:
+                    return FakeManualGitResult(args, stdout="work\n")
+                if args == ["merge", "--no-ff", "refs/remotes/origin/feature"]:
+                    return FakeManualGitResult(args)
+                if args == ["diff", "--name-only", "--diff-filter=U"]:
+                    return FakeManualGitResult(args)
+                return FakeManualGitResult(args)
+
+            module = types.SimpleNamespace(
+                run_git=run_git,
+                run_git_binary=lambda _repo_path, args, **_kwargs: FakeManualBinaryResult(args, b""),
+                MergeAutomationError=manual_models.MergeAutomationError,
+                VERBOSE=False,
+            )
+            service = ManualCommandService(module)  # type: ignore[arg-type]
+
+            result = service.run_merge(
+                types.SimpleNamespace(
+                    repo=str(repo),
+                    base_remote_branch="origin/main",
+                    merge_branches=["origin/feature"],
+                    continue_current_branch=False,
+                    work_branch="work",
+                    clone_branch=None,
+                    clone_url=None,
+                    clone_path=None,
+                    report_file="merge_manual_todo.txt",
+                    verbose=False,
+                    ignore_root_untracked_path=[],
+                    allow_dirty_submodules=False,
+                    no_prompt_dirty_submodules=True,
+                    file_conflict_mode="preserve",
+                    conflict_tool_command="tool",
+                    conflict_tool_timeout_seconds=1,
+                    no_confirm_after_conflict_tool=False,
+                    enable_cross_submodule_moves=False,
+                )
+            )
+
+            self.assertEqual(result, 0)
+            checkout_index = calls.index(("checkout", "-B", "work", "refs/remotes/origin/main"))
+            update_index = calls.index(("submodule", "update", "--init", "--recursive"))
+            clean_check_index = calls.index(("status", "--porcelain"))
+            self.assertLess(checkout_index, update_index)
+            self.assertLess(update_index, clean_check_index)
 
     def test_manual_process_repository_file_conflict_is_local(self) -> None:
         from manual_merge_split.cross_submodule_moves import CrossSubmoduleMoveService
@@ -1198,6 +1583,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             file_conflict_mode="tool",
             conflict_tool_command="code --wait {file}",
             conflict_tool_timeout_seconds=1,
+            confirm_after_conflict_tool=False,
         )
         unresolved, reason, rollback = resolve_file_conflicts(
             Path("repo"),
@@ -1210,6 +1596,40 @@ class ExtractedImplementationParityTests(unittest.TestCase):
         self.assertEqual(reason, "")
         self.assertFalse(rollback)
         self.assertIn(("add", "--", "a.txt"), git_calls)
+
+        confirming_context = manual_models.MergeContext(
+            work_branch="work",
+            merge_branch="merge",
+            file_conflict_mode="tool",
+            conflict_tool_command="code --wait {file}",
+            conflict_tool_timeout_seconds=1,
+        )
+        prompted: list[str] = []
+        reopen_count = 0
+
+        def popen_for_confirmation(*_args: object, **_kwargs: object) -> FakeProcess:
+            nonlocal reopen_count
+            reopen_count += 1
+            return FakeProcess()
+
+        def confirm_input(prompt: str) -> str:
+            prompted.append(prompt)
+            return "r" if len(prompted) == 1 else ""
+
+        unresolved, reason, rollback = resolve_file_conflicts(
+            Path("repo"),
+            ["a.txt"],
+            confirming_context,
+            run_git=run_git_for_tool,
+            popen_factory=popen_for_confirmation,
+            input_func=confirm_input,
+            output_func=lambda *_args, **_kwargs: None,
+        )
+        self.assertEqual(unresolved, [])
+        self.assertEqual(reason, "")
+        self.assertFalse(rollback)
+        self.assertEqual(reopen_count, 2)
+        self.assertEqual(len(prompted), 2)
 
     def test_manual_repository_cleanup_and_restore_are_local(self) -> None:
         from manual_merge_split.repository_ops import ManualRepositoryOps

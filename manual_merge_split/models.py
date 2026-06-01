@@ -73,6 +73,8 @@ class MergeContext:
     file_conflict_mode: str
     conflict_tool_command: str
     conflict_tool_timeout_seconds: int | None
+    confirm_after_conflict_tool: bool = True
+    enable_cross_submodule_moves: bool = False
     report_entries: list[ConflictEntry] = field(default_factory=list)
     rollback_requested: bool = False
 

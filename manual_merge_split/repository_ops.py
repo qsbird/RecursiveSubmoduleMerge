@@ -261,10 +261,14 @@ class ManualRepositoryOps:
             return
         raise self._automation_error(self._format_git_failure(result))
 
-    def update_submodules(self, repo_path: Path) -> None:
+    def update_submodules(self, repo_path: Path, paths: Iterable[str] = ()) -> None:
+        args = ["submodule", "update", "--init", "--recursive"]
+        selected_paths = [path for path in paths if path.strip()]
+        if selected_paths:
+            args.extend(["--", *selected_paths])
         self.run_git(
             repo_path,
-            ["submodule", "update", "--init", "--recursive"],
+            args,
             stream_output=self._verbose(),
         )
 

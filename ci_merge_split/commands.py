@@ -19,6 +19,13 @@ COMMAND_FUNCTIONS: tuple[str, ...] = ()
 MergeRepoCallable = Callable[..., Any]
 
 
+def report_progress(ctx: Any, message: str) -> None:
+    reporter = getattr(ctx, "report", None)
+    progress = getattr(reporter, "progress", None)
+    if callable(progress):
+        progress(message)
+
+
 def default_merge_repo(
     ctx: Any,
     repo_path: Path,
@@ -83,6 +90,106 @@ def command_range(ctx: Any, start_index: int) -> dict[str, int | None]:
     if end_index < start_index:
         return {"start": start_index, "end": None, "count": 0}
     return {"start": start_index, "end": end_index, "count": end_index - start_index + 1}
+
+
+def refresh_batch_step_summaries(batch: dict[str, Any]) -> tuple[list[int], list[int]]:
+    steps = batch.get("steps") or []
+    successful_steps = [
+        int(step["index"])
+        for step in steps
+        if step.get("status") == "success" and "index" in step
+    ]
+    failed_steps = [
+        int(step["index"])
+        for step in steps
+        if step.get("status") == "failed" and "index" in step
+    ]
+    batch["successful_steps"] = successful_steps
+    batch["failed_steps"] = failed_steps
+    return successful_steps, failed_steps
+
+
+def exception_to_batch_error(ctx: Any, exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, CiMergeError):
+        return exc.to_report_error()
+    return {
+        "exit_code": ExitCode.SYSTEM_EXCEPTION,
+        "phase": ctx.report.data.get("state") or Phase.INIT,
+        "reason": "SYSTEM_EXCEPTION",
+        "message": str(exc),
+        "details": {"type": type(exc).__name__},
+        "timestamp": now_iso(),
+    }
+
+
+def serialize_non_gitlink_conflict(conflict: Any) -> dict[str, Any]:
+    stages = []
+    for stage in getattr(conflict, "stages", ()) or ():
+        stages.append(
+            {
+                "mode": getattr(stage, "mode", None),
+                "sha": getattr(stage, "sha", None),
+                "stage": getattr(stage, "stage", None),
+                "path": getattr(stage, "path", None),
+                "raw": getattr(stage, "raw", None),
+            }
+        )
+    return {
+        "repo_path": str(getattr(conflict, "repo_path", "")),
+        "path": getattr(conflict, "path", None),
+        "type": "file_conflict" if getattr(conflict, "kind", None) != "gitlink" else "gitlink_conflict",
+        "kind": getattr(conflict, "kind", None),
+        "stages": stages,
+    }
+
+
+def convert_skippable_merge_exception(ctx: Any, exc: Exception) -> CiMergeError | None:
+    try:
+        from split_gitlink_merge import NonGitlinkConflictError
+    except ImportError:
+        return None
+
+    if not isinstance(exc, NonGitlinkConflictError):
+        return None
+
+    repo_path = getattr(exc, "repo_path", None)
+    resolved_repo = Path(repo_path).resolve(strict=False) if repo_path is not None else None
+    root_repo = Path(getattr(ctx, "root_repo", Path.cwd())).resolve(strict=False)
+    is_root_conflict = resolved_repo is None or resolved_repo == root_repo
+    conflicts = [
+        serialize_non_gitlink_conflict(conflict)
+        for conflict in getattr(exc, "conflicts", []) or []
+    ]
+    return CiMergeError(
+        ExitCode.ROOT_CONFLICT if is_root_conflict else ExitCode.SUBMODULE_CONFLICT,
+        Phase.MERGING_ROOT if is_root_conflict else Phase.MERGING_SUBMODULE,
+        "NON_GITLINK_CONFLICT",
+        str(exc),
+        details={
+            "type": type(exc).__name__,
+            "repo_path": str(repo_path) if repo_path is not None else None,
+            "conflicts": conflicts,
+        },
+        restore_needed=True,
+    )
+
+
+def mark_batch_step_failed(
+    batch: dict[str, Any],
+    step_entry: dict[str, Any],
+    index: int,
+    failure: dict[str, Any],
+) -> None:
+    step_entry["status"] = "failed"
+    step_entry["failure"] = failure
+    batch.setdefault("errors", []).append(failure)
+    batch["failure_step"] = index
+    refresh_batch_step_summaries(batch)
+
+
+def mark_batch_failed(batch: dict[str, Any]) -> None:
+    refresh_batch_step_summaries(batch)
+    batch["status"] = "failed"
 
 
 def restore_batch_continue_state(
@@ -196,6 +303,7 @@ def run_single_workflow(
     resolved_services = services or CiWorkflowServices.from_local()
     resolved_merge_repo = merge_repo or default_merge_repo
     repo_path = ctx.root_repo
+    report_progress(ctx, f"SINGLE start source={ctx.args.source} target={ctx.args.target}")
 
     initial = resolved_services.guards.preflight_check(
         ctx,
@@ -250,6 +358,7 @@ def run_single_workflow(
     if ctx.args.publish:
         resolved_services.publish.publish_result(ctx, repo_path, initial.target_sha, merge_result.result_sha)
     ctx.report.set_success()
+    report_progress(ctx, f"SINGLE success result={merge_result.result_sha}")
 
 
 def run_batch_workflow(
@@ -265,6 +374,10 @@ def run_batch_workflow(
     failure_mode = ctx.args.batch_failure_mode
     batch["failure_mode"] = failure_mode
     batch["status"] = "running"
+    report_progress(
+        ctx,
+        f"BATCH start sources={len(sources)} target={ctx.args.target} mode={failure_mode}",
+    )
     current_target = ctx.args.target
     original_target_ref: str | None = None
     original_target_sha: str | None = None
@@ -300,6 +413,7 @@ def run_batch_workflow(
             "restore_after_failure": None,
         }
         batch["steps"].append(step_entry)
+        report_progress(ctx, f"STEP {index}/{len(sources)} start source={source} target={current_target}")
 
         try:
             preflight = resolved_services.guards.preflight_check(
@@ -378,19 +492,21 @@ def run_batch_workflow(
                     "strategy": merge_result.strategy,
                 }
             )
+            report_progress(ctx, f"STEP {index}/{len(sources)} success result={merge_result.result_sha}")
         except CiMergeError as exc:
-            step_entry["status"] = "failed"
-            step_entry["failure"] = exc.to_report_error()
-            batch["errors"].append(exc.to_report_error())
-            batch["failure_step"] = index
+            mark_batch_step_failed(batch, step_entry, index, exc.to_report_error())
             last_error = exc
+            report_progress(ctx, f"STEP {index}/{len(sources)} failed reason={exc.reason}")
             if failure_mode != "continue-success":
+                mark_batch_failed(batch)
                 raise
             if not last_success_sha:
+                mark_batch_failed(batch)
                 raise
             restore_result = restore_batch_continue_state(ctx, repo_path, last_success_sha, resolved_services)
             step_entry["restore_after_failure"] = restore_result
             if not restore_result.get("success"):
+                mark_batch_failed(batch)
                 raise CiMergeError(
                     ExitCode.CLEAN_OR_RESTORE_FAILED,
                     Phase.RESTORING,
@@ -401,18 +517,50 @@ def run_batch_workflow(
                 )
             current_target = last_success_sha
             step_entry["continued_after_failure"] = True
+            report_progress(ctx, f"STEP {index}/{len(sources)} skipped continue_from={last_success_sha}")
             continue
+        except Exception as exc:
+            converted = convert_skippable_merge_exception(ctx, exc)
+            if converted is not None:
+                mark_batch_step_failed(batch, step_entry, index, converted.to_report_error())
+                last_error = converted
+                report_progress(ctx, f"STEP {index}/{len(sources)} failed reason={converted.reason}")
+                if failure_mode != "continue-success":
+                    mark_batch_failed(batch)
+                    raise converted from exc
+                if not last_success_sha:
+                    mark_batch_failed(batch)
+                    raise converted from exc
+                restore_result = restore_batch_continue_state(ctx, repo_path, last_success_sha, resolved_services)
+                step_entry["restore_after_failure"] = restore_result
+                if not restore_result.get("success"):
+                    mark_batch_failed(batch)
+                    raise CiMergeError(
+                        ExitCode.CLEAN_OR_RESTORE_FAILED,
+                        Phase.RESTORING,
+                        "BATCH_CONTINUE_RESTORE_FAILED",
+                        "failed to restore repository before continuing batch merge",
+                        details={"step": step_entry, "restore": restore_result},
+                        restore_needed=bool(ctx.snapshots),
+                    ) from exc
+                current_target = last_success_sha
+                step_entry["continued_after_failure"] = True
+                report_progress(ctx, f"STEP {index}/{len(sources)} skipped continue_from={last_success_sha}")
+                continue
+            failure = exception_to_batch_error(ctx, exc)
+            mark_batch_step_failed(batch, step_entry, index, failure)
+            report_progress(ctx, f"STEP {index}/{len(sources)} failed reason={failure['reason']}")
+            mark_batch_failed(batch)
+            raise
         finally:
             ctx.merge_step = None
             step_entry["ended_at"] = now_iso()
             step_entry["command_range"] = command_range(ctx, command_start)
 
-    successful_steps = [step["index"] for step in batch["steps"] if step.get("status") == "success"]
-    failed_steps = [step["index"] for step in batch["steps"] if step.get("status") == "failed"]
-    batch["successful_steps"] = successful_steps
-    batch["failed_steps"] = failed_steps
+    successful_steps, failed_steps = refresh_batch_step_summaries(batch)
 
     if not final_result_sha or not original_target_sha:
+        mark_batch_failed(batch)
         if last_error:
             raise last_error
         raise CiMergeError(
@@ -443,6 +591,7 @@ def run_batch_workflow(
         resolve_refs=False,
     )
     if not final.passed:
+        mark_batch_failed(batch)
         raise CiMergeError(
             ExitCode.UNDEFINED_STATE,
             Phase.PREFLIGHT,
@@ -456,11 +605,16 @@ def run_batch_workflow(
     if failed_steps:
         batch["status"] = "partial_success"
         ctx.report.data["status"] = "partial_success"
-        ctx.report.data["exit_code"] = ExitCode.SUCCESS
+        ctx.report.data["exit_code"] = ExitCode.PARTIAL_SUCCESS
         ctx.report.set_state(Phase.SUCCEEDED)
+        report_progress(
+            ctx,
+            f"BATCH partial_success success={successful_steps} failed={failed_steps} result={final_result_sha}",
+        )
     else:
         batch["status"] = "success"
         ctx.report.set_success()
+        report_progress(ctx, f"BATCH success steps={successful_steps} result={final_result_sha}")
 
 
 def run_workflow(
@@ -471,14 +625,23 @@ def run_workflow(
     resolved_services = services or CiWorkflowServices.from_local()
     runtime.validate_args(ctx.args)
     repo_path = ctx.root_repo
+    source_count = len(ctx.args.sources)
+    mode = "batch" if source_count > 1 else "single"
+    report_progress(ctx, f"CI start mode={mode} sources={source_count} target={ctx.args.target}")
 
     if ctx.args.publish_only:
+        report_progress(ctx, "PUBLISH_ONLY start")
         resolved_services.publish.run_publish_only_workflow(ctx)
+        report_progress(ctx, "PUBLISH_ONLY done")
         return
 
     if can_attempt_cleanup(ctx, repo_path):
+        report_progress(ctx, "PREPARE repository start")
         resolved_services.guards.clean_and_prepare_repo(ctx, repo_path)
+        report_progress(ctx, "PREPARE repository done")
+        report_progress(ctx, "SYNC remote refs start")
         resolved_services.guards.sync_remote_refs(ctx, repo_path)
+        report_progress(ctx, "SYNC remote refs done")
 
     if len(ctx.args.sources) > 1:
         run_batch_workflow(ctx, resolved_services, merge_repo)
@@ -494,6 +657,7 @@ def handle_failure(
     resolved_services = services or CiWorkflowServices.from_local()
     ctx.report.add_error(error)
     ctx.report.set_failure(error)
+    report_progress(ctx, f"CI failed reason={error.reason} exit={error.exit_code}")
     if error.restore_needed:
         restore_ok = resolved_services.snapshots.restore_all_snapshots(ctx)
         if not restore_ok:
