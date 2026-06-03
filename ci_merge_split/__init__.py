@@ -26,6 +26,8 @@ from .publish import CiPublishService
 from .report_artifacts import CiReportArtifactsService
 from .repository_guards import CiRepositoryGuards
 from .runtime import ExecutionContext, GitRunner, JsonReport
+from .review import export_review_record
+from .review_html import generate_html_file
 from .snapshot_restore import CiSnapshotRestoreService
 from .workflow import CiWorkflowServices
 
@@ -52,5 +54,7 @@ __all__ = [
     "Phase",
     "PreflightResult",
     "RefResolution",
+    "export_review_record",
+    "generate_html_file",
     "load_ci_merge_module",
 ]
