@@ -8,6 +8,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterable
 
+from subprocess_window import hidden_subprocess_kwargs
+
 from . import common
 from . import execution
 from .models import ConflictEntry, FileConflictResolution
@@ -16,7 +18,7 @@ from .models import ConflictEntry, FileConflictResolution
 FILE_CONFLICT_FUNCTIONS: tuple[str, ...] = ()
 CONFLICT_TOOL_CONFIRMATION_MESSAGE = "Manual confirmation required after conflict tool closes"
 CONFLICT_TOOL_CONFIRMATION_PROMPT = (
-    "Press Enter to continue, type r to reopen the conflict tool, or type s to stop and preserve the conflict: "
+    "Press Enter to continue, type r to reopen the conflict tool, or type s to stop and report branch failure: "
 )
 
 
@@ -78,7 +80,7 @@ def prompt_after_conflict_tool(
             return "continue"
         if normalized in {"r", "reopen", "retry"}:
             return "reopen"
-        if normalized in {"s", "stop", "p", "preserve"}:
+        if normalized in {"s", "stop"}:
             return "stop"
         emit_line(output_func, "Please press Enter, or type r/reopen, or s/stop.")
 
@@ -125,9 +127,6 @@ def resolve_single_file_conflict(
     input_func: Any = input,
     output_func: Any = print,
 ) -> FileConflictResolution:
-    if context.file_conflict_mode == "preserve":
-        return FileConflictResolution(reason="current run is configured to preserve conflicts")
-
     while True:
         command = render_conflict_tool_command(
             repo_path,
@@ -135,7 +134,7 @@ def resolve_single_file_conflict(
             context.conflict_tool_command,
         )
         try:
-            process = popen_factory(command, cwd=repo_path, shell=True)
+            process = popen_factory(command, cwd=repo_path, shell=True, **hidden_subprocess_kwargs())
         except OSError as exc:
             return FileConflictResolution(reason=f"failed to launch conflict tool: {exc}")
 
@@ -152,8 +151,11 @@ def resolve_single_file_conflict(
                 process.kill()
                 process.wait()
             return FileConflictResolution(
-                reason=f"conflict tool timed out after {context.conflict_tool_timeout_seconds} seconds",
-                rollback_requested=True,
+                reason=(
+                    f"conflict tool timed out after {context.conflict_tool_timeout_seconds} seconds; "
+                    "leaving the working tree unchanged to preserve local edits"
+                ),
+                rollback_requested=False,
             )
 
         if process.returncode not in (0, None):

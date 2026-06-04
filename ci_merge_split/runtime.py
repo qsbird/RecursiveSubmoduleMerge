@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -51,6 +52,7 @@ class JsonReport:
             elif raw_source:
                 sources = [str(raw_source)]
         batch_enabled = len(sources) > 1
+        submodule_fetch_scope = getattr(args, "submodule_fetch_scope", "needed")
         self.data: dict[str, Any] = {
             "schema_version": "1.0",
             "status": "running",
@@ -74,9 +76,13 @@ class JsonReport:
                 "work_branch": args.work_branch,
                 "timeout": args.timeout,
                 "max_depth": args.max_depth,
+                "submodule_fetch_scope": submodule_fetch_scope,
+                "git_network_retries": getattr(args, "git_network_retries", 2),
+                "git_network_retry_delay": getattr(args, "git_network_retry_delay", 3.0),
                 "diff_context_lines": args.diff_context_lines,
                 "allow_clean_x": bool(args.allow_clean_x),
                 "console_log": bool(args.console_log),
+                "allow_create_publish_target": bool(getattr(args, "allow_create_publish_target", False)),
             },
             "output": {
                 "output_dir": str(output_dir),
@@ -116,6 +122,11 @@ class JsonReport:
                 "success": None,
                 "remote": args.remote,
                 "recursive_submodules": True,
+                "submodule_fetch_scope": submodule_fetch_scope,
+                "submodule_fetch_scope_effective": None,
+                "submodule_fetches": [],
+                "submodule_updates": [],
+                "submodule_fetch_fallback_reasons": [],
                 "started_at": None,
                 "ended_at": None,
             },
@@ -141,6 +152,9 @@ class JsonReport:
                 "target": args.publish_target or args.target,
                 "mode": args.publish_mode,
                 "candidate_ref": args.candidate_ref,
+                "allow_create_target": bool(getattr(args, "allow_create_publish_target", False)),
+                "target_created": False,
+                "target_publish_mode": None,
                 "root": {
                     "candidate_ref_pushed": False,
                     "target_pushed": False,
@@ -230,8 +244,10 @@ class JsonReport:
         else:
             status = "FAIL"
         timeout = " timed_out=true" if command.timed_out else ""
+        retry = f" attempt={command.attempt}/{command.max_attempts}" if command.max_attempts > 1 else ""
+        network = f" network={command.network_failure_reason}" if command.network_failure_reason else ""
         self.console(
-            f"{status} exit={command.exit_code} duration_ms={command.duration_ms}{timeout} $ {' '.join(command.cmd)}"
+            f"{status} exit={command.exit_code} duration_ms={command.duration_ms}{timeout}{retry}{network} $ {' '.join(command.cmd)}"
         )
         if command.exit_code != 0:
             stderr_tail = self.console_tail(command.stderr)
@@ -260,7 +276,8 @@ class JsonReport:
             f"[{entry['started_at']}] cwd={entry['cwd']}\n"
             f"$ {' '.join(entry['cmd'])}\n"
             f"exit={entry['exit_code']} duration_ms={entry['duration_ms']} "
-            f"allow_failure={entry['allow_failure']} timed_out={entry['timed_out']}\n"
+            f"allow_failure={entry['allow_failure']} timed_out={entry['timed_out']} "
+            f"attempt={entry['attempt']}/{entry['max_attempts']} network_failure_reason={entry['network_failure_reason']}\n"
             f"stdout:\n{entry['stdout']}\n"
             f"stderr:\n{entry['stderr']}\n"
         )
@@ -372,24 +389,60 @@ class GitRunner:
         env[f"GIT_CONFIG_VALUE_{index}"] = value
         env["GIT_CONFIG_COUNT"] = str(index + 1)
 
-    def run(
-        self,
-        cwd: Path | str,
-        args: list[str],
-        *,
-        allow_failure: bool = False,
-        timeout: int | None = None,
-    ) -> CommandResult:
-        cwd_path = str(common.resolve_path(cwd))
-        cmd = [self.git, *args]
-        started_at = now_iso()
-        started_perf = time.perf_counter()
+    @staticmethod
+    def is_network_sensitive(args: list[str]) -> bool:
+        if not args:
+            return False
+        if args[0] in {"clone", "fetch", "push", "pull", "ls-remote"}:
+            return True
+        return args[:2] in (
+            ["submodule", "update"],
+            ["submodule", "sync"],
+        )
+
+    @staticmethod
+    def classify_network_failure(result: CommandResult) -> str | None:
+        if result.timed_out:
+            return "GIT_COMMAND_TIMEOUT"
+        text = f"{result.stderr}\n{result.stdout}".lower()
+        patterns = (
+            ("GIT_NETWORK_DNS_FAILED", (r"could not resolve host", r"name or service not known", r"temporary failure in name resolution")),
+            ("GIT_NETWORK_CONNECT_FAILED", (r"failed to connect", r"connection timed out", r"connection refused", r"couldn't connect")),
+            ("GIT_NETWORK_CONNECTION_RESET", (r"connection reset", r"connection was reset", r"connection aborted")),
+            ("GIT_NETWORK_REMOTE_CLOSED", (r"remote end hung up", r"the remote end hung up", r"early eof", r"unexpected disconnect")),
+            ("GIT_NETWORK_TLS_FAILED", (r"ssl.*(error|failed)", r"tls.*(error|failed)", r"gnutls recv error")),
+            ("GIT_NETWORK_HTTP_TRANSIENT", (r"http code = 50[0234]", r"the requested url returned error: 50[0234]", r"bad gateway", r"service unavailable", r"gateway timeout")),
+            ("GIT_NETWORK_RPC_FAILED", (r"rpc failed", r"curl \d+", r"http/2 stream .* was not closed cleanly")),
+            ("GIT_NETWORK_BROKEN_PIPE", (r"broken pipe",)),
+        )
+        for reason, reason_patterns in patterns:
+            if any(re.search(pattern, text) for pattern in reason_patterns):
+                return reason
+        if "network" in text:
+            return "GIT_NETWORK_FAILED"
+        return None
+
+    def build_env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_MERGE_AUTOEDIT"] = "no"
         if self.ctx.args.auto_safe_directory:
             self.add_command_config(env, "safe.directory", "*")
-        self.ctx.report.console_command_start(cmd, cwd_path, allow_failure)
+        return env
+
+    def run_once(
+        self,
+        cwd_path: str,
+        cmd: list[str],
+        env: dict[str, str],
+        *,
+        allow_failure: bool,
+        timeout: int,
+        attempt: int,
+        max_attempts: int,
+    ) -> CommandResult:
+        started_at = now_iso()
+        started_perf = time.perf_counter()
         try:
             completed = subprocess.run(
                 cmd,
@@ -400,10 +453,10 @@ class GitRunner:
                 encoding="utf-8",
                 errors="replace",
                 capture_output=True,
-                timeout=timeout or self.ctx.timeout,
+                timeout=timeout,
             )
             ended_perf = time.perf_counter()
-            result = CommandResult(
+            return CommandResult(
                 cmd=cmd,
                 cwd=cwd_path,
                 exit_code=completed.returncode,
@@ -413,10 +466,12 @@ class GitRunner:
                 ended_at=now_iso(),
                 duration_ms=common.milliseconds(started_perf, ended_perf),
                 allow_failure=allow_failure,
+                attempt=attempt,
+                max_attempts=max_attempts,
             )
         except subprocess.TimeoutExpired as exc:
             ended_perf = time.perf_counter()
-            result = CommandResult(
+            return CommandResult(
                 cmd=cmd,
                 cwd=cwd_path,
                 exit_code=124,
@@ -427,10 +482,13 @@ class GitRunner:
                 duration_ms=common.milliseconds(started_perf, ended_perf),
                 allow_failure=allow_failure,
                 timed_out=True,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                network_failure_reason="GIT_COMMAND_TIMEOUT",
             )
         except OSError as exc:
             ended_perf = time.perf_counter()
-            result = CommandResult(
+            return CommandResult(
                 cmd=cmd,
                 cwd=cwd_path,
                 exit_code=127 if isinstance(exc, FileNotFoundError) else 126,
@@ -440,18 +498,50 @@ class GitRunner:
                 ended_at=now_iso(),
                 duration_ms=common.milliseconds(started_perf, ended_perf),
                 allow_failure=allow_failure,
+                attempt=attempt,
+                max_attempts=max_attempts,
             )
 
-        self.ctx.report.add_command(result)
+    def retry_delay(self, attempt: int) -> float:
+        base = float(getattr(self.ctx.args, "git_network_retry_delay", 3.0))
+        return max(0.0, base) * (2 ** max(0, attempt - 1))
+
+    def run(
+        self,
+        cwd: Path | str,
+        args: list[str],
+        *,
+        allow_failure: bool = False,
+        timeout: int | None = None,
+    ) -> CommandResult:
+        cwd_path = str(common.resolve_path(cwd))
+        cmd = [self.git, *args]
+        env = self.build_env()
+        command_timeout = timeout or self.ctx.timeout
+        retries = int(getattr(self.ctx.args, "git_network_retries", 2) or 0)
+        max_attempts = 1 + max(0, retries) if self.is_network_sensitive(args) else 1
+        result: CommandResult | None = None
+        for attempt in range(1, max_attempts + 1):
+            self.ctx.report.console_command_start(cmd, cwd_path, allow_failure)
+            result = self.run_once(
+                cwd_path,
+                cmd,
+                env,
+                allow_failure=allow_failure,
+                timeout=command_timeout,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
+            network_reason = self.classify_network_failure(result)
+            result.network_failure_reason = network_reason
+            self.ctx.report.add_command(result)
+            if result.exit_code == 0:
+                break
+            if not network_reason or attempt >= max_attempts:
+                break
+            time.sleep(self.retry_delay(attempt))
+        assert result is not None
         if result.exit_code != 0 and not allow_failure:
-            if result.timed_out:
-                raise CiMergeError(
-                    ExitCode.GIT_COMMAND_FAILED,
-                    self.ctx.report.data.get("state") or Phase.INIT,
-                    "GIT_COMMAND_TIMEOUT",
-                    "git command timed out",
-                    details={"command": result.to_dict()},
-                )
             raise GitCommandError(self.ctx.report.data.get("state") or Phase.INIT, result)
         return result
 
@@ -568,6 +658,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=int, default=1800, help="per-command timeout in seconds")
     parser.add_argument("--max_depth", type=int, default=16, help="maximum recursive submodule depth")
     parser.add_argument(
+        "--git-network-retries",
+        "--git_network_retries",
+        dest="git_network_retries",
+        type=int,
+        default=2,
+        help="retry count for transient network-sensitive Git commands",
+    )
+    parser.add_argument(
+        "--git-network-retry-delay",
+        "--git_network_retry_delay",
+        dest="git_network_retry_delay",
+        type=float,
+        default=3.0,
+        help="base delay in seconds before retrying network-sensitive Git commands",
+    )
+    parser.add_argument(
+        "--submodule-fetch-scope",
+        "--submodule_fetch_scope",
+        dest="submodule_fetch_scope",
+        choices=("needed", "all"),
+        default="needed",
+        help="fetch refs only for gitlink-affected submodules, or all initialized submodules",
+    )
+    parser.add_argument(
         "--diff_context_lines",
         type=int,
         default=3,
@@ -584,6 +698,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--from_report", help="merge-report.json path to publish when --publish_only true")
     parser.add_argument("--publish_target", help="remote target branch to update")
+    parser.add_argument(
+        "--allow_create_publish_target",
+        type=common.parse_bool,
+        default=False,
+        help="allow publishing to create --publish_target when it does not exist on the remote",
+    )
     parser.add_argument("--publish_mode", default="force-with-lease", help="publish mode")
     parser.add_argument("--candidate_ref", help="optional remote candidate ref")
     parser.add_argument("--job_id", help="stable job id for output and branch naming")
@@ -686,6 +806,26 @@ def validate_args(args: argparse.Namespace) -> None:
             "--max_depth must be greater than or equal to 0",
             details={"max_depth": args.max_depth},
         )
+    raw_git_network_retries = getattr(args, "git_network_retries", 2)
+    raw_git_network_retry_delay = getattr(args, "git_network_retry_delay", 3.0)
+    git_network_retries = 2 if raw_git_network_retries is None else int(raw_git_network_retries)
+    git_network_retry_delay = 3.0 if raw_git_network_retry_delay is None else float(raw_git_network_retry_delay)
+    if git_network_retries < 0:
+        raise CiMergeError(
+            ExitCode.ARGUMENT_ERROR,
+            Phase.INIT,
+            "INVALID_GIT_NETWORK_RETRIES",
+            "--git_network_retries must be greater than or equal to 0",
+            details={"git_network_retries": git_network_retries},
+        )
+    if git_network_retry_delay < 0:
+        raise CiMergeError(
+            ExitCode.ARGUMENT_ERROR,
+            Phase.INIT,
+            "INVALID_GIT_NETWORK_RETRY_DELAY",
+            "--git_network_retry_delay must be greater than or equal to 0",
+            details={"git_network_retry_delay": git_network_retry_delay},
+        )
     if args.diff_context_lines < 0:
         raise CiMergeError(
             ExitCode.ARGUMENT_ERROR,
@@ -702,18 +842,21 @@ def validate_args(args: argparse.Namespace) -> None:
             "only force-with-lease publishing is supported",
             details={"publish_mode": args.publish_mode},
         )
-    if (
-        args.publish
-        and not args.publish_only
-        and not getattr(args, "publish_target_explicit", False)
-        and target_requires_explicit_publish_target(args.target, args.remote)
-    ):
+    if args.publish and not args.publish_target:
         raise CiMergeError(
             ExitCode.ARGUMENT_ERROR,
             Phase.INIT,
             "PUBLISH_TARGET_REQUIRED",
-            "--publish_target must be set when --publish true uses a non-branch --target",
-            details={"target": args.target, "remote": args.remote},
+            "--publish_target must be set for publishing",
+            details={"publish_only": bool(args.publish_only), "target": args.target, "remote": args.remote},
+        )
+    if args.publish and target_requires_explicit_publish_target(args.publish_target, args.remote):
+        raise CiMergeError(
+            ExitCode.ARGUMENT_ERROR,
+            Phase.INIT,
+            "PUBLISH_TARGET_REQUIRED",
+            "--publish_target must name a remote branch to publish",
+            details={"publish_target": args.publish_target, "remote": args.remote},
         )
 
 
@@ -739,13 +882,13 @@ def normalize_args(args: argparse.Namespace, job_id: str) -> None:
             sources = [source] if source else []
     args.sources = sources
     args.source = sources[0] if sources else None
+    if args.publish_target:
+        args.publish_target = str(args.publish_target).strip() or None
     if args.publish_only:
         args.publish = True
     args.publish_target_explicit = bool(args.publish_target)
     if not args.work_branch:
         args.work_branch = f"ci-merge/{common.sanitize_ref_component(job_id)}"
-    if args.publish and not args.publish_only and not args.publish_target:
-        args.publish_target = args.target
     if args.publish and not args.candidate_ref:
         args.candidate_ref = f"refs/merge-candidates/{common.sanitize_ref_component(job_id)}"
 

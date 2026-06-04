@@ -9,7 +9,17 @@ import subprocess
 import time
 from pathlib import Path
 
-from .model import Ancestry, Conflict, GitCommandResult, GitlinkMergeError, MergeCommitMessage
+from subprocess_window import hidden_subprocess_kwargs
+
+from .model import (
+    Ancestry,
+    Conflict,
+    GitCommandResult,
+    GitlinkMergeError,
+    MergeCommitMessage,
+    RequiredCommitFetchError,
+    RequiredCommitMissingError,
+)
 from .planner import GitlinkMergePlanner
 from .ports import GitBackend
 
@@ -61,6 +71,7 @@ class SubprocessGitBackend:
                 errors="replace",
                 capture_output=True,
                 timeout=self.timeout_seconds,
+                **hidden_subprocess_kwargs(),
             )
             result = GitCommandResult(
                 args=cmd,
@@ -129,11 +140,14 @@ class GitActionExecutor:
         if check.returncode == 0:
             return
         if fetch_missing:
-            self.run(repo, ["fetch", "--all", "--prune"], check=False)
+            fetch = self.run(repo, ["fetch", "--all", "--prune"], check=False)
+            if fetch.returncode != 0:
+                raise RequiredCommitFetchError(repo, sha, fetch)
             retry = self.run(repo, ["cat-file", "-e", f"{sha}^{{commit}}"], check=False)
             if retry.returncode == 0:
                 return
-        raise GitlinkMergeError(f"required commit is unavailable in {repo}: {sha}")
+            raise RequiredCommitMissingError(repo, sha, retry)
+        raise RequiredCommitMissingError(repo, sha, check)
 
     def ancestry(self, repo_path: Path, ours_sha: str, theirs_sha: str) -> Ancestry:
         return Ancestry(

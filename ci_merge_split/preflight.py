@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -9,6 +10,26 @@ from typing import Any
 from . import common
 from .models import CiMergeError, ExitCode, Phase, PreflightResult, now_iso
 from . import repository_ops
+
+
+SUBMODULE_FETCH_SCOPE_ALL = "all"
+SUBMODULE_FETCH_SCOPE_NEEDED = "needed"
+SUBMODULE_FETCH_SCOPE_SKIPPED = "skipped"
+
+
+@dataclass(frozen=True)
+class MergeRefTriple:
+    source: str
+    source_sha: str
+    target_sha: str
+    merge_base_sha: str
+
+
+@dataclass(frozen=True)
+class GitlinkChange:
+    path: str
+    old_sha: str
+    new_sha: str
 
 
 def _ci_error_class(ci_module: ModuleType | None) -> type[Exception]:
@@ -71,26 +92,367 @@ def run_sync_command(
     reason: str,
     message: str,
     ci_module: ModuleType | None = None,
+    *,
+    details: dict[str, Any] | None = None,
 ) -> Any:
     result = ctx.runner.run(repo_path, args, allow_failure=True)
     if result.exit_code != 0:
+        error_details = {"repo_path": str(repo_path), "command": result.to_dict()}
+        if details:
+            error_details.update(details)
         _raise_ci_error(
             ci_module,
             "GIT_COMMAND_FAILED",
             "SYNCING_REFS",
             reason,
             message,
-            details={"repo_path": str(repo_path), "command": result.to_dict()},
+            details=error_details,
             restore_needed=False,
         )
     return result
+
+
+def parse_submodule_status_paths(stdout: str) -> list[str]:
+    paths: list[str] = []
+    for line in common.split_lines(stdout):
+        body = line[1:].strip() if line[:1] in {" ", "-", "+", "U"} else line.strip()
+        parts = body.split(None, 1)
+        if len(parts) >= 2:
+            path = parts[1].split(" (", 1)[0].strip()
+            if path:
+                paths.append(path)
+    return list(dict.fromkeys(paths))
+
+
+def parse_raw_gitlink_changes(stdout: str) -> tuple[list[GitlinkChange], list[str]]:
+    changes: list[GitlinkChange] = []
+    fallback_reasons: list[str] = []
+    seen: set[str] = set()
+    for line in common.split_lines(stdout):
+        if not line.startswith(":") or "\t" not in line:
+            fallback_reasons.append("RAW_DIFF_UNPARSEABLE")
+            continue
+        meta, path_text = line[1:].split("\t", 1)
+        fields = meta.split()
+        if len(fields) < 5:
+            fallback_reasons.append("RAW_DIFF_UNPARSEABLE")
+            continue
+        old_mode, new_mode, old_sha, new_sha, status = fields[:5]
+        paths = [part.strip() for part in path_text.split("\t") if part.strip()]
+        status_letter = status[:1]
+        if ".gitmodules" in paths:
+            fallback_reasons.append("GITMODULES_CHANGED")
+            continue
+        if "160000" not in {old_mode, new_mode}:
+            continue
+        if old_mode != "160000" or new_mode != "160000" or status_letter in {"A", "D", "R", "C", "T"}:
+            fallback_reasons.append("SUBMODULE_TOPOLOGY_CHANGED")
+            continue
+        path = paths[-1] if paths else ""
+        if not path:
+            fallback_reasons.append("RAW_DIFF_UNPARSEABLE")
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        changes.append(GitlinkChange(path=path, old_sha=old_sha, new_sha=new_sha))
+    return changes, list(dict.fromkeys(fallback_reasons))
+
+
+def gitlink_sha_at_commit(ctx: Any, repo_path: Path, commitish: str, path: str) -> str | None:
+    result = ctx.runner.run(repo_path, ["ls-tree", commitish, "--", path], allow_failure=True)
+    if result.exit_code != 0 or not result.stdout.strip():
+        return None
+    line = result.stdout.splitlines()[0]
+    meta, _separator, _path = line.partition("\t")
+    parts = meta.split()
+    if len(parts) >= 3 and parts[0] == "160000" and parts[1] == "commit":
+        return parts[2]
+    return None
+
+
+def is_git_worktree(ctx: Any, repo_path: Path) -> bool:
+    result = ctx.runner.run(repo_path, ["rev-parse", "--is-inside-work-tree"], allow_failure=True)
+    return result.exit_code == 0 and result.stdout.strip() == "true"
+
+
+def append_unique(values: list[str], *items: str) -> None:
+    seen = set(values)
+    for item in items:
+        if item and item not in seen:
+            values.append(item)
+            seen.add(item)
+
+
+def display_submodule_path(parent_display: str, path: str) -> str:
+    normalized_parent = parent_display.strip().replace("\\", "/")
+    normalized_path = path.strip().replace("\\", "/")
+    if not normalized_parent or normalized_parent == ".":
+        return normalized_path
+    return f"{normalized_parent.rstrip('/')}/{normalized_path}"
+
+
+def resolve_merge_ref_triples(ctx: Any, repo_path: Path, ci_module: ModuleType | None = None) -> tuple[list[MergeRefTriple], list[dict[str, Any]]]:
+    skipped: list[dict[str, Any]] = []
+    target = getattr(ctx.args, "target", None)
+    sources = list(getattr(ctx.args, "sources", []) or ([getattr(ctx.args, "source", None)] if getattr(ctx.args, "source", None) else []))
+    if not target or not sources:
+        skipped.append({"reason": "SOURCE_OR_TARGET_MISSING", "target": target, "sources": sources})
+        return [], skipped
+
+    target_resolution = repository_ops.resolve_commit_ref(ctx, repo_path, target, ci_module)
+    if target_resolution.command.exit_code != 0 or not target_resolution.sha:
+        skipped.append(
+            {
+                "reason": "TARGET_REF_UNRESOLVED",
+                "target": target,
+                "command": target_resolution.command.to_dict(),
+            }
+        )
+        return [], skipped
+
+    triples: list[MergeRefTriple] = []
+    for source in sources:
+        source_resolution = repository_ops.resolve_commit_ref(ctx, repo_path, source, ci_module)
+        if source_resolution.command.exit_code != 0 or not source_resolution.sha:
+            skipped.append(
+                {
+                    "reason": "SOURCE_REF_UNRESOLVED",
+                    "source": source,
+                    "command": source_resolution.command.to_dict(),
+                }
+            )
+            continue
+        merge_base = ctx.runner.run(repo_path, ["merge-base", source_resolution.sha, target_resolution.sha], allow_failure=True)
+        if merge_base.exit_code != 0 or not merge_base.stdout.strip():
+            skipped.append(
+                {
+                    "reason": "MERGE_BASE_UNRESOLVED",
+                    "source": source,
+                    "target": target,
+                    "command": merge_base.to_dict(),
+                }
+            )
+            continue
+        triples.append(
+            MergeRefTriple(
+                source=str(source),
+                source_sha=str(source_resolution.sha),
+                target_sha=str(target_resolution.sha),
+                merge_base_sha=merge_base.stdout.strip(),
+            )
+        )
+    return triples, skipped
+
+
+def collect_changed_gitlink_paths(
+    ctx: Any,
+    repo_path: Path,
+    triple: MergeRefTriple,
+) -> tuple[list[str], list[str]]:
+    paths: list[str] = []
+    fallback_reasons: list[str] = []
+    for left, right in (
+        (triple.merge_base_sha, triple.source_sha),
+        (triple.merge_base_sha, triple.target_sha),
+    ):
+        diff = ctx.runner.run(repo_path, ["diff", "--raw", "--no-abbrev", left, right, "--"], allow_failure=True)
+        if diff.exit_code != 0:
+            fallback_reasons.append("RAW_DIFF_FAILED")
+            continue
+        changes, reasons = parse_raw_gitlink_changes(diff.stdout)
+        append_unique(paths, *(change.path for change in changes))
+        append_unique(fallback_reasons, *reasons)
+    return paths, fallback_reasons
+
+
+def fetch_submodule_repo(
+    ctx: Any,
+    repo_path: Path,
+    display_path: str,
+    depth: int,
+    sync_report: dict[str, Any],
+    ci_module: ModuleType | None = None,
+) -> Any:
+    item = {
+        "path": display_path,
+        "repo_path": str(repo_path),
+        "depth": depth,
+        "success": False,
+        "command": None,
+    }
+    sync_report.setdefault("submodule_fetches", []).append(item)
+    result = ctx.runner.run(repo_path, ["fetch", "--all", "--prune"], allow_failure=True)
+    item["command"] = result.to_dict()
+    if result.exit_code != 0:
+        item["failure_reason"] = "SUBMODULE_FETCH_FAILED"
+        _raise_ci_error(
+            ci_module,
+            "GIT_COMMAND_FAILED",
+            "SYNCING_REFS",
+            "SUBMODULE_FETCH_FAILED",
+            "failed to fetch submodule refs before merge",
+            details={"repo_path": str(repo_path), "path": display_path, "command": result.to_dict()},
+            restore_needed=False,
+        )
+    item["success"] = True
+    return result
+
+
+def ensure_needed_submodule_worktree(
+    ctx: Any,
+    parent_repo: Path,
+    submodule_path: str,
+    display_path: str,
+    sync_report: dict[str, Any],
+    ci_module: ModuleType | None = None,
+) -> bool:
+    sub_repo = parent_repo / submodule_path
+    if is_git_worktree(ctx, sub_repo):
+        return True
+    update = ctx.runner.run(
+        parent_repo,
+        ["submodule", "update", "--init", "--recursive", "--", submodule_path],
+        allow_failure=True,
+    )
+    sync_report.setdefault("submodule_updates", []).append(
+        {
+            "path": display_path,
+            "repo_path": str(sub_repo),
+            "success": update.exit_code == 0,
+            "command": update.to_dict(),
+        }
+    )
+    if update.exit_code != 0:
+        _raise_ci_error(
+            ci_module,
+            "GIT_COMMAND_FAILED",
+            "SYNCING_REFS",
+            "SUBMODULE_UPDATE_FAILED",
+            "failed to initialize required submodule before merge",
+            details={"repo_path": str(parent_repo), "path": display_path, "command": update.to_dict()},
+            restore_needed=False,
+        )
+    return is_git_worktree(ctx, sub_repo)
+
+
+def fetch_all_submodule_refs(ctx: Any, repo_path: Path, sync_report: dict[str, Any], ci_module: ModuleType | None = None) -> None:
+    status = ctx.runner.run(repo_path, ["submodule", "status", "--recursive"], allow_failure=True)
+    sync_report["submodule_status_command"] = status.to_dict()
+    if status.exit_code != 0:
+        _raise_ci_error(
+            ci_module,
+            "GIT_COMMAND_FAILED",
+            "SYNCING_REFS",
+            "SUBMODULE_STATUS_FAILED",
+            "failed to list submodules before recursive fetch",
+            details={"repo_path": str(repo_path), "command": status.to_dict()},
+            restore_needed=False,
+        )
+    for path in parse_submodule_status_paths(status.stdout):
+        child_repo = repo_path / path
+        if not is_git_worktree(ctx, child_repo):
+            sync_report.setdefault("submodule_fetches", []).append(
+                {
+                    "path": path,
+                    "repo_path": str(child_repo),
+                    "success": None,
+                    "skipped": True,
+                    "skip_reason": "SUBMODULE_NOT_INITIALIZED",
+                }
+            )
+            continue
+        fetch_submodule_repo(ctx, child_repo, path, len([part for part in path.replace("\\", "/").split("/") if part]), sync_report, ci_module)
+
+
+def fetch_needed_submodule_refs(ctx: Any, repo_path: Path, sync_report: dict[str, Any], ci_module: ModuleType | None = None) -> None:
+    triples, skipped = resolve_merge_ref_triples(ctx, repo_path, ci_module)
+    sync_report["submodule_fetch_analysis"] = {"skipped": skipped, "triples": len(triples)}
+    if not triples:
+        sync_report["submodule_fetch_scope_effective"] = SUBMODULE_FETCH_SCOPE_SKIPPED
+        sync_report["submodule_fetch_skipped_reason"] = "NO_RESOLVED_MERGE_REFS"
+        return
+
+    fallback_reasons: list[str] = []
+    stack: list[tuple[Path, str, MergeRefTriple, int]] = [(repo_path, ".", triple, 0) for triple in triples]
+    fetched_repos: set[Path] = set()
+    visited_triples: set[tuple[str, str, str, str]] = set()
+    needed_paths: list[str] = []
+    max_depth = int(getattr(ctx, "max_depth", getattr(ctx.args, "max_depth", 16)))
+
+    while stack:
+        parent_repo, parent_display, triple, depth = stack.pop()
+        visit_key = (str(parent_repo.resolve(strict=False)), triple.merge_base_sha, triple.target_sha, triple.source_sha)
+        if visit_key in visited_triples:
+            continue
+        visited_triples.add(visit_key)
+        if depth > max_depth:
+            append_unique(fallback_reasons, "SUBMODULE_FETCH_DEPTH_EXCEEDED")
+            break
+
+        changed_paths, reasons = collect_changed_gitlink_paths(ctx, parent_repo, triple)
+        append_unique(fallback_reasons, *reasons)
+        if fallback_reasons:
+            break
+
+        for path in changed_paths:
+            display_path = display_submodule_path(parent_display, path)
+            append_unique(needed_paths, display_path)
+            child_base = gitlink_sha_at_commit(ctx, parent_repo, triple.merge_base_sha, path)
+            child_target = gitlink_sha_at_commit(ctx, parent_repo, triple.target_sha, path)
+            child_source = gitlink_sha_at_commit(ctx, parent_repo, triple.source_sha, path)
+            if not child_base or not child_target or not child_source:
+                append_unique(fallback_reasons, "SUBMODULE_TOPOLOGY_CHANGED")
+                break
+
+            if not ensure_needed_submodule_worktree(ctx, parent_repo, path, display_path, sync_report, ci_module):
+                append_unique(fallback_reasons, "SUBMODULE_NOT_INITIALIZED")
+                break
+
+            child_repo = parent_repo / path
+            resolved_child_repo = child_repo.resolve(strict=False)
+            if resolved_child_repo not in fetched_repos:
+                fetch_submodule_repo(ctx, child_repo, display_path, depth + 1, sync_report, ci_module)
+                fetched_repos.add(resolved_child_repo)
+
+            stack.append(
+                (
+                    child_repo,
+                    display_path,
+                    MergeRefTriple(
+                        source=triple.source,
+                        source_sha=child_source,
+                        target_sha=child_target,
+                        merge_base_sha=child_base,
+                    ),
+                    depth + 1,
+                )
+            )
+        if fallback_reasons:
+            break
+
+    sync_report["submodule_fetch_needed_paths"] = needed_paths
+    if fallback_reasons:
+        sync_report["submodule_fetch_scope_effective"] = SUBMODULE_FETCH_SCOPE_ALL
+        sync_report["submodule_fetch_fallback_reasons"] = fallback_reasons
+        fetch_all_submodule_refs(ctx, repo_path, sync_report, ci_module)
+        return
+    sync_report["submodule_fetch_scope_effective"] = SUBMODULE_FETCH_SCOPE_NEEDED
 
 
 def sync_remote_refs(ctx: Any, repo_path: Path, ci_module: ModuleType | None = None) -> None:
     ctx.set_state(_phase(ci_module, "SYNCING_REFS"))
     sync_report = ctx.report.data["remote_sync"]
     sync_report["attempted"] = True
+    sync_report.setdefault("submodule_fetches", [])
+    sync_report.setdefault("submodule_updates", [])
+    sync_report.setdefault("submodule_fetch_fallback_reasons", [])
     sync_report["started_at"] = now_iso()
+    scope = str(getattr(ctx.args, "submodule_fetch_scope", SUBMODULE_FETCH_SCOPE_NEEDED) or SUBMODULE_FETCH_SCOPE_NEEDED).strip().lower()
+    if scope not in {SUBMODULE_FETCH_SCOPE_ALL, SUBMODULE_FETCH_SCOPE_NEEDED}:
+        scope = SUBMODULE_FETCH_SCOPE_NEEDED
+    sync_report["submodule_fetch_scope"] = scope
+    sync_report["submodule_fetch_scope_effective"] = None
     try:
         run_sync_command(
             ctx,
@@ -108,14 +470,11 @@ def sync_remote_refs(ctx: Any, repo_path: Path, ci_module: ModuleType | None = N
             "failed to sync submodule URLs before recursive fetch",
             ci_module,
         )
-        run_sync_command(
-            ctx,
-            repo_path,
-            ["submodule", "foreach", "--recursive", "git fetch --all --prune"],
-            "SUBMODULE_FETCH_FAILED",
-            "failed to recursively fetch submodule refs before merge",
-            ci_module,
-        )
+        if scope == SUBMODULE_FETCH_SCOPE_ALL:
+            sync_report["submodule_fetch_scope_effective"] = SUBMODULE_FETCH_SCOPE_ALL
+            fetch_all_submodule_refs(ctx, repo_path, sync_report, ci_module)
+        else:
+            fetch_needed_submodule_refs(ctx, repo_path, sync_report, ci_module)
         sync_report["success"] = True
     except Exception:
         sync_report["success"] = False

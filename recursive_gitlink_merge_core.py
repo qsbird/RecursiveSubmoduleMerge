@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from subprocess_window import hidden_subprocess_kwargs
+
 
 class GitlinkMergeError(RuntimeError):
     """Base error for the reusable gitlink merge core."""
@@ -109,6 +111,7 @@ class SubprocessGit:
                 errors="replace",
                 capture_output=True,
                 timeout=self.timeout_seconds,
+                **hidden_subprocess_kwargs(),
             )
             result = GitCommandResult(
                 args=cmd,

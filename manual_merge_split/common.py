@@ -109,7 +109,7 @@ def parse_branch_tokens(raw_value: str) -> list[str]:
 
 
 def normalize_argv(argv: list[str]) -> list[str]:
-    if argv and argv[0] in {"merge", "cleanup", "guided", "-h", "--help"}:
+    if argv and argv[0] in {"merge", "cleanup", "publish", "guided", "-h", "--help"}:
         return argv
     return ["merge", *argv]
 

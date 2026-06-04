@@ -12,6 +12,8 @@ import threading
 from pathlib import Path
 from typing import Iterable
 
+from subprocess_window import hidden_subprocess_kwargs
+
 from .models import GitBinaryResult, GitResult, MergeAutomationError
 
 
@@ -80,6 +82,7 @@ def run_git(
             capture_output=True,
             text=False,
             check=False,
+            **hidden_subprocess_kwargs(),
         )
         result = GitResult(
             args=cmd,
@@ -104,6 +107,7 @@ def run_git(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=False,
+        **hidden_subprocess_kwargs(),
     )
     encoding = (locale.getpreferredencoding(False) or "utf-8").strip() or "utf-8"
     events: queue.SimpleQueue[tuple[str, str | None]] = queue.SimpleQueue()
@@ -184,6 +188,7 @@ def run_git_binary(
         capture_output=True,
         text=False,
         check=False,
+        **hidden_subprocess_kwargs(),
     )
     result = GitBinaryResult(
         args=cmd,

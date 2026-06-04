@@ -12,6 +12,27 @@ class GitlinkMergeError(RuntimeError):
     """Base error for recursive gitlink merge failures."""
 
 
+class RequiredCommitFetchError(GitlinkMergeError):
+    """Raised when fetching refs failed while making a required commit available."""
+
+    def __init__(self, repo_path: Path, sha: str, fetch_result: "GitCommandResult") -> None:
+        self.repo_path = repo_path
+        self.sha = sha
+        self.fetch_result = fetch_result
+        detail = fetch_result.stderr.strip() or fetch_result.stdout.strip() or f"exit code {fetch_result.returncode}"
+        super().__init__(f"failed to fetch required commit {sha} in {repo_path}: {detail}")
+
+
+class RequiredCommitMissingError(GitlinkMergeError):
+    """Raised when refs were fetched but the required commit is still unavailable."""
+
+    def __init__(self, repo_path: Path, sha: str, check_result: "GitCommandResult") -> None:
+        self.repo_path = repo_path
+        self.sha = sha
+        self.check_result = check_result
+        super().__init__(f"required commit is unavailable in {repo_path}: {sha}")
+
+
 class NonGitlinkConflictError(GitlinkMergeError):
     """Raised when strict policy sees conflicts outside submodule gitlinks."""
 

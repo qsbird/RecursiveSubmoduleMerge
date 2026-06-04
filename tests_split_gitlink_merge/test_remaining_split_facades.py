@@ -4,8 +4,13 @@ import types
 import unittest
 import tempfile
 import json
+import io
+import sys
+import subprocess
+from unittest import mock
 from pathlib import Path
 
+import subprocess_window
 from ci_merge_split import CiWorkflowServices
 from ci_merge_split import artifacts as ci_artifacts
 from ci_merge_split import common as ci_common
@@ -21,6 +26,7 @@ from ci_merge_split.publish import PUBLISH_FUNCTIONS
 from ci_merge_split.report_artifacts import REPORT_ARTIFACT_FUNCTIONS
 from ci_merge_split.repository_guards import REPOSITORY_GUARD_FUNCTIONS
 from ci_merge_split.snapshot_restore import SNAPSHOT_RESTORE_FUNCTIONS
+from merge_cleanup_core import steps as cleanup_steps
 from manual_merge_split import ManualWorkflowServices
 from manual_merge_split import common as manual_common
 from manual_merge_split import execution as manual_execution
@@ -79,13 +85,13 @@ def fake_module(function_names: set[str]) -> tuple[types.SimpleNamespace, list[t
 
 
 class FakeCiCommandResult:
-    def __init__(self, args: list[str], stdout: str = "", exit_code: int = 0) -> None:
+    def __init__(self, args: list[str], stdout: str = "", exit_code: int = 0, stderr: str = "") -> None:
         self.args = args
         self.cmd = ["git", *args]
         self.cwd = "repo"
         self.exit_code = exit_code
         self.stdout = stdout
-        self.stderr = ""
+        self.stderr = stderr
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -228,6 +234,7 @@ class FakeCiContext:
             publish_target=None,
             publish_mode="push",
             candidate_ref=None,
+            allow_create_publish_target=False,
             from_report=None,
             allow_partial_publish=False,
             batch_failure_mode="fail-fast",
@@ -347,20 +354,24 @@ class RemainingSplitFacadeTests(unittest.TestCase):
         conflict_context = manual_models.MergeContext(
             work_branch="work",
             merge_branch="merge",
-            file_conflict_mode="preserve",
+            file_conflict_mode="tool",
             conflict_tool_command="tool",
             conflict_tool_timeout_seconds=1,
         )
-        unresolved, reason, rollback = services.file_conflicts.resolve_file_conflicts(Path("repo"), ["demo.txt"], conflict_context)
+        services.file_conflicts.record_file_conflicts(
+            Path("repo"),
+            ["demo.txt"],
+            conflict_context,
+            reason="manual merge required",
+        )
         services.cross_submodule_moves.collect_cross_submodule_moves(Path("repo"), ["old-lib"])
         services.repository_ops.ensure_commit_available(Path("repo"), "abc123")
         branch_tokens = services.guided_commands.parse_branch_tokens("a b")
 
         self.assertEqual(branch_tokens, ["a b"])
         self.assertEqual(dirty_impact[0], True)
-        self.assertEqual(unresolved, ["demo.txt"])
-        self.assertIn("preserve conflicts", reason)
-        self.assertFalse(rollback)
+        self.assertEqual(conflict_context.report_entries[0].files, ["demo.txt"])
+        self.assertIn("manual merge required", conflict_context.report_entries[0].reason)
         called_names = [item[0] for item in calls]
         self.assertNotIn("resolve_file_conflicts", called_names)
         self.assertNotIn("collect_cross_submodule_moves", called_names)
@@ -393,6 +404,23 @@ class RemainingSplitFacadeTests(unittest.TestCase):
             )
         )
         self.assertEqual(failure, "Command failed in repo: git demo\nstdout:\nout\nstderr:\nerr")
+
+    def test_manual_git_execution_hides_windows_child_console(self) -> None:
+        fake_completed = types.SimpleNamespace(returncode=0, stdout=b"ok\n", stderr=b"")
+        with mock.patch("manual_merge_split.execution.hidden_subprocess_kwargs", return_value={"creationflags": 1}):
+            with mock.patch("manual_merge_split.execution.subprocess.run", return_value=fake_completed) as run:
+                result = manual_execution.run_git(Path.cwd(), ["status"])
+
+        self.assertEqual(result.stdout, "ok")
+        self.assertEqual(run.call_args.kwargs["creationflags"], 1)
+
+    def test_windows_subprocess_helper_is_platform_scoped(self) -> None:
+        with mock.patch("subprocess_window.sys.platform", "linux"):
+            self.assertEqual(subprocess_window.hidden_subprocess_kwargs(), {})
+        if sys.platform == "win32":
+            kwargs = subprocess_window.hidden_subprocess_kwargs()
+            self.assertIn("startupinfo", kwargs)
+            self.assertIn("creationflags", kwargs)
 
 
 class ExtractedImplementationParityTests(unittest.TestCase):
@@ -438,9 +466,13 @@ class ExtractedImplementationParityTests(unittest.TestCase):
         self.assertEqual(report_value(nested, "a", "b"), self.ci_merge.report_value(nested, "a", "b"))
         self.assertEqual(report_value(nested, "x", "missing"), self.ci_merge.report_value(nested, "x", "missing"))
 
-        ctx = types.SimpleNamespace(args=types.SimpleNamespace(publish_target=None, remote="origin"))
+        ctx = types.SimpleNamespace(args=types.SimpleNamespace(publish_target="main", remote="origin"))
         report = {"input": {"target": "main"}, "publish": {"target": None}, "resolved": {"target_ref": "refs/heads/main"}}
-        self.assertEqual(infer_publish_target_from_report(ctx, report), self.ci_merge.infer_publish_target_from_report(ctx, report))
+        self.assertEqual(infer_publish_target_from_report(ctx, report), "main")
+        ctx.args.publish_target = None
+        with self.assertRaises(ci_models.CiMergeError) as missing_target:
+            infer_publish_target_from_report(ctx, report)
+        self.assertEqual(missing_target.exception.reason, "PUBLISH_TARGET_REQUIRED")
 
     def test_ci_command_helpers_match_original(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -531,10 +563,55 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             original_report = self.ci_merge.JsonReport(original_args, "job-42", *original_paths)
             for data in (local_report.data, original_report.data):
                 data.pop("started_at", None)
-            self.assertEqual(local_report.data["input"], original_report.data["input"])
+            local_input = local_report.data["input"].copy()
+            self.assertFalse(local_input.pop("allow_create_publish_target"))
+            self.assertEqual(local_input.pop("submodule_fetch_scope"), "needed")
+            self.assertEqual(local_input.pop("git_network_retries"), 2)
+            self.assertEqual(local_input.pop("git_network_retry_delay"), 3.0)
+            self.assertEqual(local_input, original_report.data["input"])
             self.assertEqual(local_report.data["batch"], original_report.data["batch"])
-            self.assertEqual(local_report.data["publish"], original_report.data["publish"])
+            local_publish = local_report.data["publish"].copy()
+            self.assertFalse(local_publish.pop("allow_create_target"))
+            self.assertFalse(local_publish.pop("target_created"))
+            self.assertIsNone(local_publish.pop("target_publish_mode"))
+            self.assertEqual(local_publish, original_report.data["publish"])
             self.assertEqual(set(local_report.data), set(original_report.data))
+
+    def test_ci_runtime_publish_requires_explicit_publish_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir()
+            publish_args = ci_runtime.parse_arguments(
+                [
+                    "--source",
+                    "feature",
+                    "--target",
+                    "main",
+                    "--repo_path",
+                    str(repo),
+                    "--publish",
+                    "true",
+                ]
+            )
+            ci_runtime.normalize_args(publish_args, "job-42")
+            with self.assertRaises(ci_models.CiMergeError) as publish_error:
+                ci_runtime.validate_args(publish_args)
+            self.assertEqual(publish_error.exception.reason, "PUBLISH_TARGET_REQUIRED")
+
+            publish_only_args = ci_runtime.parse_arguments(
+                [
+                    "--publish_only",
+                    "true",
+                    "--from_report",
+                    str(Path(temp_dir) / "merge-report.json"),
+                    "--repo_path",
+                    str(repo),
+                ]
+            )
+            ci_runtime.normalize_args(publish_only_args, "job-42")
+            with self.assertRaises(ci_models.CiMergeError) as publish_only_error:
+                ci_runtime.validate_args(publish_only_args)
+            self.assertEqual(publish_only_error.exception.reason, "PUBLISH_TARGET_REQUIRED")
 
     def test_ci_runtime_multi_source_argument_compatibility(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -717,6 +794,37 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             self.assertEqual(merge_calls[0]["target_sha"], "targetsha")
             self.assertIn("SINGLE start source=source target=main", ctx.report.progress_messages)
             self.assertIn("SINGLE success result=resultsha", ctx.report.progress_messages)
+
+    def test_ci_single_workflow_converts_mixed_conflict_to_root_conflict(self) -> None:
+        from split_gitlink_merge import Conflict, NonGitlinkConflictError
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "repo"
+            root.mkdir()
+            ctx = FakeCiContext(Path(temp_dir))
+            ctx.root_repo = root
+
+            def merge_repo(_ctx_arg: object, repo_path: Path, **_kwargs: object) -> object:
+                conflicts = [
+                    Conflict(repo_path=repo_path, path="file.txt", stages=(), kind="file"),
+                    Conflict(repo_path=repo_path, path="submodule", stages=(), kind="gitlink"),
+                ]
+                raise NonGitlinkConflictError(repo_path, conflicts)
+
+            with self.assertRaises(ci_models.CiMergeError) as raised:
+                ci_commands.run_single_workflow(ctx, CiWorkflowServices.from_local(), merge_repo)
+
+            error = raised.exception
+            self.assertEqual(error.exit_code, ci_models.ExitCode.ROOT_CONFLICT)
+            self.assertEqual(error.phase, ci_models.Phase.MERGING_ROOT)
+            self.assertEqual(error.reason, "NON_GITLINK_CONFLICT")
+            self.assertTrue(error.restore_needed)
+            self.assertEqual(error.details["type"], "NonGitlinkConflictError")
+            self.assertEqual(
+                [item["type"] for item in error.details["conflicts"]],
+                ["file_conflict", "gitlink_conflict"],
+            )
+            self.assertIn("SINGLE failed reason=NON_GITLINK_CONFLICT", ctx.report.progress_messages)
 
     def test_ci_batch_progress_reports_minimal_step_updates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -945,6 +1053,13 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             ctx = FakeCiContext(Path(temp_dir))
             repo = Path(temp_dir) / "repo"
             repo.mkdir()
+            self.assertEqual(ci_recovery.clean_flag(ctx), "-fd")
+            self.assertEqual(ci_recovery.clean_flag(ctx, remove_nested_git_repos=True), "-ffd")
+            ctx.allow_clean_x = True
+            self.assertEqual(ci_recovery.clean_flag(ctx), "-fdx")
+            self.assertEqual(ci_recovery.clean_flag(ctx, remove_nested_git_repos=True), "-ffdx")
+            ctx.allow_clean_x = False
+
             cleanup = ci_recovery.run_cleanup_steps(
                 ctx,
                 repo,
@@ -964,17 +1079,62 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             restore_data = ctx.report.data["restore"]
             self.assertTrue(restore_data["attempted"])
             self.assertTrue(restore_data["success"])
+            calls = [(call[0], call[1], call[2]) for call in ctx.runner.calls]
+            self.assertIn((repo, ("clean", "-ffd"), False), calls)
+            self.assertIn((repo, ("submodule", "foreach", "--recursive", "git clean -ffd"), True), calls)
+
+    def test_shared_cleanup_core_builds_ci_cleanup_sequences(self) -> None:
+        self.assertEqual(cleanup_steps.git_clean_flag(False), "-fd")
+        self.assertEqual(cleanup_steps.git_clean_flag(True), "-fdx")
+        self.assertEqual(cleanup_steps.git_clean_flag(False, remove_nested_git_repos=True), "-ffd")
+        self.assertEqual(cleanup_steps.git_clean_flag(True, remove_nested_git_repos=True), "-ffdx")
+
+        levels = cleanup_steps.ci_prepare_cleanup_levels(False)
+        self.assertEqual([level.name for level in levels], [
+            "level_1_basic_cleanup",
+            "level_2_abort_and_recursive_cleanup",
+            "level_3_sync_and_force_update",
+        ])
+        self.assertIn(("clean", "-ffd"), [step.args for step in levels[1].steps])
+        self.assertIn(
+            ("submodule", "foreach", "--recursive", "git clean -ffd"),
+            [step.args for step in levels[1].steps],
+        )
+
+        batch_args = [step.args for step in cleanup_steps.ci_batch_continue_restore_steps("targetsha", False)]
+        self.assertEqual(batch_args[0], ("merge", "--abort"))
+        self.assertIn(("reset", "--hard", "targetsha"), batch_args)
+        self.assertIn(("submodule", "update", "--init", "--recursive", "--force"), batch_args)
+
+    def test_ci_cleanup_runner_accepts_shared_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = FakeCiContext(Path(temp_dir))
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir()
+
+            cleanup = ci_recovery.run_cleanup_steps(
+                ctx,
+                repo,
+                "shared",
+                [cleanup_steps.reset_hard_step()],
+            )
+
+            self.assertTrue(cleanup["success"])
+            self.assertEqual(cleanup["steps"][0]["cmd"], ["git", "reset", "--hard"])
 
     def test_ci_publish_result_is_local(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             runner = FakePublishRunner()
             ctx = FakeCiContext(Path(temp_dir), runner)
+            ctx.args.publish_target = "main"
             repo = Path(temp_dir) / "repo"
             repo.mkdir()
 
             publish = publish_result(ctx, repo, "targetsha", "resultsha")
 
             self.assertTrue(publish["success"])
+            self.assertFalse(publish["target_created"])
+            self.assertEqual(publish["target_publish_mode"], "force-with-lease")
             self.assertEqual(publish["remote_target_before_sha"], "targetsha")
             self.assertEqual(publish["remote_target_after_sha"], "resultsha")
             pushed = [call[1] for call in runner.calls if call[1] and call[1][0] == "push"]
@@ -985,6 +1145,70 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                     "--force-with-lease=main:targetsha",
                     "origin",
                     "resultsha:main",
+                ),
+                pushed,
+            )
+
+    def test_ci_publish_result_creates_missing_target_only_when_allowed(self) -> None:
+        class MissingTargetRunner(FakePublishRunner):
+            def __init__(self) -> None:
+                super().__init__()
+                self.target_fetches = 0
+
+            def run(self, repo_path: Path, args: list[str], *, allow_failure: bool = False) -> FakeCiCommandResult:
+                self.calls.append((repo_path, tuple(args), allow_failure))
+                if args == ["fetch", "origin", "new-target"]:
+                    self.target_fetches += 1
+                    if self.target_fetches == 1:
+                        return FakeCiCommandResult(
+                            args,
+                            exit_code=128,
+                            stderr="fatal: couldn't find remote ref new-target\n",
+                        )
+                    return FakeCiCommandResult(args)
+                if args == ["rev-parse", "FETCH_HEAD"]:
+                    return FakeCiCommandResult(args, stdout="resultsha\n")
+                return FakeCiCommandResult(args)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir()
+            blocked = FakeCiContext(Path(temp_dir), MissingTargetRunner())
+            blocked.args.publish_target = "new-target"
+
+            with self.assertRaises(ci_models.CiMergeError) as blocked_error:
+                publish_result(blocked, repo, "targetsha", "resultsha")
+            self.assertEqual(blocked_error.exception.reason, "PUBLISH_TARGET_NOT_FOUND")
+
+            runner = MissingTargetRunner()
+            ctx = FakeCiContext(Path(temp_dir), runner)
+            ctx.args.publish_target = "new-target"
+            ctx.args.allow_create_publish_target = True
+
+            publish = publish_result(ctx, repo, "targetsha", "resultsha")
+
+            self.assertTrue(publish["success"])
+            self.assertTrue(publish["target_created"])
+            self.assertEqual(publish["target_publish_mode"], "create")
+            self.assertIsNone(publish["remote_target_before_sha"])
+            self.assertEqual(publish["remote_target_after_sha"], "resultsha")
+            pushed = [call[1] for call in runner.calls if call[1] and call[1][0] == "push"]
+            self.assertIn(
+                (
+                    "push",
+                    "--recurse-submodules=check",
+                    "origin",
+                    "resultsha:refs/heads/new-target",
+                ),
+                pushed,
+            )
+            self.assertNotIn(
+                (
+                    "push",
+                    "--recurse-submodules=check",
+                    "--force-with-lease=new-target:targetsha",
+                    "origin",
+                    "resultsha:new-target",
                 ),
                 pushed,
             )
@@ -1017,6 +1241,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             ctx.root_repo = root / "repo"
             ctx.root_repo.mkdir()
             ctx.args.from_report = str(report_path)
+            ctx.args.publish_target = "main"
 
             run_publish_only_workflow(ctx)
 
@@ -1050,8 +1275,13 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             allow_failure=True,
             timed_out=False,
         )
-        original_command = self.ci_merge.CommandResult(**local_command.to_dict())
-        self.assertEqual(local_command.to_dict(), original_command.to_dict())
+        local_command_dict = local_command.to_dict()
+        legacy_command_dict = dict(local_command_dict)
+        self.assertEqual(legacy_command_dict.pop("attempt"), 1)
+        self.assertEqual(legacy_command_dict.pop("max_attempts"), 1)
+        self.assertIsNone(legacy_command_dict.pop("network_failure_reason"))
+        original_command = self.ci_merge.CommandResult(**legacy_command_dict)
+        self.assertEqual(legacy_command_dict, original_command.to_dict())
 
         local_error = ci_models.CiMergeError(
             ci_models.ExitCode.ARGUMENT_ERROR,
@@ -1275,7 +1505,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             "repo",
             "--continue-current-branch",
             "--file-conflict-mode",
-            "preserve",
+            "tool",
             "--ignore-root-untracked-path",
             "generated.txt",
         ]
@@ -1285,6 +1515,9 @@ class ExtractedImplementationParityTests(unittest.TestCase):
         self.assertFalse(local_merge_values.pop("no_confirm_after_conflict_tool"))
         self.assertFalse(local_merge_values.pop("enable_cross_submodule_moves"))
         self.assertEqual(local_merge_values, vars(original_merge))
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(SystemExit):
+                manual_runtime.parse_args(["feature", "--file-conflict-mode", "preserve"])
 
         cleanup_argv = [
             "cleanup",
@@ -1366,6 +1599,117 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             self.assertIn(("reset", "--hard", "HEAD"), calls)
             self.assertIn(("submodule", "update", "--init", "--recursive"), calls)
 
+    def test_manual_merge_refuses_to_reset_existing_work_branch_with_local_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            calls: list[tuple[str, ...]] = []
+
+            def run_git(_repo_path: Path, args: list[str], **_kwargs: object) -> FakeManualGitResult:
+                calls.append(tuple(args))
+                if args == ["rev-parse", "--show-toplevel"]:
+                    return FakeManualGitResult(args, stdout=str(repo) + "\n")
+                if args == ["rev-parse", "-q", "--verify", "MERGE_HEAD"]:
+                    return FakeManualGitResult(args, returncode=1)
+                if args == ["config", "--get", "user.name"]:
+                    return FakeManualGitResult(args, stdout="User\n")
+                if args == ["config", "--get", "user.email"]:
+                    return FakeManualGitResult(args, stdout="user@example.com\n")
+                if args == ["status", "--porcelain", "--ignore-submodules=dirty"]:
+                    return FakeManualGitResult(args)
+                if args == ["status", "--porcelain"]:
+                    return FakeManualGitResult(args)
+                if args == ["remote"]:
+                    return FakeManualGitResult(args, stdout="origin\n")
+                if args == ["rev-parse", "--verify", "refs/heads/work^{commit}"]:
+                    return FakeManualGitResult(args, stdout="local-only-commit\n")
+                if args == ["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"]:
+                    return FakeManualGitResult(args, stdout="base-commit\n")
+                return FakeManualGitResult(args)
+
+            module = types.SimpleNamespace(
+                run_git=run_git,
+                run_git_binary=lambda _repo_path, args, **_kwargs: FakeManualBinaryResult(args, b""),
+                MergeAutomationError=manual_models.MergeAutomationError,
+                VERBOSE=False,
+            )
+            service = ManualCommandService(module)  # type: ignore[arg-type]
+
+            result = service.run_merge(
+                types.SimpleNamespace(
+                    repo=str(repo),
+                    base_remote_branch="origin/main",
+                    merge_branches=["origin/feature"],
+                    continue_current_branch=False,
+                    work_branch="work",
+                    clone_branch=None,
+                    clone_url=None,
+                    clone_path=None,
+                    report_file="merge_manual_todo.txt",
+                    verbose=False,
+                    ignore_root_untracked_path=[],
+                    allow_dirty_submodules=False,
+                    no_prompt_dirty_submodules=True,
+                    file_conflict_mode="tool",
+                    conflict_tool_command="tool",
+                    conflict_tool_timeout_seconds=1,
+                    no_confirm_after_conflict_tool=False,
+                    enable_cross_submodule_moves=False,
+                )
+            )
+
+            self.assertEqual(result, 1)
+            self.assertNotIn(("checkout", "-B", "work", "refs/remotes/origin/main"), calls)
+
+    def test_manual_cleanup_rebuild_refuses_to_reset_existing_work_branch_with_local_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            calls: list[tuple[str, ...]] = []
+
+            def run_git(_repo_path: Path, args: list[str], **_kwargs: object) -> FakeManualGitResult:
+                calls.append(tuple(args))
+                if args == ["rev-parse", "--show-toplevel"]:
+                    return FakeManualGitResult(args, stdout=str(repo) + "\n")
+                if args == ["config", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"]:
+                    return FakeManualGitResult(args, returncode=1)
+                if args == ["rev-parse", "-q", "--verify", "MERGE_HEAD"]:
+                    return FakeManualGitResult(args, returncode=1)
+                if args == ["diff", "--name-only", "--diff-filter=U"]:
+                    return FakeManualGitResult(args)
+                if args == ["rev-parse", "--verify", "HEAD"]:
+                    return FakeManualGitResult(args, stdout="headsha\n")
+                if args == ["status", "--porcelain"]:
+                    return FakeManualGitResult(args)
+                if args == ["remote"]:
+                    return FakeManualGitResult(args, stdout="origin\n")
+                if args == ["rev-parse", "--verify", "refs/heads/work^{commit}"]:
+                    return FakeManualGitResult(args, stdout="local-only-commit\n")
+                if args == ["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"]:
+                    return FakeManualGitResult(args, stdout="base-commit\n")
+                return FakeManualGitResult(args)
+
+            module = types.SimpleNamespace(
+                run_git=run_git,
+                run_git_binary=lambda _repo_path, args, **_kwargs: FakeManualBinaryResult(args, b""),
+                MergeAutomationError=manual_models.MergeAutomationError,
+                VERBOSE=False,
+            )
+            service = ManualCommandService(module)  # type: ignore[arg-type]
+
+            result = service.run_cleanup(
+                types.SimpleNamespace(
+                    repo=str(repo),
+                    report_file="merge_manual_todo.txt",
+                    skip_submodule_update=True,
+                    rebuild_work_branch=True,
+                    base_remote_branch="origin/main",
+                    work_branch="work",
+                    verbose=False,
+                )
+            )
+
+            self.assertEqual(result, 1)
+            self.assertNotIn(("checkout", "-B", "work", "refs/remotes/origin/main"), calls)
+
     def test_manual_merge_updates_submodules_after_root_checkout_before_clean_check(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo = Path(temp_dir)
@@ -1430,7 +1774,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                     ignore_root_untracked_path=[],
                     allow_dirty_submodules=False,
                     no_prompt_dirty_submodules=True,
-                    file_conflict_mode="preserve",
+                    file_conflict_mode="tool",
                     conflict_tool_command="tool",
                     conflict_tool_timeout_seconds=1,
                     no_confirm_after_conflict_tool=False,
@@ -1447,7 +1791,6 @@ class ExtractedImplementationParityTests(unittest.TestCase):
 
     def test_manual_process_repository_file_conflict_is_local(self) -> None:
         from manual_merge_split.cross_submodule_moves import CrossSubmoduleMoveService
-        from manual_merge_split.file_conflicts import ManualFileConflictService
         from manual_merge_split.repository_ops import ManualRepositoryOps
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1470,10 +1813,17 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                     return FakeManualGitResult(args)
                 if args == ["merge", "--no-ff", "feature"]:
                     return FakeManualGitResult(args)
+                if args == ["ls-files", "-u"]:
+                    return FakeManualGitResult(
+                        args,
+                        stdout=(
+                            "100644 base 1\tfile.txt\n"
+                            "100644 ours 2\tfile.txt\n"
+                            "100644 theirs 3\tfile.txt\n"
+                        ),
+                    )
                 if args == ["diff", "--name-only", "--diff-filter=U"]:
                     return FakeManualGitResult(args, stdout="file.txt\n")
-                if args == ["ls-files", "--stage", "--", "file.txt"]:
-                    return FakeManualGitResult(args, stdout="100644 abc 1\tfile.txt\n")
                 return FakeManualGitResult(args)
 
             module = types.SimpleNamespace(
@@ -1485,10 +1835,33 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             context = manual_models.MergeContext(
                 work_branch="work",
                 merge_branch="feature",
-                file_conflict_mode="preserve",
+                file_conflict_mode="tool",
                 conflict_tool_command="tool",
                 conflict_tool_timeout_seconds=1,
             )
+
+            class FakeFileConflictService:
+                def resolve_moved_away_file_conflicts(self, *_args: object) -> list[str]:
+                    return []
+
+                def resolve_file_conflicts(
+                    self,
+                    _repo_path: Path,
+                    file_conflicts: list[str],
+                    _context: manual_models.MergeContext,
+                ) -> tuple[list[str], str, bool]:
+                    return file_conflicts, "manual file conflict requires hand merge", False
+
+                def record_file_conflicts(
+                    self,
+                    repo_path: Path,
+                    file_conflicts: list[str],
+                    merge_context: manual_models.MergeContext,
+                    *,
+                    reason: str,
+                    category: str = "manual_conflict",
+                ) -> None:
+                    record_file_conflicts(repo_path, file_conflicts, merge_context, reason=reason, category=category)
 
             completed = process_repository(
                 repo,
@@ -1497,7 +1870,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                 is_root=True,
                 prepare_branch=False,
                 ops=ManualRepositoryOps(module),  # type: ignore[arg-type]
-                file_conflicts_service=ManualFileConflictService(module),  # type: ignore[arg-type]
+                file_conflicts_service=FakeFileConflictService(),  # type: ignore[arg-type]
                 cross_submodule_moves_service=CrossSubmoduleMoveService(module),  # type: ignore[arg-type]
             )
 
@@ -1508,6 +1881,124 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             report_path = repo / "merge_manual_todo.txt"
             write_report(report_path, context)
             self.assertIn("file.txt", report_path.read_text(encoding="utf-8"))
+
+    def test_manual_repository_ops_classifies_incomplete_stage_conflicts(self) -> None:
+        from manual_merge_split.repository_ops import ManualRepositoryOps
+
+        def run_git(_repo_path: Path, args: list[str], **_kwargs: object) -> FakeManualGitResult:
+            if args == ["ls-files", "-u"]:
+                return FakeManualGitResult(
+                    args,
+                    stdout=(
+                        "100644 base 1\tcomplete-file.txt\n"
+                        "100644 ours 2\tcomplete-file.txt\n"
+                        "100644 theirs 3\tcomplete-file.txt\n"
+                        "160000 base 1\tcomplete-submodule\n"
+                        "160000 ours 2\tcomplete-submodule\n"
+                        "160000 theirs 3\tcomplete-submodule\n"
+                        "100644 base 1\tdeleted-by-them.txt\n"
+                        "100644 ours 2\tdeleted-by-them.txt\n"
+                        "160000 base 1\tdeleted-submodule\n"
+                        "160000 theirs 3\tdeleted-submodule\n"
+                    ),
+                )
+            return FakeManualGitResult(args)
+
+        module = types.SimpleNamespace(
+            run_git=run_git,
+            MergeAutomationError=manual_models.MergeAutomationError,
+            VERBOSE=False,
+        )
+        ops = ManualRepositoryOps(module)  # type: ignore[arg-type]
+
+        submodule_conflicts, file_conflicts, incomplete = ops.split_conflicts_by_stage(Path("repo"))
+
+        self.assertEqual(submodule_conflicts, ["complete-submodule"])
+        self.assertEqual(file_conflicts, ["complete-file.txt"])
+        self.assertEqual([item.path for item in incomplete], ["deleted-by-them.txt", "deleted-submodule"])
+        self.assertFalse(incomplete[0].is_gitlink)
+        self.assertTrue(incomplete[1].is_gitlink)
+        self.assertEqual(incomplete[0].stages, (1, 2))
+        self.assertEqual(incomplete[1].missing_stages, (2,))
+
+    def test_manual_process_repository_stops_on_incomplete_stage_conflicts(self) -> None:
+        from manual_merge_split.cross_submodule_moves import CrossSubmoduleMoveService
+        from manual_merge_split.file_conflicts import ManualFileConflictService
+        from manual_merge_split.repository_ops import ManualRepositoryOps
+
+        cases = [
+            (
+                "file.txt",
+                "100644 base 1\tfile.txt\n100644 ours 2\tfile.txt\n",
+                "file",
+                "missing=3",
+            ),
+            (
+                "libs/sub",
+                "160000 base 1\tlibs/sub\n160000 theirs 3\tlibs/sub\n",
+                "gitlink",
+                "missing=2",
+            ),
+        ]
+
+        for path, unmerged_index, expected_type, expected_missing in cases:
+            with self.subTest(path=path):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    repo = Path(temp_dir)
+                    calls: list[tuple[str, ...]] = []
+
+                    def run_git(_repo_path: Path, args: list[str], **_kwargs: object) -> FakeManualGitResult:
+                        calls.append(tuple(args))
+                        if args == ["rev-parse", "--show-toplevel"]:
+                            return FakeManualGitResult(args, stdout=str(repo) + "\n")
+                        if args == ["rev-parse", "-q", "--verify", "MERGE_HEAD"]:
+                            return FakeManualGitResult(args, returncode=1)
+                        if args == ["config", "--get", "user.name"]:
+                            return FakeManualGitResult(args, stdout="User\n")
+                        if args == ["config", "--get", "user.email"]:
+                            return FakeManualGitResult(args, stdout="user@example.com\n")
+                        if args == ["status", "--porcelain"]:
+                            return FakeManualGitResult(args)
+                        if args == ["remote"]:
+                            return FakeManualGitResult(args)
+                        if args == ["merge", "--no-ff", "feature"]:
+                            return FakeManualGitResult(args)
+                        if args == ["ls-files", "-u"]:
+                            return FakeManualGitResult(args, stdout=unmerged_index)
+                        return FakeManualGitResult(args)
+
+                    module = types.SimpleNamespace(
+                        run_git=run_git,
+                        run_git_binary=lambda _repo_path, args, **_kwargs: FakeManualBinaryResult(args, b""),
+                        MergeAutomationError=manual_models.MergeAutomationError,
+                        VERBOSE=False,
+                    )
+                    context = manual_models.MergeContext(
+                        work_branch="work",
+                        merge_branch="feature",
+                        file_conflict_mode="tool",
+                        conflict_tool_command="tool",
+                        conflict_tool_timeout_seconds=1,
+                    )
+
+                    completed = process_repository(
+                        repo,
+                        context,
+                        root_base_remote_branch=None,
+                        is_root=True,
+                        prepare_branch=False,
+                        ops=ManualRepositoryOps(module),  # type: ignore[arg-type]
+                        file_conflicts_service=ManualFileConflictService(module),  # type: ignore[arg-type]
+                        cross_submodule_moves_service=CrossSubmoduleMoveService(module),  # type: ignore[arg-type]
+                    )
+
+                    self.assertFalse(completed)
+                    self.assertEqual(context.report_entries[0].category, "incomplete_stage_conflict")
+                    self.assertEqual(context.report_entries[0].files, [path])
+                    self.assertIn(expected_type, context.report_entries[0].reason)
+                    self.assertIn(expected_missing, context.report_entries[0].reason)
+                    self.assertNotIn(("diff", "--name-only", "--diff-filter=U"), calls)
+                    self.assertNotIn(("ls-files", "-u", "--", path), calls)
 
     def test_manual_file_conflict_helpers_are_local(self) -> None:
         context = manual_models.MergeContext(
@@ -1520,21 +2011,6 @@ class ExtractedImplementationParityTests(unittest.TestCase):
         record_file_conflicts(Path("repo"), ["a.txt"], context, reason="reason", category="cat")
         self.assertEqual(context.report_entries[0].files, ["a.txt"])
         self.assertEqual(context.report_entries[0].category, "cat")
-
-        preserve = manual_models.MergeContext(
-            work_branch="work",
-            merge_branch="merge",
-            file_conflict_mode="preserve",
-            conflict_tool_command="code",
-            conflict_tool_timeout_seconds=1,
-        )
-        resolution = resolve_single_file_conflict(
-            Path("repo"),
-            "a.txt",
-            preserve,
-            run_git=lambda *_args, **_kwargs: FakeManualGitResult([]),
-        )
-        self.assertEqual(resolution.reason, "current run is configured to preserve conflicts")
 
         calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
 
@@ -1596,6 +2072,38 @@ class ExtractedImplementationParityTests(unittest.TestCase):
         self.assertEqual(reason, "")
         self.assertFalse(rollback)
         self.assertIn(("add", "--", "a.txt"), git_calls)
+
+        class TimeoutProcess:
+            returncode = None
+
+            def __init__(self) -> None:
+                self.wait_calls = 0
+                self.terminated = False
+
+            def wait(self, timeout: int | None = None) -> None:
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise subprocess.TimeoutExpired("tool", timeout)
+                return None
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def kill(self) -> None:
+                return None
+
+        timeout_process = TimeoutProcess()
+        unresolved, reason, rollback = resolve_file_conflicts(
+            Path("repo"),
+            ["a.txt"],
+            tool_context,
+            run_git=run_git_for_tool,
+            popen_factory=lambda *_args, **_kwargs: timeout_process,
+        )
+        self.assertEqual(unresolved, ["a.txt"])
+        self.assertIn("leaving the working tree unchanged", reason)
+        self.assertFalse(rollback)
+        self.assertTrue(timeout_process.terminated)
 
         confirming_context = manual_models.MergeContext(
             work_branch="work",
@@ -1678,6 +2186,70 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             self.assertIn(("checkout", "main"), calls)
             self.assertIn(("reset", "--hard", "headsha"), calls)
             self.assertIn(("submodule", "update", "--init", "--recursive"), calls)
+
+    def test_restore_snapshot_refuses_to_rewind_branch_with_new_commits(self) -> None:
+        from manual_merge_split.repository_ops import ManualRepositoryOps
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            calls: list[tuple[str, ...]] = []
+
+            def run_git(_repo_path: Path, args: list[str], **_kwargs: object) -> FakeManualGitResult:
+                calls.append(tuple(args))
+                if args == ["rev-parse", "--show-toplevel"]:
+                    return FakeManualGitResult(args, stdout=str(repo) + "\n")
+                if args == ["show-ref", "--verify", "refs/heads/main"]:
+                    return FakeManualGitResult(args, stdout="newsha refs/heads/main\n")
+                if args == ["rev-parse", "--verify", "refs/heads/main^{commit}"]:
+                    return FakeManualGitResult(args, stdout="newsha\n")
+                if args == ["rev-parse", "--verify", "oldsha^{commit}"]:
+                    return FakeManualGitResult(args, stdout="oldsha\n")
+                return FakeManualGitResult(args)
+
+            module = types.SimpleNamespace(
+                run_git=run_git,
+                MergeAutomationError=manual_models.MergeAutomationError,
+                VERBOSE=False,
+            )
+            ops = ManualRepositoryOps(module)  # type: ignore[arg-type]
+            snapshot = manual_models.RepoSnapshot(repo.resolve(), "oldsha", "main")
+
+            with self.assertRaises(manual_models.MergeAutomationError):
+                ops.restore_snapshot(repo, {repo.resolve(): snapshot}, is_root=False)
+
+            self.assertNotIn(("reset", "--hard", "oldsha"), calls)
+
+    def test_restore_snapshot_refuses_to_leave_detached_local_commit(self) -> None:
+        from manual_merge_split.repository_ops import ManualRepositoryOps
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            calls: list[tuple[str, ...]] = []
+
+            def run_git(_repo_path: Path, args: list[str], **_kwargs: object) -> FakeManualGitResult:
+                calls.append(tuple(args))
+                if args == ["rev-parse", "--show-toplevel"]:
+                    return FakeManualGitResult(args, stdout=str(repo) + "\n")
+                if args == ["symbolic-ref", "--quiet", "--short", "HEAD"]:
+                    return FakeManualGitResult(args, returncode=1)
+                if args == ["rev-parse", "--verify", "HEAD^{commit}"]:
+                    return FakeManualGitResult(args, stdout="detached-local\n")
+                if args == ["rev-parse", "--verify", "oldsha^{commit}"]:
+                    return FakeManualGitResult(args, stdout="oldsha\n")
+                return FakeManualGitResult(args, returncode=1)
+
+            module = types.SimpleNamespace(
+                run_git=run_git,
+                MergeAutomationError=manual_models.MergeAutomationError,
+                VERBOSE=False,
+            )
+            ops = ManualRepositoryOps(module)  # type: ignore[arg-type]
+            snapshot = manual_models.RepoSnapshot(repo.resolve(), "oldsha", None)
+
+            with self.assertRaises(manual_models.MergeAutomationError):
+                ops.restore_snapshot(repo, {repo.resolve(): snapshot}, is_root=False)
+
+            self.assertNotIn(("checkout", "--detach", "oldsha"), calls)
 
     def test_manual_cross_submodule_merge_file_contents_is_local(self) -> None:
         move = manual_models.CrossSubmoduleMove(

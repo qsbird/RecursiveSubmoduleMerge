@@ -24,8 +24,16 @@ from .models import (
     RepoSnapshot,
     SubmoduleConflictInfo,
     TextMergeNormalization,
+    UnmergedConflict,
 )
 from .preflight import ManualPreflightService
+from .publish import (
+    ManualPublishService,
+    PublishPlanItem,
+    PublishResult,
+    run_publish,
+    run_publish_workflow,
+)
 from .repository_ops import ManualRepositoryOps
 from .runtime import build_parser, main, parse_args
 from .workflow import ManualWorkflowServices
@@ -47,14 +55,18 @@ __all__ = [
     "ManualGuidedCommandService",
     "ManualCommandService",
     "ManualPreflightService",
+    "ManualPublishService",
     "ManualRepositoryOps",
     "ManualWorkflowServices",
     "MergeBatchResult",
     "MergeContext",
     "MergePreflightResult",
+    "PublishPlanItem",
+    "PublishResult",
     "RepoSnapshot",
     "SubmoduleConflictInfo",
     "TextMergeNormalization",
+    "UnmergedConflict",
     "load_manual_merge_module",
     "build_parser",
     "format_git_failure",
@@ -62,6 +74,8 @@ __all__ = [
     "parse_args",
     "run_git",
     "run_git_binary",
+    "run_publish",
+    "run_publish_workflow",
     "set_verbose",
     "verbose_print",
 ]

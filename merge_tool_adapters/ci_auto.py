@@ -285,7 +285,7 @@ class CiAutoGitlinkMergeService:
         self._record_snapshot(repo, source_sha, target_sha, depth)
         branch = self._branch_for_depth(depth)
         self.actions.run(repo, ["checkout", "-B", branch, target_sha])
-        self.actions.run(repo, ["submodule", "update", "--init", "--recursive", "--force"], check=False)
+        self._sync_submodules_for_head(repo)
 
         merge = self.actions.merge_no_commit(repo, source_sha)
         strategy = "clean_merge"
@@ -313,8 +313,12 @@ class CiAutoGitlinkMergeService:
             strategy,
         )
         result_sha = self.actions.commit_pending_merge(repo, message)
+        self._sync_submodules_for_head(repo)
         self._collect_repository_details(repo, display_path or self._display_path(repo), base_sha, target_sha, source_sha, result_sha, strategy)
         return CiMergeResult(repo, display_path or self._display_path(repo), base_sha, source_sha, target_sha, result_sha, strategy)
+
+    def _sync_submodules_for_head(self, repo: Path) -> None:
+        self.actions.run(repo, ["submodule", "update", "--init", "--recursive", "--force"], check=False)
 
     def _build_commit_message(
         self,

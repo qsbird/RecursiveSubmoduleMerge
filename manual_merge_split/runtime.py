@@ -36,6 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_cleanup_arguments(cleanup_parser)
 
+    publish_parser = subparsers.add_parser(
+        "publish",
+        help="Recursively publish the root HEAD and referenced submodule commits.",
+    )
+    add_publish_arguments(publish_parser)
+
     guided_parser = subparsers.add_parser(
         "guided",
         help="Launch an interactive command-line wizard for merge and cleanup.",
@@ -130,7 +136,7 @@ def add_merge_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--file-conflict-mode",
-        choices=["tool", "preserve"],
+        choices=["tool"],
         default=DEFAULT_FILE_CONFLICT_MODE,
         help="How to handle normal file conflicts. Default: %(default)s",
     )
@@ -214,6 +220,48 @@ def add_cleanup_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_publish_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--repo",
+        default=".",
+        help="Root repository path. Defaults to the current directory.",
+    )
+    parser.add_argument(
+        "--remote",
+        default="origin",
+        help="Remote name used for all repositories. Default: origin",
+    )
+    parser.add_argument(
+        "--push-target",
+        "--push_target",
+        dest="push_target",
+        required=True,
+        help="Remote branch name to publish in the root repository and all submodules.",
+    )
+    parser.add_argument(
+        "--check-only",
+        "--check_only",
+        dest="check_only",
+        action="store_true",
+        help="Run all publish checks and dry-run pushes without changing local branch refs or pushing.",
+    )
+    parser.add_argument(
+        "--no-sync-local-branches",
+        action="store_true",
+        help="Do not create best-effort local branch refs that point at the published commits.",
+    )
+    parser.add_argument(
+        "--no-branch-suffix",
+        action="store_true",
+        help="Do not create a suffix branch when the requested local branch name points elsewhere.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print executed commands and key progress information.",
+    )
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     normalized = common.normalize_argv(list(sys.argv[1:] if argv is None else argv))
@@ -230,6 +278,8 @@ def main(
     commands = command_service or ManualCommandService()
     if args.command == "cleanup":
         return commands.run_cleanup(args)
+    if args.command == "publish":
+        return commands.run_publish(args)
     if args.command == "guided":
         if guided_service is not None:
             return guided_service.run_guided(args)

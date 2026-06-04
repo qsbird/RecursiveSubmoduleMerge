@@ -8,6 +8,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable
 
+from merge_cleanup_core import steps as cleanup_steps
+
 from . import runtime
 from .models import CiMergeError, CommandResult, ExitCode, MergeStepContext, Phase, PreflightResult, now_iso
 from .preflight import preflight_failure_reason
@@ -112,6 +114,9 @@ def refresh_batch_step_summaries(batch: dict[str, Any]) -> tuple[list[int], list
 def exception_to_batch_error(ctx: Any, exc: Exception) -> dict[str, Any]:
     if isinstance(exc, CiMergeError):
         return exc.to_report_error()
+    converted = convert_merge_exception(ctx, exc)
+    if converted is not None:
+        return converted.to_report_error()
     return {
         "exit_code": ExitCode.SYSTEM_EXCEPTION,
         "phase": ctx.report.data.get("state") or Phase.INIT,
@@ -141,6 +146,57 @@ def serialize_non_gitlink_conflict(conflict: Any) -> dict[str, Any]:
         "kind": getattr(conflict, "kind", None),
         "stages": stages,
     }
+
+
+def command_result_to_dict(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+    return {
+        "args": getattr(value, "args", None),
+        "cwd": str(getattr(value, "cwd", "")),
+        "returncode": getattr(value, "returncode", None),
+        "stdout": getattr(value, "stdout", None),
+        "stderr": getattr(value, "stderr", None),
+    }
+
+
+def convert_commit_availability_exception(ctx: Any, exc: Exception) -> CiMergeError | None:
+    try:
+        from split_gitlink_merge import RequiredCommitFetchError, RequiredCommitMissingError
+    except ImportError:
+        return None
+
+    repo_path = getattr(exc, "repo_path", None)
+    sha = getattr(exc, "sha", None)
+    details = {
+        "type": type(exc).__name__,
+        "repo_path": str(repo_path) if repo_path is not None else None,
+        "sha": sha,
+    }
+    if isinstance(exc, RequiredCommitFetchError):
+        details["command"] = command_result_to_dict(getattr(exc, "fetch_result", None))
+        return CiMergeError(
+            ExitCode.GIT_COMMAND_FAILED,
+            Phase.MERGING_SUBMODULE,
+            "SUBMODULE_COMMIT_FETCH_FAILED",
+            str(exc),
+            details=details,
+            restore_needed=True,
+        )
+    if isinstance(exc, RequiredCommitMissingError):
+        details["command"] = command_result_to_dict(getattr(exc, "check_result", None))
+        return CiMergeError(
+            ExitCode.SUBMODULE_CONFLICT,
+            Phase.MERGING_SUBMODULE,
+            "SUBMODULE_COMMIT_NOT_FOUND",
+            str(exc),
+            details=details,
+            restore_needed=True,
+        )
+    return None
 
 
 def convert_skippable_merge_exception(ctx: Any, exc: Exception) -> CiMergeError | None:
@@ -174,6 +230,13 @@ def convert_skippable_merge_exception(ctx: Any, exc: Exception) -> CiMergeError 
     )
 
 
+def convert_merge_exception(ctx: Any, exc: Exception) -> CiMergeError | None:
+    converted = convert_commit_availability_exception(ctx, exc)
+    if converted is not None:
+        return converted
+    return convert_skippable_merge_exception(ctx, exc)
+
+
 def mark_batch_step_failed(
     batch: dict[str, Any],
     step_entry: dict[str, Any],
@@ -200,7 +263,6 @@ def restore_batch_continue_state(
 ) -> dict[str, Any]:
     resolved_services = services or CiWorkflowServices.from_local()
     ctx.set_state(Phase.RESTORING)
-    clean_flag = "-fdx" if ctx.allow_clean_x else "-fd"
     result: dict[str, Any] = {
         "target_sha": target_sha,
         "started_at": now_iso(),
@@ -223,16 +285,8 @@ def restore_batch_continue_state(
         return command
 
     try:
-        for operation in ("merge", "rebase", "cherry-pick"):
-            run([operation, "--abort"], allow_failure=True)
-        run(["submodule", "foreach", "--recursive", "git merge --abort"], allow_failure=True)
-        run(["submodule", "foreach", "--recursive", "git rebase --abort"], allow_failure=True)
-        run(["submodule", "foreach", "--recursive", "git cherry-pick --abort"], allow_failure=True)
-        run(["reset", "--hard", target_sha])
-        run(["clean", clean_flag])
-        run(["submodule", "foreach", "--recursive", "git reset --hard"], allow_failure=True)
-        run(["submodule", "foreach", "--recursive", f"git clean {clean_flag}"], allow_failure=True)
-        run(["submodule", "update", "--init", "--recursive", "--force"])
+        for step in cleanup_steps.ci_batch_continue_restore_steps(target_sha, ctx.allow_clean_x):
+            run(list(step.args), allow_failure=step.allow_failure)
         ready, reasons = resolved_services.guards.verify_repo_ready(ctx, repo_path)
         result["success"] = ready
         result["verify_errors"] = reasons
@@ -326,15 +380,24 @@ def run_single_workflow(
         merge_base_sha=initial.merge_base_sha,
     )
 
-    merge_result = resolved_merge_repo(
-        ctx,
-        repo_path,
-        source_sha=initial.source_sha,
-        target_sha=initial.target_sha,
-        base_sha=initial.merge_base_sha,
-        depth=0,
-        display_path=".",
-    )
+    try:
+        merge_result = resolved_merge_repo(
+            ctx,
+            repo_path,
+            source_sha=initial.source_sha,
+            target_sha=initial.target_sha,
+            base_sha=initial.merge_base_sha,
+            depth=0,
+            display_path=".",
+        )
+    except CiMergeError:
+        raise
+    except Exception as exc:
+        converted = convert_merge_exception(ctx, exc)
+        if converted is not None:
+            report_progress(ctx, f"SINGLE failed reason={converted.reason}")
+            raise converted from exc
+        raise
     ctx.report.data["resolved"]["result_sha"] = merge_result.result_sha
 
     final = resolved_services.guards.preflight_check(
@@ -520,7 +583,7 @@ def run_batch_workflow(
             report_progress(ctx, f"STEP {index}/{len(sources)} skipped continue_from={last_success_sha}")
             continue
         except Exception as exc:
-            converted = convert_skippable_merge_exception(ctx, exc)
+            converted = convert_merge_exception(ctx, exc)
             if converted is not None:
                 mark_batch_step_failed(batch, step_entry, index, converted.to_report_error())
                 last_error = converted

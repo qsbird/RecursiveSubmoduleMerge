@@ -131,8 +131,12 @@ class CiReviewHtmlTests(unittest.TestCase):
             html_text = output_path.read_text(encoding="utf-8")
 
         self.assertIn("Self-contained offline HTML", html_text)
-        self.assertIn("CodeMirror Review Workbench", html_text)
-        self.assertIn('class="diff-workbench codemirror-review"', html_text)
+        self.assertIn("Rapid Diffs Review Workbench", html_text)
+        self.assertIn('class="rd-diff-file rd-diff-workbench"', html_text)
+        self.assertIn('class="rd-hunk-lines rd-hunk-lines-inline"', html_text)
+        self.assertIn('class="rd-hunk-lines rd-hunk-lines-parallel"', html_text)
+        self.assertIn('class="rd-line-number"', html_text)
+        self.assertIn('class="rd-line-content"', html_text)
         self.assertIn('data-view-mode="unified"', html_text)
         self.assertIn('data-view-mode="split"', html_text)
         self.assertIn('class="nav-link nav-file"', html_text)
@@ -147,6 +151,7 @@ class CiReviewHtmlTests(unittest.TestCase):
         self.assertNotIn("diff2html", html_text.lower())
         self.assertNotIn("import(", html_text)
         self.assertNotIn('<pre class="patch"', html_text)
+        self.assertNotIn("CodeMirror Review Workbench", html_text)
 
     def test_patch_rows_track_unified_diff_line_numbers(self) -> None:
         rows = parse_patch_rows(

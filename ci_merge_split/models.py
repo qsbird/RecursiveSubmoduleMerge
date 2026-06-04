@@ -86,6 +86,9 @@ class CommandResult:
     duration_ms: int
     allow_failure: bool
     timed_out: bool = False
+    attempt: int = 1
+    max_attempts: int = 1
+    network_failure_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -99,16 +102,28 @@ class CommandResult:
             "duration_ms": self.duration_ms,
             "allow_failure": self.allow_failure,
             "timed_out": self.timed_out,
+            "attempt": self.attempt,
+            "max_attempts": self.max_attempts,
+            "network_failure_reason": self.network_failure_reason,
         }
 
 
 class GitCommandError(CiMergeError):
     def __init__(self, phase: str, command: CommandResult) -> None:
+        if command.timed_out:
+            reason = "GIT_COMMAND_TIMEOUT"
+            message = "git command timed out"
+        elif command.network_failure_reason:
+            reason = "GIT_NETWORK_FAILED"
+            message = "git command failed because the remote network operation failed"
+        else:
+            reason = "GIT_COMMAND_FAILED"
+            message = f"git command failed with exit code {command.exit_code}"
         super().__init__(
             ExitCode.GIT_COMMAND_FAILED,
             phase,
-            "GIT_COMMAND_FAILED",
-            f"git command failed with exit code {command.exit_code}",
+            reason,
+            message,
             details={"command": command.to_dict()},
         )
 

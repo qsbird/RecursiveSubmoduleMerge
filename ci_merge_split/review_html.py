@@ -270,6 +270,142 @@ pre {
   background: #fff7ed;
   color: #9a3412;
 }
+.rd-diff-file {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+}
+.rd-diff-toolbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  background: #f6f8fa;
+}
+.rd-diff-toolbar .segmented button[aria-pressed="true"] {
+  background: #1f6feb;
+  color: #fff;
+}
+.rd-diff-workbench[data-view="unified"] .rd-parallel-view { display: none; }
+.rd-diff-workbench[data-view="split"] .rd-inline-view { display: none; }
+.rd-text-view-root {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: auto;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.rd-text-view-root td,
+.rd-text-view-root th {
+  border: 0;
+  padding: 0;
+  vertical-align: top;
+}
+.rd-text-view-scroll {
+  max-height: 680px;
+  overflow: auto;
+}
+.rd-text-view-content {
+  min-width: max-content;
+}
+.rd-hunk-header {
+  background: #f0f5ff;
+  color: #315a9f;
+  font-weight: 600;
+}
+.rd-hunk-header-buttons {
+  width: 92px;
+  border-right: 1px solid #d8e2f2 !important;
+  text-align: center;
+}
+.rd-hunk-header-content {
+  padding: 3px 10px !important;
+  white-space: pre;
+}
+.rd-hunk-lines {
+  border-top: 1px solid #eef2f7;
+}
+.rd-line-number {
+  width: 46px;
+  min-width: 46px;
+  padding: 0 8px !important;
+  color: #6b7280;
+  background: #f8fafc;
+  border-right: 1px solid #e5e7eb !important;
+  text-align: right;
+  user-select: none;
+}
+.rd-line-number a,
+.rd-line-number span {
+  display: block;
+  color: inherit;
+  text-decoration: none;
+}
+.rd-line-number-empty {
+  background: #f3f4f6;
+}
+.rd-line-content {
+  min-width: 560px;
+  background: #fff;
+}
+.rd-line-content-old,
+.rd-line-content-new {
+  min-width: 360px;
+}
+.rd-line-text {
+  margin: 0;
+  padding: 1px 10px;
+  white-space: pre;
+  word-break: normal;
+}
+.wrap-enabled .rd-line-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.rd-line-number[data-change="added"] {
+  background: #ccf0d8;
+  color: #14532d;
+}
+.rd-line-content[data-change="added"] {
+  background: #e6ffed;
+  color: #14532d;
+}
+.rd-line-number[data-change="removed"] {
+  background: #ffd7d5;
+  color: #7f1d1d;
+}
+.rd-line-content[data-change="removed"] {
+  background: #ffebe9;
+  color: #7f1d1d;
+}
+.rd-line-number[data-change="meta"],
+.rd-line-content[data-change="meta"] {
+  background: #f1f5f9;
+  color: #475569;
+}
+.rd-parallel-view .rd-hunk-header-buttons {
+  width: 46px;
+}
+.rd-code-viewer {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+}
+.rd-code-viewer .rd-text-view-scroll {
+  max-height: 560px;
+}
+.rd-code-viewer .rd-line-number {
+  width: 56px;
+  min-width: 56px;
+}
+.rd-code-viewer .rd-line-content {
+  min-width: 420px;
+}
 .review-checklist {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
@@ -284,128 +420,9 @@ pre {
   border-radius: 8px;
   background: #fff;
 }
-.diff-workbench {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  overflow: hidden;
-  background: #fff;
-}
-.diff-toolbar {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  align-items: center;
-  padding: 8px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface-soft);
-}
-.diff-meta {
+.rd-diff-meta {
   color: var(--muted);
   font-size: 12px;
-}
-.diff-workbench[data-view="unified"] .cm-split-view { display: none; }
-.diff-workbench[data-view="split"] .cm-unified-view { display: none; }
-.cm-editor {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  overflow: hidden;
-  background: #fff;
-  color: var(--text);
-  font-family: Consolas, "Cascadia Mono", monospace;
-  font-size: 12.5px;
-  line-height: 1.55;
-}
-.diff-workbench > .cm-editor {
-  border: 0;
-  border-radius: 0;
-}
-.cm-scroller {
-  max-height: 680px;
-  overflow: auto;
-}
-.cm-content {
-  min-width: max-content;
-}
-.cm-line {
-  display: grid;
-  grid-template-columns: 56px minmax(520px, max-content);
-  min-height: 22px;
-  border-bottom: 1px solid #eef2f7;
-}
-.cm-line:last-child { border-bottom: 0; }
-.cm-line code, .cm-pane code, .cm-split-meta code {
-  display: block;
-  min-width: max-content;
-  padding: 1px 10px;
-  background: transparent;
-  border-radius: 0;
-  white-space: pre;
-}
-.wrap-enabled .cm-line code,
-.wrap-enabled .cm-pane code,
-.wrap-enabled .cm-split-meta code {
-  min-width: 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.cm-gutter {
-  padding: 1px 8px;
-  color: var(--muted);
-  background: #f8fafc;
-  border-right: 1px solid #e2e8f0;
-  text-align: right;
-  user-select: none;
-}
-.cm-diff-line {
-  grid-template-columns: 52px 52px 24px minmax(620px, max-content);
-}
-.cm-sign {
-  padding: 1px 0;
-  text-align: center;
-  color: var(--muted);
-  border-right: 1px solid #e2e8f0;
-  user-select: none;
-}
-.cm-diff-meta, .cm-diff-note { background: var(--meta-bg); color: #475569; }
-.cm-diff-hunk { background: var(--hunk-bg); color: var(--hunk-text); font-weight: 600; }
-.cm-diff-add { background: var(--add-bg); }
-.cm-diff-add .cm-gutter, .cm-diff-add .cm-sign { background: var(--add-line); color: var(--add-text); }
-.cm-diff-add code { color: var(--add-text); }
-.cm-diff-del { background: var(--del-bg); }
-.cm-diff-del .cm-gutter, .cm-diff-del .cm-sign { background: var(--del-line); color: var(--del-text); }
-.cm-diff-del code { color: var(--del-text); }
-.cm-diff-ctx { background: #fff; }
-.cm-split-content {
-  min-width: 960px;
-}
-.cm-split-row {
-  display: grid;
-  grid-template-columns: minmax(460px, 1fr) minmax(460px, 1fr);
-  border-bottom: 1px solid #eef2f7;
-}
-.cm-split-row:last-child { border-bottom: 0; }
-.cm-pane {
-  display: grid;
-  grid-template-columns: 56px 24px minmax(320px, max-content);
-  min-height: 22px;
-}
-.cm-pane-old { border-right: 1px solid var(--border); }
-.cm-pane-blank { background: #f8fafc; color: var(--muted); }
-.cm-split-meta {
-  grid-column: 1 / -1;
-  display: grid;
-  grid-template-columns: 112px minmax(620px, max-content);
-  min-height: 22px;
-}
-.cm-split-meta .cm-gutter { text-align: left; }
-.cm-static-editor .cm-scroller { max-height: 560px; }
-.cm-static-editor .cm-content { min-width: 100%; }
-.cm-static-editor .cm-line { grid-template-columns: 56px minmax(360px, max-content); }
-.cm-lang-json .cm-line code,
-.cm-lang-python .cm-line code,
-.cm-lang-javascript .cm-line code,
-.cm-lang-cpp .cm-line code {
-  tab-size: 4;
 }
 .hidden { display: none !important; }
 @media (max-width: 900px) {
@@ -416,8 +433,6 @@ pre {
   .repo-header { flex-direction: column; }
   .repo-meta { text-align: left; }
   .toolbar input { min-width: 100%; }
-  .cm-split-content { min-width: 720px; }
-  .cm-split-row { grid-template-columns: minmax(360px, 1fr) minmax(360px, 1fr); }
 }
 """
 
@@ -443,12 +458,12 @@ SCRIPT = """
       });
     }
 
-    document.querySelectorAll('.diff-workbench').forEach(function (workbench) {
+    document.querySelectorAll('.rd-diff-workbench').forEach(function (workbench) {
       setDiffView(workbench, workbench.getAttribute('data-view') || 'unified');
     });
     document.querySelectorAll('.js-view-toggle').forEach(function (button) {
       button.addEventListener('click', function () {
-        const workbench = button.closest('.diff-workbench');
+        const workbench = button.closest('.rd-diff-workbench');
         if (workbench) {
           setDiffView(workbench, button.getAttribute('data-view') || 'unified');
         }
@@ -545,6 +560,16 @@ def display_lines(text: str) -> list[str]:
     return text.splitlines()
 
 
+def rd_change_type(kind: str) -> str:
+    if kind == "add":
+        return "added"
+    if kind == "del":
+        return "removed"
+    if kind in {"meta", "note"}:
+        return "meta"
+    return "context"
+
+
 def render_code_editor(
     text: str | None,
     *,
@@ -558,20 +583,23 @@ def render_code_editor(
     rendered_lines = []
     for number, line in enumerate(lines, start=1):
         rendered_lines.append(
-            '<div class="cm-line">'
-            f'<span class="cm-gutter cm-line-number">{number}</span>'
-            f"<code>{esc(line)}</code>"
-            "</div>"
+            '<tr class="rd-hunk-lines rd-code-lines">'
+            f'<td class="rd-line-number"><span>{number}</span></td>'
+            '<td class="rd-line-content">'
+            f'<pre class="rd-line-text">{esc(line)}</pre>'
+            "</td>"
+            "</tr>"
         )
     language_class = html_token(language)
-    class_text = f"cm-editor cm-static-editor cm-lang-{language_class}"
+    class_text = f"rd-code-viewer rd-lang-{language_class}"
     if extra_class:
         class_text += f" {extra_class}"
     return (
         f'<div class="{esc(class_text)}" data-language="{esc(language)}" role="region" aria-label="{esc(aria_label)}">'
-        '<div class="cm-scroller"><div class="cm-content">'
+        '<div class="rd-text-view-scroll"><table class="rd-text-view-root">'
+        '<tbody class="rd-text-view-content">'
         f"{''.join(rendered_lines)}"
-        "</div></div></div>"
+        "</tbody></table></div></div>"
     )
 
 
@@ -632,20 +660,56 @@ def parse_patch_rows(text: str) -> list[dict[str, Any]]:
 def render_patch_unified(rows: list[dict[str, Any]]) -> str:
     rendered_rows = []
     for row in rows:
+        change = rd_change_type(str(row["kind"]))
+        if row["kind"] == "hunk":
+            rendered_rows.append(
+                '<tr class="rd-hunk-header rd-hunk-header-inline" data-hunk-header="true">'
+                '<td class="rd-hunk-header-buttons" colspan="2"></td>'
+                f'<td class="rd-hunk-header-content"><pre class="rd-line-text">{esc(row["raw"])}</pre></td>'
+                "</tr>"
+            )
+            continue
         rendered_rows.append(
-            f'<div class="cm-line cm-diff-line cm-diff-{esc(row["kind"])}">'
-            f'<span class="cm-gutter cm-old-line">{esc(row["old_number"])}</span>'
-            f'<span class="cm-gutter cm-new-line">{esc(row["new_number"])}</span>'
-            f'<span class="cm-sign">{esc(row["sign"])}</span>'
-            f'<code>{esc(row["code"])}</code>'
-            "</div>"
+            f'<tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="{esc(change)}">'
+            f'<td class="rd-line-number" data-change="{esc(change)}" data-position="old"><span>{esc(row["old_number"])}</span></td>'
+            f'<td class="rd-line-number" data-change="{esc(change)}" data-position="new"><span>{esc(row["new_number"])}</span></td>'
+            f'<td class="rd-line-content" data-change="{esc(change)}">'
+            f'<pre class="rd-line-text">{esc(row["code"])}</pre>'
+            "</td>"
+            "</tr>"
         )
     return (
-        '<div class="cm-editor cm-diff-editor cm-unified-view" data-view-mode="unified" role="region" '
+        '<div class="rd-inline-view" data-view-mode="unified" role="region" '
         'aria-label="Unified diff">'
-        '<div class="cm-scroller"><div class="cm-content">'
+        '<div class="rd-text-view-scroll"><table class="rd-text-view-root">'
+        '<tbody class="rd-text-view-content">'
         f"{''.join(rendered_rows)}"
-        "</div></div></div>"
+        "</tbody></table></div></div>"
+    )
+
+
+def render_parallel_number_cell(row: dict[str, Any], side: str, change: str, blank: bool) -> str:
+    number = row["old_number"] if side == "old" else row["new_number"]
+    classes = "rd-line-number"
+    if blank:
+        classes += " rd-line-number-empty"
+    return (
+        f'<td class="{esc(classes)}" data-change="{esc(change)}" data-position="{esc(side)}">'
+        f'<span>{esc("" if blank else number)}</span>'
+        "</td>"
+    )
+
+
+def render_parallel_content_cell(row: dict[str, Any], side: str, change: str, blank: bool) -> str:
+    position = "old" if side == "old" else "new"
+    classes = f"rd-line-content rd-line-content-{position}"
+    if blank:
+        classes += " rd-line-number-empty"
+    code = "" if blank else str(row["code"])
+    return (
+        f'<td class="{esc(classes)}" data-change="{esc(change)}" data-position="{esc(position)}">'
+        f'<pre class="rd-line-text">{esc(code)}</pre>'
+        "</td>"
     )
 
 
@@ -653,23 +717,16 @@ def render_split_pane(row: dict[str, Any], side: str) -> str:
     kind = str(row["kind"])
     is_old = side == "old"
     blank = (kind == "add" and is_old) or (kind == "del" and not is_old)
-    number = row["old_number"] if is_old else row["new_number"]
-    sign = "-" if kind == "del" and is_old else "+" if kind == "add" and not is_old else ""
-    code = "" if blank else row["code"]
-    pane_kind = "ctx"
+    pane_kind = "context"
     if kind == "add" and not is_old:
-        pane_kind = "add"
+        pane_kind = "added"
     elif kind == "del" and is_old:
-        pane_kind = "del"
-    classes = f"cm-pane cm-pane-{side} cm-diff-{pane_kind}"
-    if blank:
-        classes += " cm-pane-blank"
-    return (
-        f'<div class="{esc(classes)}">'
-        f'<span class="cm-gutter">{esc(number)}</span>'
-        f'<span class="cm-sign">{esc(sign)}</span>'
-        f"<code>{esc(code)}</code>"
-        "</div>"
+        pane_kind = "removed"
+    return render_parallel_number_cell(row, side, pane_kind, blank) + render_parallel_content_cell(
+        row,
+        side,
+        pane_kind,
+        blank,
     )
 
 
@@ -678,26 +735,29 @@ def render_patch_split(rows: list[dict[str, Any]]) -> str:
     for row in rows:
         kind = str(row["kind"])
         if kind in {"meta", "hunk", "note"}:
+            label_class = "rd-hunk-header" if kind == "hunk" else "rd-hunk-lines"
+            change = "context" if kind == "hunk" else "meta"
             rendered_rows.append(
-                f'<div class="cm-split-row cm-diff-{esc(kind)}">'
-                '<div class="cm-split-meta">'
-                f'<span class="cm-gutter">{esc(row["index"])}</span>'
-                f'<code>{esc(row["raw"])}</code>'
-                "</div></div>"
+                f'<tr class="{label_class} rd-hunk-header-parallel" data-change="{esc(change)}">'
+                '<td class="rd-hunk-header-buttons"></td>'
+                f'<td class="rd-hunk-header-content" colspan="3"><pre class="rd-line-text">{esc(row["raw"])}</pre></td>'
+                "</tr>"
             )
             continue
+        change = rd_change_type(kind)
         rendered_rows.append(
-            f'<div class="cm-split-row cm-diff-{esc(kind)}">'
+            f'<tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="{esc(change)}">'
             f'{render_split_pane(row, "old")}'
             f'{render_split_pane(row, "new")}'
-            "</div>"
+            "</tr>"
         )
     return (
-        '<div class="cm-editor cm-diff-editor cm-split-view" data-view-mode="split" role="region" '
+        '<div class="rd-parallel-view" data-view-mode="split" role="region" '
         'aria-label="Side by side diff">'
-        '<div class="cm-scroller"><div class="cm-split-content">'
+        '<div class="rd-text-view-scroll"><table class="rd-text-view-root">'
+        '<tbody class="rd-text-view-content">'
         f"{''.join(rendered_rows)}"
-        "</div></div></div>"
+        "</tbody></table></div></div>"
     )
 
 
@@ -706,13 +766,13 @@ def render_patch_block(text: str, empty_text: str = "No patch content is availab
         return f'<div class="warning">{esc(empty_text)}</div>'
     rows = parse_patch_rows(text)
     return (
-        f'<div class="diff-workbench codemirror-review" data-view="unified" data-line-count="{len(rows)}">'
-        '<div class="diff-toolbar">'
+        f'<div class="rd-diff-file rd-diff-workbench" data-view="unified" data-line-count="{len(rows)}">'
+        '<div class="rd-diff-toolbar">'
         '<div class="segmented" role="group" aria-label="Diff view">'
         '<button type="button" class="js-view-toggle" data-view="unified">Unified</button>'
         '<button type="button" class="js-view-toggle" data-view="split">Split</button>'
         "</div>"
-        f'<span class="diff-meta">{len(rows)} patch lines</span>'
+        f'<span class="rd-diff-meta">{len(rows)} patch lines</span>'
         "</div>"
         f"{render_patch_unified(rows)}"
         f"{render_patch_split(rows)}"
@@ -1191,11 +1251,11 @@ def render_html(
   <header>
     <h1>{esc(title)}</h1>
     <div>Report: <code>{esc(report_path.resolve(strict=False))}</code></div>
-    <div class="muted">Self-contained offline HTML. CodeMirror-style review workbench with no external CSS, JavaScript, CDN, or network resources.</div>
+    <div class="muted">Self-contained offline HTML. GitLab Rapid Diffs-style review workbench with no external CSS, JavaScript, CDN, or network resources.</div>
   </header>
   <main>
     <div class="review-bar">
-      <strong>CodeMirror Review Workbench - {len(repositories)} repos - {changed_file_count} files - {len(conflicts)} conflicts</strong>
+      <strong>Rapid Diffs Review Workbench - {len(repositories)} repos - {changed_file_count} files - {len(conflicts)} conflicts</strong>
       <div class="review-actions">
         <button type="button" class="review-button js-wrap-toggle" aria-pressed="false">Wrap</button>
         <button type="button" class="review-button" data-details-action="expand">Expand all</button>

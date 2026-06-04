@@ -88,6 +88,10 @@ def submodule_candidate_ref(ctx: Any, display_path: str) -> str:
     return f"refs/heads/ci-merge-submodules/{job}/{path}"
 
 
+def remote_branch_ref(target: str) -> str:
+    return target if target.startswith("refs/heads/") else f"refs/heads/{target}"
+
+
 def submodule_publish_candidates(ctx: Any) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -129,7 +133,7 @@ def publish_run(
             ci_module,
             "PUBLISH_FAILED",
             "PUBLISHING",
-            classify_publish_failure(result.stderr) if result.stderr else fallback_reason,
+            classify_publish_command_failure(result) if (result.stderr or getattr(result, "network_failure_reason", None)) else fallback_reason,
             "publishing command failed",
             details={"command": result.to_dict()},
             restore_needed=False,
@@ -162,7 +166,14 @@ def publish_remote_ref_sha(
     raise AssertionError("unreachable")
 
 
-def classify_publish_failure(stderr: str) -> str:
+def remote_ref_missing(stderr: str) -> bool:
+    text = stderr.lower()
+    return "couldn't find remote ref" in text or "could not find remote ref" in text
+
+
+def classify_publish_failure(stderr: str, network_failure_reason: str | None = None) -> str:
+    if network_failure_reason:
+        return "PUBLISH_NETWORK_FAILED"
     text = stderr.lower()
     if "stale info" in text or "fetch first" in text or "non-fast-forward" in text:
         return "PUBLISH_RACE"
@@ -175,6 +186,13 @@ def classify_publish_failure(stderr: str) -> str:
     if "could not resolve host" in text or "failed to connect" in text or "network" in text:
         return "PUBLISH_NETWORK_FAILED"
     return "PUBLISH_FAILED"
+
+
+def classify_publish_command_failure(result: Any) -> str:
+    return classify_publish_failure(
+        getattr(result, "stderr", "") or "",
+        getattr(result, "network_failure_reason", None),
+    )
 
 
 def publish_submodule_candidates(ctx: Any, ci_module: ModuleType | None = None) -> list[dict[str, Any]]:
@@ -236,7 +254,7 @@ def publish_submodule_candidates(ctx: Any, ci_module: ModuleType | None = None) 
             allow_failure=True,
         )
         if push.exit_code != 0:
-            item["failure_reason"] = classify_publish_failure(push.stderr)
+            item["failure_reason"] = classify_publish_command_failure(push)
             publish_log(ctx, "submodule_publish_item_failed", item)
             _raise_ci_error(
                 ci_module,
@@ -280,7 +298,18 @@ def publish_submodule_candidates(ctx: Any, ci_module: ModuleType | None = None) 
 
 def publish_result(ctx: Any, repo_path: Path, target_sha: str, result_sha: str, ci_module: ModuleType | None = None) -> dict[str, Any]:
     ctx.set_state(_phase(ci_module, "PUBLISHING"))
-    publish_target = ctx.args.publish_target or ctx.args.target
+    publish_target = ctx.args.publish_target
+    if not publish_target:
+        _raise_ci_error(
+            ci_module,
+            "ARGUMENT_ERROR",
+            "INIT",
+            "PUBLISH_TARGET_REQUIRED",
+            "--publish_target must be set for publishing",
+            details={"target": getattr(ctx.args, "target", None), "remote": ctx.args.remote},
+            restore_needed=False,
+        )
+    allow_create_target = bool(getattr(ctx.args, "allow_create_publish_target", False))
     publish = ctx.report.data["publish"]
     publish["enabled"] = True
     publish["attempted"] = True
@@ -289,15 +318,46 @@ def publish_result(ctx: Any, repo_path: Path, target_sha: str, result_sha: str, 
     publish["target"] = publish_target
     publish["mode"] = ctx.args.publish_mode
     publish["candidate_ref"] = ctx.args.candidate_ref
+    publish["allow_create_target"] = allow_create_target
+    publish["target_created"] = False
+    publish["target_publish_mode"] = None
     publish["expected_result_sha"] = result_sha
     ctx.report.data["publish_attempted"] = True
     publish_log(ctx, "start", {"target": publish_target, "result_sha": result_sha})
 
-    publish_run(ctx, repo_path, ["fetch", ctx.args.remote, publish_target], "PUBLISH_FETCH_FAILED", ci_module)
-    before = publish_run(ctx, repo_path, ["rev-parse", "FETCH_HEAD"], "PUBLISH_RESOLVE_REMOTE_FAILED", ci_module)
-    remote_before = before.stdout.strip()
+    fetch_target = ctx.runner.run(repo_path, ["fetch", ctx.args.remote, publish_target], allow_failure=True)
+    target_exists = fetch_target.exit_code == 0
+    remote_before: str | None = None
+    if target_exists:
+        before = publish_run(ctx, repo_path, ["rev-parse", "FETCH_HEAD"], "PUBLISH_RESOLVE_REMOTE_FAILED", ci_module)
+        remote_before = before.stdout.strip()
+    elif allow_create_target and remote_ref_missing(fetch_target.stderr):
+        publish_log(ctx, "target_missing_create_allowed", {"target": publish_target, "remote": ctx.args.remote})
+    elif remote_ref_missing(fetch_target.stderr):
+        _raise_ci_error(
+            ci_module,
+            "PUBLISH_FAILED",
+            "PUBLISHING",
+            "PUBLISH_TARGET_NOT_FOUND",
+            "remote publish target does not exist; pass --allow_create_publish_target true to create it",
+            details={"target": publish_target, "remote": ctx.args.remote, "command": fetch_target.to_dict()},
+            restore_needed=False,
+        )
+    else:
+        _raise_ci_error(
+            ci_module,
+            "PUBLISH_FAILED",
+            "PUBLISHING",
+            classify_publish_command_failure(fetch_target) if (fetch_target.stderr or getattr(fetch_target, "network_failure_reason", None)) else "PUBLISH_FETCH_FAILED",
+            "publishing command failed",
+            details={"command": fetch_target.to_dict()},
+            restore_needed=False,
+        )
+
     publish["remote_target_before_sha"] = remote_before
-    if remote_before != target_sha:
+    publish["target_publish_mode"] = "force-with-lease" if target_exists else "create"
+    publish["target_created"] = not target_exists
+    if target_exists and remote_before != target_sha:
         _raise_ci_error(
             ci_module,
             "PUBLISH_FAILED",
@@ -345,29 +405,28 @@ def publish_result(ctx: Any, repo_path: Path, target_sha: str, result_sha: str, 
         publish["root"]["candidate_ref_pushed"] = True
         publish_log(ctx, "root_candidate_ref_pushed", {"candidate_ref": ctx.args.candidate_ref, "result_sha": result_sha})
 
-    push = ctx.runner.run(
-        repo_path,
-        [
-            "push",
-            "--recurse-submodules=check",
-            f"--force-with-lease={publish_target}:{remote_before}",
-            ctx.args.remote,
-            f"{result_sha}:{publish_target}",
-        ],
-        allow_failure=True,
-    )
+    push_args = ["push", "--recurse-submodules=check"]
+    if target_exists:
+        push_args.append(f"--force-with-lease={publish_target}:{remote_before}")
+    push_target = publish_target if target_exists else remote_branch_ref(publish_target)
+    push_args.extend([ctx.args.remote, f"{result_sha}:{push_target}"])
+    push = ctx.runner.run(repo_path, push_args, allow_failure=True)
     if push.exit_code != 0:
         _raise_ci_error(
             ci_module,
             "PUBLISH_FAILED",
             "PUBLISHING",
-            classify_publish_failure(push.stderr),
+            classify_publish_command_failure(push),
             "publishing candidate result failed",
             details={"command": push.to_dict(), "remote_target_before_sha": remote_before},
             restore_needed=False,
         )
     publish["root"]["target_pushed"] = True
-    publish_log(ctx, "root_target_pushed", {"target": publish_target, "expected_before": remote_before, "result_sha": result_sha})
+    publish_log(
+        ctx,
+        "root_target_created" if not target_exists else "root_target_pushed",
+        {"target": publish_target, "expected_before": remote_before, "result_sha": result_sha},
+    )
 
     publish_run(ctx, repo_path, ["fetch", ctx.args.remote, publish_target], "PUBLISH_VERIFY_FETCH_FAILED", ci_module)
     after = publish_run(ctx, repo_path, ["rev-parse", "FETCH_HEAD"], "PUBLISH_VERIFY_RESOLVE_FAILED", ci_module)
@@ -407,19 +466,6 @@ def infer_publish_target_from_report(
             details={"publish_target": ctx.args.publish_target, "remote": ctx.args.remote},
             restore_needed=False,
         )
-
-    manual_target = report_value(source_report, "batch", "manual_publish", "target")
-    manual_supported = bool(report_value(source_report, "batch", "manual_publish", "supported"))
-    if manual_supported and manual_target:
-        return str(manual_target)
-
-    for candidate in (
-        report_value(source_report, "publish", "target"),
-        report_value(source_report, "input", "target"),
-        report_value(source_report, "resolved", "target_ref"),
-    ):
-        if candidate and not target_requires_explicit_publish_target(str(candidate), ctx.args.remote):
-            return str(candidate)
 
     _raise_ci_error(
         ci_module,

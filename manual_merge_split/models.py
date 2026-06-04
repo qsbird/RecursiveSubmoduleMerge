@@ -55,6 +55,25 @@ class ConflictEntry:
     category: str = "manual_conflict"
 
 
+@dataclass(frozen=True)
+class UnmergedConflict:
+    path: str
+    modes: tuple[str, ...]
+    stages: tuple[int, ...]
+
+    @property
+    def is_gitlink(self) -> bool:
+        return "160000" in self.modes
+
+    @property
+    def is_complete(self) -> bool:
+        return set(self.stages) == {1, 2, 3}
+
+    @property
+    def missing_stages(self) -> tuple[int, ...]:
+        return tuple(stage for stage in (1, 2, 3) if stage not in set(self.stages))
+
+
 @dataclass
 class DirtyRepoAssessment:
     repo_path: Path

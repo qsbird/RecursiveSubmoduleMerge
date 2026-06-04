@@ -27,6 +27,8 @@ from .model import (
     MergeCommitMessage,
     MergeEvent,
     NonGitlinkConflictError,
+    RequiredCommitFetchError,
+    RequiredCommitMissingError,
     RepositoryResolution,
 )
 from .planner import GitlinkMergePlanner
@@ -56,6 +58,8 @@ __all__ = [
     "MergeEvent",
     "MergePolicy",
     "NonGitlinkConflictError",
+    "RequiredCommitFetchError",
+    "RequiredCommitMissingError",
     "RecursiveGitlinkMergeEngine",
     "RepositoryResolution",
     "SubprocessGitBackend",

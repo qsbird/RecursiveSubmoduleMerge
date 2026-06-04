@@ -24,6 +24,7 @@ from .models import (
     MergeBatchResult,
     MergeContext,
     REPORT_FILE_NAME,
+    UnmergedConflict,
 )
 from .preflight import (
     ManualPreflightService,
@@ -31,6 +32,7 @@ from .preflight import (
     ensure_repo_ready,
     format_dirty_submodule_list,
 )
+from .publish import ManualPublishService
 from .repository_ops import ManualRepositoryOps
 
 
@@ -113,6 +115,41 @@ def can_skip_failed_branch(context: MergeContext, completed: bool) -> bool:
     return all(entry.category == "missing_submodule_commit" for entry in context.report_entries)
 
 
+def can_auto_rollback_failed_branch(context: MergeContext) -> bool:
+    if not context.report_entries:
+        return False
+    return all(entry.category == "missing_submodule_commit" for entry in context.report_entries)
+
+
+def describe_incomplete_stage_conflict(conflict: UnmergedConflict) -> str:
+    conflict_type = "gitlink" if conflict.is_gitlink else "file"
+    stages = ",".join(str(stage) for stage in conflict.stages) or "none"
+    missing = ",".join(str(stage) for stage in conflict.missing_stages) or "none"
+    modes = ",".join(conflict.modes) or "unknown"
+    return f"{conflict.path} ({conflict_type}, stages={stages}, missing={missing}, modes={modes})"
+
+
+def record_incomplete_stage_conflicts(
+    repo_path: Path,
+    conflicts: list[UnmergedConflict],
+    context: MergeContext,
+) -> None:
+    if not conflicts:
+        return
+    details = "; ".join(describe_incomplete_stage_conflict(conflict) for conflict in conflicts)
+    context.report_entries.append(
+        ConflictEntry(
+            repo_path=repo_path,
+            files=[conflict.path for conflict in conflicts],
+            reason=(
+                "Conflict has incomplete git index stages and requires manual resolution "
+                f"outside this tool: {details}"
+            ),
+            category="incomplete_stage_conflict",
+        )
+    )
+
+
 def refresh_submodules_after_root_checkout(
     repo_path: Path,
     ops: ManualRepositoryOps,
@@ -175,7 +212,11 @@ def process_repository(
 
     ops.merge_branch(repo_path, context.merge_branch)
 
-    submodule_conflicts, file_conflicts = ops.split_conflicts(repo_path)
+    submodule_conflicts, file_conflicts, incomplete_stage_conflicts = ops.split_conflicts_by_stage(repo_path)
+    if incomplete_stage_conflicts:
+        record_incomplete_stage_conflicts(repo_path, incomplete_stage_conflicts, context)
+        return False
+
     moved_away_resolved = file_conflicts_service.resolve_moved_away_file_conflicts(
         repo_path,
         file_conflicts,
@@ -346,7 +387,10 @@ def process_repository(
                 category="cross_submodule_move_conflict",
             )
 
-    remaining_submodule_conflicts, remaining_file_conflicts = ops.split_conflicts(repo_path)
+    remaining_submodule_conflicts, remaining_file_conflicts, remaining_incomplete_stage_conflicts = (
+        ops.split_conflicts_by_stage(repo_path)
+    )
+    record_incomplete_stage_conflicts(repo_path, remaining_incomplete_stage_conflicts, context)
     unexpected_submodule_conflicts = [
         path for path in remaining_submodule_conflicts if path not in unresolved_child_submodules
     ]
@@ -355,6 +399,7 @@ def process_repository(
     if (
         remaining_submodule_conflicts
         or remaining_file_conflicts
+        or remaining_incomplete_stage_conflicts
         or unresolved_file_conflicts
         or unresolved_moved_here
         or failed_child_submodules
@@ -469,6 +514,10 @@ def resolve_merge_work_branch(args: Any, repo_path: Path, ops: ManualRepositoryO
 def make_merge_context(args: Any, repo_path: Path, ops: ManualRepositoryOps) -> MergeContext:
     timeout_seconds = args.conflict_tool_timeout_seconds
     normalized_merge_branches = [common.normalize_user_merge_ref(branch) for branch in args.merge_branches]
+    if args.file_conflict_mode != "tool":
+        raise ops._automation_error(
+            "File conflict preserve mode has been removed; merge this branch manually instead."
+        )
     return MergeContext(
         work_branch=resolve_merge_work_branch(args, repo_path, ops),
         merge_branch=normalized_merge_branches[0],
@@ -606,7 +655,7 @@ def run_merge(
 
                 write_report(report_path, branch_context)
                 batch_result.stopped_branch = merge_branch
-                should_rollback = bool(batch_result.completed_branches) or branch_context.rollback_requested
+                should_rollback = branch_context.rollback_requested and can_auto_rollback_failed_branch(branch_context)
                 if should_rollback:
                     ops.rollback_to_snapshot(
                         repo_path,
@@ -629,6 +678,11 @@ def run_merge(
                     )
                 elif batch_result.rolled_back_to_checkpoint:
                     print("Repository rolled back to the pre-merge checkpoint.")
+                else:
+                    print(
+                        "Repository was left unchanged after the failed merge branch to preserve local edits. "
+                        "Resolve or clean up manually before retrying."
+                    )
                 return 2
 
             batch_result.completed_branches.append(merge_branch)
@@ -659,6 +713,18 @@ def run_cleanup(args: Any, *, manual_module: ModuleType | None, ops: ManualRepos
     if args.rebuild_work_branch and not (args.base_remote_branch or "").strip():
         print("--base-remote-branch cannot be empty when rebuilding the work branch.", file=sys.stderr)
         return 1
+
+    print(
+        "WARNING: cleanup may recursively abort merges and run git reset --hard HEAD, "
+        "discarding tracked or staged local changes in the root repository and submodules.",
+        file=sys.stderr,
+    )
+    if args.rebuild_work_branch:
+        print(
+            "WARNING: rebuild work branch may move an existing local branch with the same name; "
+            "the tool will block if that would hide local committed work.",
+            file=sys.stderr,
+        )
 
     repo_path = Path(args.repo).resolve()
     report_path = repo_path / getattr(args, "report_file", REPORT_FILE_NAME)
@@ -725,6 +791,10 @@ class ManualCommandService:
     def cross_submodule_moves(self) -> CrossSubmoduleMoveService:
         return CrossSubmoduleMoveService(self.manual_module)
 
+    @property
+    def publish(self) -> ManualPublishService:
+        return ManualPublishService(self.manual_module)
+
     def set_verbose(self, enabled: bool) -> None:
         set_verbose(self.manual_module, enabled)
 
@@ -756,3 +826,6 @@ class ManualCommandService:
 
     def run_cleanup(self, args: Any) -> int:
         return run_cleanup(args, manual_module=self.manual_module, ops=self.ops)
+
+    def run_publish(self, args: Any) -> int:
+        return self.publish.run_publish(args)

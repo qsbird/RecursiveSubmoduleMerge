@@ -14,7 +14,6 @@ from .commands import ManualCommandService
 from .models import (
     DEFAULT_CONFLICT_TOOL_COMMAND,
     DEFAULT_CONFLICT_TOOL_TIMEOUT_SECONDS,
-    DEFAULT_FILE_CONFLICT_MODE,
     REPORT_FILE_NAME,
     ROOT_BASE_REMOTE_BRANCH,
 )
@@ -108,11 +107,7 @@ def run_guided(
             no_prompt_dirty_submodules=False,
             ignore_root_untracked_path=[],
             report_file=prompt_with_default("Conflict report filename", REPORT_FILE_NAME, input_func=input_func),
-            file_conflict_mode=prompt_with_default(
-                "File conflict mode: tool or preserve",
-                DEFAULT_FILE_CONFLICT_MODE,
-                input_func=input_func,
-            ),
+            file_conflict_mode="tool",
             conflict_tool_command=prompt_with_default(
                 "Conflict tool command",
                 DEFAULT_CONFLICT_TOOL_COMMAND,

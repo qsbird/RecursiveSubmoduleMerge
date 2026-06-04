@@ -147,6 +147,26 @@ class AdapterIntegrationTests(unittest.TestCase):
         parents = run_git(fixture.parent, ["show", "-s", "--format=%P", "HEAD"]).stdout.strip().split()
         self.assertEqual(parents, [fixture.ours_parent_sha, fixture.theirs_parent_sha])
 
+    def test_ci_auto_adapter_syncs_submodules_after_clean_gitlink_merge(self) -> None:
+        fixture = GitlinkFixture(self.base).build(leave_conflicted=False)
+
+        service = CiAutoGitlinkMergeService(
+            SubprocessGitBackend(auto_safe_directory=True),
+            max_depth=16,
+        )
+        result = service.merge_repo(
+            fixture.parent,
+            source_sha=fixture.theirs_parent_sha,
+            target_sha=fixture.parent_base_sha,
+            base_sha=fixture.parent_base_sha,
+            depth=0,
+            display_path=".",
+        )
+
+        self.assertEqual(result.strategy, "clean_merge")
+        self.assertEqual(run_git(fixture.parent, ["status", "--short"]).stdout.strip(), "")
+        self.assertEqual(run_git(fixture.parent_sub, ["rev-parse", "HEAD"]).stdout.strip(), fixture.theirs_sha)
+
 
 if __name__ == "__main__":
     unittest.main()

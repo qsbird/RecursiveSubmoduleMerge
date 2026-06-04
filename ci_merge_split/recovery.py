@@ -6,6 +6,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from merge_cleanup_core import CleanupStep, coerce_cleanup_step, git_clean_flag
+from merge_cleanup_core import steps as cleanup_steps
+
 from . import common
 from .models import CiMergeError, ExitCode, Phase, now_iso
 from . import repository_ops
@@ -57,7 +60,7 @@ def run_cleanup_steps(
     ctx: Any,
     repo_path: Path,
     level_name: str,
-    steps: list[dict[str, Any]],
+    steps: list[CleanupStep | dict[str, Any]] | tuple[CleanupStep | dict[str, Any], ...],
 ) -> dict[str, Any]:
     fallback = {
         "level": level_name,
@@ -69,10 +72,11 @@ def run_cleanup_steps(
         "verify_errors": [],
     }
     try:
-        for step in steps:
-            args = step["args"]
-            allow_failure = bool(step.get("allow_failure", False))
-            cwd = common.resolve_path(step.get("cwd", repo_path))
+        for raw_step in steps:
+            step = coerce_cleanup_step(raw_step)
+            args = list(step.args)
+            allow_failure = step.allow_failure
+            cwd = common.resolve_path(step.cwd if step.cwd is not None else repo_path)
             result = ctx.runner.run(cwd, args, allow_failure=allow_failure)
             fallback["steps"].append(
                 {
@@ -98,57 +102,23 @@ def run_cleanup_steps(
         fallback["ended_at"] = now_iso()
 
 
+def clean_flag(ctx: Any, *, remove_nested_git_repos: bool = False) -> str:
+    return git_clean_flag(ctx.allow_clean_x, remove_nested_git_repos=remove_nested_git_repos)
+
+
 def clean_and_prepare_repo(ctx: Any, repo_path: Path, ci_module: ModuleType | None = None) -> None:
     ctx.set_state(_phase(ci_module, "CLEANING"))
-    clean_flag = "-fdx" if ctx.allow_clean_x else "-fd"
-    levels: list[tuple[str, list[dict[str, Any]]]] = [
-        (
-            "level_1_basic_cleanup",
-            [
-                {"args": ["reset", "--hard"]},
-                {"args": ["clean", clean_flag]},
-                {"args": ["submodule", "update", "--init", "--recursive"]},
-            ],
-        ),
-        (
-            "level_2_abort_and_recursive_cleanup",
-            [
-                {"args": ["merge", "--abort"], "allow_failure": True},
-                {"args": ["rebase", "--abort"], "allow_failure": True},
-                {"args": ["cherry-pick", "--abort"], "allow_failure": True},
-                {"args": ["reset", "--hard"]},
-                {"args": ["clean", clean_flag]},
-                {"args": ["submodule", "foreach", "--recursive", "git reset --hard"], "allow_failure": True},
-                {"args": ["submodule", "foreach", "--recursive", f"git clean {clean_flag}"], "allow_failure": True},
-            ],
-        ),
-        (
-            "level_3_sync_and_force_update",
-            [
-                {"args": ["submodule", "sync", "--recursive"]},
-                {"args": ["fetch", "--all", "--prune"], "allow_failure": True},
-                {"args": ["submodule", "update", "--init", "--recursive", "--force"]},
-            ],
-        ),
-    ]
-
-    for level_name, steps in levels:
-        fallback = run_cleanup_steps(ctx, repo_path, level_name, steps)
+    for level in cleanup_steps.ci_prepare_cleanup_levels(ctx.allow_clean_x):
+        fallback = run_cleanup_steps(ctx, repo_path, level.name, level.steps)
         ctx.report.add_fallback(fallback)
         if fallback["success"]:
             return
 
-    deep_steps: list[dict[str, Any]] = []
-    for submodule_path in repository_ops.get_submodule_paths(ctx, repo_path):
-        sub_repo = common.resolve_path(repo_path / submodule_path)
-        deep_steps.extend(
-            [
-                {"cwd": sub_repo, "args": ["fetch", "--all", "--prune"], "allow_failure": True},
-                {"cwd": sub_repo, "args": ["reset", "--hard"]},
-                {"cwd": sub_repo, "args": ["clean", clean_flag]},
-                {"cwd": sub_repo, "args": ["submodule", "update", "--init", "--recursive", "--force"]},
-            ]
-        )
+    deep_steps = cleanup_steps.ci_deep_submodule_cleanup_steps(
+        repo_path,
+        repository_ops.get_submodule_paths(ctx, repo_path),
+        ctx.allow_clean_x,
+    )
 
     fallback = run_cleanup_steps(ctx, repo_path, "level_4_deep_submodule_cleanup", deep_steps)
     ctx.report.add_fallback(fallback)
@@ -201,12 +171,9 @@ def restore_repo_to_snapshot(ctx: Any, snapshot: dict[str, Any], ci_module: Modu
         "errors": [],
     }
     try:
-        ctx.runner.run(repo_path, ["merge", "--abort"], allow_failure=True)
-        ctx.runner.run(repo_path, ["rebase", "--abort"], allow_failure=True)
-        ctx.runner.run(repo_path, ["cherry-pick", "--abort"], allow_failure=True)
-        ctx.runner.run(repo_path, ["reset", "--hard", pre_merge_head])
-        ctx.runner.run(repo_path, ["clean", "-fd"])
-        ctx.runner.run(repo_path, ["submodule", "update", "--init", "--recursive", "--force"], allow_failure=True)
+        for step in cleanup_steps.ci_snapshot_restore_steps(pre_merge_head, ctx.allow_clean_x):
+            cwd = common.resolve_path(step.cwd if step.cwd is not None else repo_path)
+            ctx.runner.run(cwd, list(step.args), allow_failure=step.allow_failure)
         if branch:
             checkout = ctx.runner.run(repo_path, ["checkout", branch], allow_failure=True)
             if checkout.exit_code != 0:
