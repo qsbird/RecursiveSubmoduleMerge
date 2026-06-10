@@ -167,6 +167,18 @@ class CiAutoMergePolicy(MergePolicy):
         branch = self._branch_for_depth(context.depth)
         actions.run(context.submodule_repo, ["checkout", "-B", branch, context.ours_sha])
         actions.run(context.submodule_repo, ["submodule", "update", "--init", "--recursive", "--force"], check=False)
+        if self.ctx is not None and self.services is not None:
+            self.services.guards.ensure_ready_after_state_change(
+                self.ctx,
+                context.submodule_repo,
+                scope={
+                    "type": "recursive_merge_target_checkout",
+                    "depth": context.depth,
+                    "path": context.submodule_path,
+                    "target_sha": context.ours_sha,
+                },
+                checkout_args=["checkout", "-B", branch, context.ours_sha],
+            )
 
     def handle_file_conflicts(
         self,
@@ -286,6 +298,16 @@ class CiAutoGitlinkMergeService:
         branch = self._branch_for_depth(depth)
         self.actions.run(repo, ["checkout", "-B", branch, target_sha])
         self._sync_submodules_for_head(repo)
+        self._ensure_ready_after_state_change(
+            repo,
+            scope={
+                "type": "merge_repo_target_checkout",
+                "depth": depth,
+                "target_sha": target_sha,
+                "display_path": display_path or self._display_path(repo),
+            },
+            checkout_args=["checkout", "-B", branch, target_sha],
+        )
 
         merge = self.actions.merge_no_commit(repo, source_sha)
         strategy = "clean_merge"
@@ -296,7 +318,7 @@ class CiAutoGitlinkMergeService:
             gitlinks = [conflict for conflict in conflicts if conflict.kind == "gitlink"]
             non_gitlinks = [conflict for conflict in conflicts if conflict.kind != "gitlink"]
             if not gitlinks or non_gitlinks:
-                self.policy.handle_file_conflicts(self.actions, repo, conflicts, depth)
+                self.policy.handle_file_conflicts(self.actions, repo, non_gitlinks or conflicts, depth)
             self.engine.resolve_active_conflicts(repo, depth=depth)
             self.policy.validate_after_conflicts(self.actions, repo, depth)
             strategy = "recursive_gitlink_merge"
@@ -314,11 +336,39 @@ class CiAutoGitlinkMergeService:
         )
         result_sha = self.actions.commit_pending_merge(repo, message)
         self._sync_submodules_for_head(repo)
+        self._ensure_ready_after_state_change(
+            repo,
+            scope={
+                "type": "merge_repo_result_checkout",
+                "depth": depth,
+                "target_sha": target_sha,
+                "result_sha": result_sha,
+                "display_path": display_path or self._display_path(repo),
+                "preserve_refs": [result_sha],
+            },
+            checkout_args=["checkout", "--detach", result_sha],
+        )
         self._collect_repository_details(repo, display_path or self._display_path(repo), base_sha, target_sha, source_sha, result_sha, strategy)
         return CiMergeResult(repo, display_path or self._display_path(repo), base_sha, source_sha, target_sha, result_sha, strategy)
 
     def _sync_submodules_for_head(self, repo: Path) -> None:
         self.actions.run(repo, ["submodule", "update", "--init", "--recursive", "--force"], check=False)
+
+    def _ensure_ready_after_state_change(
+        self,
+        repo: Path,
+        *,
+        scope: dict[str, Any],
+        checkout_args: list[str],
+    ) -> None:
+        if self.ctx is None or self.services is None:
+            return
+        self.services.guards.ensure_ready_after_state_change(
+            self.ctx,
+            repo,
+            scope=scope,
+            checkout_args=checkout_args,
+        )
 
     def _build_commit_message(
         self,

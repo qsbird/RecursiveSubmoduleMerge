@@ -47,8 +47,34 @@ class CiRepositoryGuards:
     def verify_repo_ready(self, ctx: Any, repo_path: Path) -> tuple[bool, list[str]]:
         return repository_ops.verify_repo_ready(ctx, repo_path)
 
-    def clean_and_prepare_repo(self, ctx: Any, repo_path: Path) -> None:
-        recovery.clean_and_prepare_repo(ctx, repo_path, self.ci_module)
+    def clean_and_prepare_repo(
+        self,
+        ctx: Any,
+        repo_path: Path,
+        *,
+        scope: dict[str, Any] | None = None,
+    ) -> None:
+        recovery.clean_and_prepare_repo(ctx, repo_path, self.ci_module, scope=scope)
+
+    def ensure_ready_after_state_change(
+        self,
+        ctx: Any,
+        repo_path: Path,
+        *,
+        scope: dict[str, Any] | None = None,
+        checkout_args: list[str] | tuple[str, ...] | None = None,
+        update_submodules: bool = True,
+        max_cleanup_attempts: int = 2,
+    ) -> None:
+        recovery.ensure_ready_after_state_change(
+            ctx,
+            repo_path,
+            self.ci_module,
+            scope=scope,
+            checkout_args=checkout_args,
+            update_submodules=update_submodules,
+            max_cleanup_attempts=max_cleanup_attempts,
+        )
 
     def sync_remote_refs(self, ctx: Any, repo_path: Path) -> None:
         preflight.sync_remote_refs(ctx, repo_path, self.ci_module)

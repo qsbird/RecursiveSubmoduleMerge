@@ -11,6 +11,7 @@ from typing import Any, Callable
 from merge_cleanup_core import steps as cleanup_steps
 
 from . import runtime
+from . import repository_ops
 from .models import CiMergeError, CommandResult, ExitCode, MergeStepContext, Phase, PreflightResult, now_iso
 from .preflight import preflight_failure_reason
 from .publish import target_requires_explicit_publish_target
@@ -26,6 +27,24 @@ def report_progress(ctx: Any, message: str) -> None:
     progress = getattr(reporter, "progress", None)
     if callable(progress):
         progress(message)
+
+
+def report_warning(ctx: Any, reason: str, message: str, details: dict[str, Any] | None = None) -> None:
+    reporter = getattr(ctx, "report", None)
+    add_warning = getattr(reporter, "add_warning", None)
+    if callable(add_warning):
+        add_warning(reason, message, details=details)
+        return
+    data = getattr(reporter, "data", None)
+    if isinstance(data, dict):
+        data.setdefault("warnings", []).append(
+            {
+                "reason": reason,
+                "message": message,
+                "details": details or {},
+                "timestamp": now_iso(),
+            }
+        )
 
 
 def default_merge_repo(
@@ -94,6 +113,136 @@ def command_range(ctx: Any, start_index: int) -> dict[str, int | None]:
     return {"start": start_index, "end": end_index, "count": end_index - start_index + 1}
 
 
+def fallback_count(ctx: Any) -> int | None:
+    report = getattr(ctx, "report", None)
+    data = getattr(report, "data", None)
+    if isinstance(data, dict) and isinstance(data.get("fallbacks"), list):
+        return len(data["fallbacks"])
+    fallbacks = getattr(report, "fallbacks", None)
+    if isinstance(fallbacks, list):
+        return len(fallbacks)
+    return None
+
+
+def fallback_range(start_index: int | None, end_index: int | None) -> dict[str, int | None]:
+    if start_index is None or end_index is None:
+        return {"start": None, "end": None, "count": None}
+    if end_index <= start_index:
+        return {"start": start_index, "end": None, "count": 0}
+    return {"start": start_index, "end": end_index - 1, "count": end_index - start_index}
+
+
+def batch_step_cleanup_scope(index: int, total: int, source: str, target: str) -> dict[str, Any]:
+    scope: dict[str, Any] = {
+        "type": "batch_step_start",
+        "step_index": index,
+        "step_total": total,
+        "source": source,
+        "target": target,
+    }
+    if index > 1:
+        scope["preserve_refs"] = [target]
+    return scope
+
+
+def sync_root_refs_for_target_resolution(
+    ctx: Any,
+    repo_path: Path,
+    services: CiWorkflowServices,
+) -> None:
+    ctx.set_state(Phase.SYNCING_REFS)
+    command = services.guards.run_sync_command(
+        ctx,
+        repo_path,
+        ["fetch", "--no-recurse-submodules", ctx.args.remote, "--prune"],
+        "REMOTE_FETCH_FAILED",
+        "failed to fetch remote refs before target checkout",
+    )
+    remote_sync = ctx.report.data.setdefault("remote_sync", {})
+    if isinstance(remote_sync, dict):
+        remote_sync["root_fetch_before_target_checkout"] = command.to_dict()
+
+
+def checkout_detached_and_prepare(
+    ctx: Any,
+    repo_path: Path,
+    services: CiWorkflowServices,
+    target_sha: str,
+    *,
+    scope: dict[str, Any],
+) -> None:
+    checkout_args = ["checkout", "--detach", target_sha]
+    checkout = ctx.runner.run(repo_path, checkout_args, allow_failure=True)
+    if checkout.exit_code != 0:
+        retry_scope = dict(scope)
+        retry_scope.update(
+            {
+                "type": f"{scope.get('type', 'checkout')}_pre_checkout_retry",
+                "checkout_failure": checkout.to_dict(),
+            }
+        )
+        services.guards.clean_and_prepare_repo(ctx, repo_path, scope=retry_scope)
+        checkout = ctx.runner.run(repo_path, checkout_args, allow_failure=True)
+        if checkout.exit_code != 0:
+            raise CiMergeError(
+                ExitCode.CLEAN_OR_RESTORE_FAILED,
+                Phase.CLEANING,
+                "TARGET_CHECKOUT_FAILED_AFTER_CLEANUP",
+                "failed to checkout target state after cleanup",
+                details={"repo_path": str(repo_path), "target_sha": target_sha, "command": checkout.to_dict()},
+                restore_needed=True,
+            )
+    ctx.runner.run(repo_path, ["submodule", "update", "--init", "--recursive", "--force"], allow_failure=True)
+    services.guards.ensure_ready_after_state_change(
+        ctx,
+        repo_path,
+        scope=scope,
+        checkout_args=checkout_args,
+    )
+
+
+def prepare_batch_step(
+    ctx: Any,
+    repo_path: Path,
+    services: CiWorkflowServices,
+    step_entry: dict[str, Any],
+    *,
+    index: int,
+    total: int,
+    source: str,
+    target: str,
+) -> None:
+    started_at = now_iso()
+    start_count = fallback_count(ctx)
+    cleanup_entry: dict[str, Any] = {
+        "attempted": True,
+        "success": False,
+        "started_at": started_at,
+        "ended_at": None,
+        "fallback_range": {"start": start_count, "end": None, "count": None},
+    }
+    step_entry["pre_step_cleanup"] = cleanup_entry
+    try:
+        cleanup_scope = batch_step_cleanup_scope(index, total, source, target)
+        target_resolution = repository_ops.resolve_commit_ref(ctx, repo_path, target)
+        if target_resolution.sha:
+            checkout_detached_and_prepare(
+                ctx,
+                repo_path,
+                services,
+                target_resolution.sha,
+                scope=cleanup_scope,
+            )
+        cleanup_entry["success"] = True
+    except Exception as exc:
+        cleanup_entry["error"] = exception_to_batch_error(ctx, exc)
+        raise
+    finally:
+        end_count = fallback_count(ctx)
+        cleanup_entry["ended_at"] = now_iso()
+        cleanup_entry["fallback_range"] = fallback_range(start_count, end_count)
+
+
 def refresh_batch_step_summaries(batch: dict[str, Any]) -> tuple[list[int], list[int]]:
     steps = batch.get("steps") or []
     successful_steps = [
@@ -139,13 +288,31 @@ def serialize_non_gitlink_conflict(conflict: Any) -> dict[str, Any]:
                 "raw": getattr(stage, "raw", None),
             }
         )
+    kind = getattr(conflict, "kind", None)
+    type_by_kind = {
+        "file": "file_conflict",
+        "gitmodules": "gitmodules_conflict",
+        "unparseable": "unparseable_conflict",
+        "unsupported_stage": "unsupported_conflict_stage",
+        "gitlink": "gitlink_conflict",
+    }
     return {
         "repo_path": str(getattr(conflict, "repo_path", "")),
         "path": getattr(conflict, "path", None),
-        "type": "file_conflict" if getattr(conflict, "kind", None) != "gitlink" else "gitlink_conflict",
-        "kind": getattr(conflict, "kind", None),
+        "type": type_by_kind.get(kind, "file_conflict" if kind != "gitlink" else "gitlink_conflict"),
+        "kind": kind,
         "stages": stages,
+        "action": "manual_required",
     }
+
+
+def record_non_gitlink_conflicts(ctx: Any, conflicts: list[dict[str, Any]]) -> None:
+    if not conflicts:
+        return
+    report = getattr(ctx, "report", None)
+    add_conflicts = getattr(report, "add_conflicts", None)
+    if callable(add_conflicts):
+        add_conflicts(conflicts)
 
 
 def command_result_to_dict(value: Any) -> dict[str, Any] | None:
@@ -212,9 +379,19 @@ def convert_skippable_merge_exception(ctx: Any, exc: Exception) -> CiMergeError 
     resolved_repo = Path(repo_path).resolve(strict=False) if repo_path is not None else None
     root_repo = Path(getattr(ctx, "root_repo", Path.cwd())).resolve(strict=False)
     is_root_conflict = resolved_repo is None or resolved_repo == root_repo
+    raw_conflicts = list(getattr(exc, "conflicts", []) or [])
+    non_gitlink_conflicts = [
+        conflict for conflict in raw_conflicts if getattr(conflict, "kind", None) != "gitlink"
+    ]
     conflicts = [
         serialize_non_gitlink_conflict(conflict)
-        for conflict in getattr(exc, "conflicts", []) or []
+        for conflict in (non_gitlink_conflicts or raw_conflicts)
+    ]
+    record_non_gitlink_conflicts(ctx, conflicts)
+    conflict_paths = [
+        str(conflict.get("path"))
+        for conflict in conflicts
+        if conflict.get("path") is not None
     ]
     return CiMergeError(
         ExitCode.ROOT_CONFLICT if is_root_conflict else ExitCode.SUBMODULE_CONFLICT,
@@ -225,6 +402,8 @@ def convert_skippable_merge_exception(ctx: Any, exc: Exception) -> CiMergeError 
             "type": type(exc).__name__,
             "repo_path": str(repo_path) if repo_path is not None else None,
             "conflicts": conflicts,
+            "conflict_paths": conflict_paths,
+            "conflict_count": len(conflicts),
         },
         restore_needed=True,
     )
@@ -470,6 +649,7 @@ def run_batch_workflow(
             "result_sha": None,
             "strategy": None,
             "preflight": None,
+            "pre_step_cleanup": None,
             "command_range": {"start": command_start, "end": None, "count": 0},
             "artifact_scope": batch_step_artifact_scope(ctx, artifact_prefix),
             "continued_after_failure": False,
@@ -479,6 +659,16 @@ def run_batch_workflow(
         report_progress(ctx, f"STEP {index}/{len(sources)} start source={source} target={current_target}")
 
         try:
+            prepare_batch_step(
+                ctx,
+                repo_path,
+                resolved_services,
+                step_entry,
+                index=index,
+                total=len(sources),
+                source=source,
+                target=current_target,
+            )
             preflight = resolved_services.guards.preflight_check(
                 ctx,
                 repo_path,
@@ -665,6 +855,20 @@ def run_batch_workflow(
         )
 
     batch["manual_publish"] = manual_publish_info(ctx, original_target_sha, final_result_sha)
+    if ctx.args.publish:
+        if failed_steps and not bool(getattr(ctx.args, "allow_partial_publish", False)):
+            report_warning(
+                ctx,
+                "BATCH_PARTIAL_PUBLISH_SKIPPED",
+                "batch publish was skipped because one or more source branches failed; "
+                "set --allow_partial_publish true to publish the partial_success result",
+                details={"successful_steps": successful_steps, "failed_steps": failed_steps},
+            )
+            report_progress(ctx, "BATCH publish skipped reason=BATCH_PARTIAL_PUBLISH_SKIPPED")
+        else:
+            resolved_services.publish.publish_result(ctx, repo_path, original_target_sha, final_result_sha)
+            report_progress(ctx, f"BATCH publish success result={final_result_sha}")
+
     if failed_steps:
         batch["status"] = "partial_success"
         ctx.report.data["status"] = "partial_success"
@@ -699,12 +903,55 @@ def run_workflow(
         return
 
     if can_attempt_cleanup(ctx, repo_path):
-        report_progress(ctx, "PREPARE repository start")
-        resolved_services.guards.clean_and_prepare_repo(ctx, repo_path)
-        report_progress(ctx, "PREPARE repository done")
+        report_progress(ctx, "PREPARE pre-checkout repository start")
+        resolved_services.guards.clean_and_prepare_repo(
+            ctx,
+            repo_path,
+            scope={"type": "workflow_pre_checkout_prepare", "mode": mode, "source_count": source_count},
+        )
+        report_progress(ctx, "PREPARE pre-checkout repository done")
+
+        report_progress(ctx, "SYNC root refs for target checkout start")
+        sync_root_refs_for_target_resolution(ctx, repo_path, resolved_services)
+        report_progress(ctx, "SYNC root refs for target checkout done")
+
+        target_sha_for_checkout: str | None = None
+        target_checkout_scope = {
+            "type": "workflow_target_checkout",
+            "mode": mode,
+            "source_count": source_count,
+            "target": ctx.args.target,
+        }
+        if ctx.args.target:
+            target_resolution = repository_ops.resolve_commit_ref(ctx, repo_path, ctx.args.target)
+            target_sha_for_checkout = target_resolution.sha
+            if target_sha_for_checkout:
+                report_progress(ctx, "CHECKOUT target repository start")
+                checkout_detached_and_prepare(
+                    ctx,
+                    repo_path,
+                    resolved_services,
+                    target_sha_for_checkout,
+                    scope=target_checkout_scope,
+                )
+                report_progress(ctx, "CHECKOUT target repository done")
+
         report_progress(ctx, "SYNC remote refs start")
         resolved_services.guards.sync_remote_refs(ctx, repo_path)
         report_progress(ctx, "SYNC remote refs done")
+
+        if target_sha_for_checkout:
+            report_progress(ctx, "CHECKOUT target after sync start")
+            post_sync_scope = dict(target_checkout_scope)
+            post_sync_scope["type"] = "workflow_post_sync_target_checkout"
+            checkout_detached_and_prepare(
+                ctx,
+                repo_path,
+                resolved_services,
+                target_sha_for_checkout,
+                scope=post_sync_scope,
+            )
+            report_progress(ctx, "CHECKOUT target after sync done")
 
     if len(ctx.args.sources) > 1:
         run_batch_workflow(ctx, resolved_services, merge_repo)
