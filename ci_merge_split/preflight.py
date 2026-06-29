@@ -282,8 +282,17 @@ def fetch_submodule_repo(
         "command": None,
     }
     sync_report.setdefault("submodule_fetches", []).append(item)
-    result = ctx.runner.run(repo_path, ["fetch", "--all", "--prune"], allow_failure=True)
+    remote = str(getattr(ctx.args, "remote", "origin") or "origin")
+    fetch_cmd = ["fetch", "--no-recurse-submodules", remote, "--prune"]
+    result = ctx.runner.run(repo_path, fetch_cmd, allow_failure=True)
     item["command"] = result.to_dict()
+
+    if result.exit_code != 0 and _stderr_contains_ref_lock_error(result.stderr):
+        _fix_packed_refs_and_retry(ctx, repo_path, sync_report)
+        result = ctx.runner.run(repo_path, fetch_cmd, allow_failure=True)
+        item["command"] = result.to_dict()
+        item["ref_lock_recovery_attempted"] = True
+
     if result.exit_code != 0:
         item["failure_reason"] = "SUBMODULE_FETCH_FAILED"
         _raise_ci_error(
@@ -297,6 +306,25 @@ def fetch_submodule_repo(
         )
     item["success"] = True
     return result
+
+
+def _stderr_contains_ref_lock_error(stderr: str) -> bool:
+    return "cannot lock ref" in (stderr or "")
+
+
+def _fix_packed_refs_and_retry(ctx: Any, repo_path: Path, sync_report: dict[str, Any]) -> None:
+    pack_refs_result = ctx.runner.run(
+        repo_path,
+        ["pack-refs", "--all", "--prune"],
+        allow_failure=True,
+    )
+    sync_report.setdefault("submodule_pack_refs_recovery", []).append(
+        {
+            "repo_path": str(repo_path),
+            "success": pack_refs_result.exit_code == 0,
+            "command": pack_refs_result.to_dict(),
+        }
+    )
 
 
 def ensure_needed_submodule_worktree(
@@ -457,7 +485,7 @@ def sync_remote_refs(ctx: Any, repo_path: Path, ci_module: ModuleType | None = N
         run_sync_command(
             ctx,
             repo_path,
-            ["fetch", ctx.args.remote, "--prune"],
+            ["fetch", "--no-recurse-submodules", ctx.args.remote, "--prune"],
             "REMOTE_FETCH_FAILED",
             "failed to fetch remote refs before resolving source and target",
             ci_module,
