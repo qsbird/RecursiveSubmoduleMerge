@@ -52,6 +52,21 @@ def decode_stream(payload: bytes | None) -> str:
     return payload.decode("utf-8", errors="replace")
 
 
+def _safe_write(stream: object, text: str) -> None:
+    """Write *text* to *stream* (sys.stdout / sys.stderr), silently ignoring
+    characters that cannot be encoded by the stream's current codec (e.g.
+    Unicode replacement characters on a gbk terminal)."""
+    try:
+        if hasattr(stream, "buffer"):
+            stream.buffer.write((text + "\n" if not text.endswith("\n") else text).encode(stream.encoding or "utf-8", errors="replace"))
+            stream.flush()
+        else:
+            stream.write(text)
+            stream.flush()
+    except (UnicodeEncodeError, UnicodeDecodeError, OSError):
+        pass
+
+
 def format_git_failure(result: GitResult) -> str:
     rendered = " ".join(shlex.quote(part) for part in result.args)
     details = [f"Command failed in {result.cwd}: {rendered}"]
@@ -69,7 +84,7 @@ def run_git(
     check: bool = True,
     stream_output: bool = False,
 ) -> GitResult:
-    cmd = ["git", *args]
+    cmd = ["git", "-c", "safe.directory=*", "-c", "core.longpaths=true", *args]
 
     if VERBOSE:
         print(f"[RUN] {repo_path}", flush=True)
@@ -148,12 +163,10 @@ def run_git(
             continue
         if stream_name == "stdout":
             stdout_chunks.append(payload)
-            sys.stdout.write(payload)
-            sys.stdout.flush()
+            _safe_write(sys.stdout, payload)
         else:
             stderr_chunks.append(payload)
-            sys.stderr.write(payload)
-            sys.stderr.flush()
+            _safe_write(sys.stderr, payload)
 
     result = GitResult(
         args=cmd,
@@ -177,7 +190,7 @@ def run_git_binary(
     *,
     check: bool = True,
 ) -> GitBinaryResult:
-    cmd = ["git", *args]
+    cmd = ["git", "-c", "safe.directory=*", "-c", "core.longpaths=true", *args]
     if VERBOSE:
         print(f"[RUN] {repo_path}", flush=True)
         print(" ".join(shlex.quote(part) for part in cmd), flush=True)

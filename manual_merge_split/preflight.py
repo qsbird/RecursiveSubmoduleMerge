@@ -153,12 +153,26 @@ def ensure_repo_ready(
 ) -> None:
     if ops.merge_in_progress(repo_path):
         raise ops._automation_error(f"Repository already has an in-progress merge: {repo_path}")
-    if require_clean and ops.working_tree_has_changes(
-        repo_path,
-        ignored_untracked_paths=ignored_untracked_paths,
-        ignored_paths=ignored_dirty_paths,
-    ):
-        raise ops._automation_error(f"Repository has uncommitted changes, please clean it before running: {repo_path}")
+    if require_clean:
+        status_lines = ops.working_tree_status_lines(
+            repo_path,
+            ignored_untracked_paths=ignored_untracked_paths,
+            ignored_paths=ignored_dirty_paths,
+        )
+        if status_lines:
+            failure_message = f"Repository has uncommitted changes, please clean it before running: {repo_path}"
+            ops.require_risky_operation_confirmation(
+                reason="DIRTY_WORKTREE_BEFORE_MERGE",
+                message=(
+                    "Continuing may mix local uncommitted changes into the merge, or later cleanup "
+                    "may overwrite those changes."
+                ),
+                details={
+                    "repository": str(repo_path),
+                    "status": status_lines,
+                },
+                failure_message=failure_message,
+            )
     if not ops.has_git_identity(repo_path):
         raise ops._automation_error(
             "Git user.name / user.email is not configured for repository: "
@@ -200,8 +214,6 @@ def refresh_repository_for_merge(
         if not common.path_contains_git_repo(child_repo):
             raise ops._automation_error(f"Failed to initialize submodule repository before merge: {child_repo}")
 
-    ops.fetch_all_remotes(repo_path)
-
     for submodule_path in ops.get_submodule_paths(repo_path):
         child_repo = repo_path / submodule_path
         if not child_repo.exists() or not common.path_contains_git_repo(child_repo):
@@ -222,11 +234,24 @@ def preflight_repository(
 
     ops.ensure_git_repo(repo_path)
     ensure_repo_ready(repo_path, ops, require_clean=False)
-    if ops.repo_has_direct_changes(
+    status_lines = ops.repo_direct_status_lines(
         repo_path,
         ignored_untracked_paths=ignored_root_untracked_paths,
-    ):
-        raise ops._automation_error(f"Repository has uncommitted changes, please clean it before running: {repo_path}")
+    )
+    if status_lines:
+        failure_message = f"Repository has uncommitted changes, please clean it before running: {repo_path}"
+        ops.require_risky_operation_confirmation(
+            reason="ROOT_UNCOMMITTED_CHANGES_BEFORE_PREFLIGHT",
+            message=(
+                "Continuing preflight with root-level uncommitted changes may mix local files into "
+                "the merge result or make later cleanup discard them."
+            ),
+            details={
+                "repository": str(repo_path),
+                "status": status_lines,
+            },
+            failure_message=failure_message,
+        )
 
     refresh_repository_for_merge(repo_path, ops)
     ops.fetch_ref_if_remote(repo_path, base_ref)
@@ -263,6 +288,7 @@ def preflight_repository(
             repo_path=entry.repo_path,
             lineage=entry.lineage,
             reason=reason,
+            risk_confirmed=affected,
         )
         if affected:
             blocked_dirty_submodules.append(assessed_entry)
@@ -270,10 +296,24 @@ def preflight_repository(
             allowed_dirty_submodules.append(assessed_entry)
 
     if blocked_dirty_submodules:
-        raise ops._automation_error(
+        failure_message = (
             "Merge preflight found dirty submodules that may be touched by the planned merge:\n"
             + format_dirty_submodule_list(blocked_dirty_submodules)
         )
+        ops.require_risky_operation_confirmation(
+            reason="DIRTY_SUBMODULE_TOUCHED_BY_MERGE",
+            message=(
+                "The planned merge may update, replace, or remove dirty submodules listed below. "
+                "Continuing can leave local submodule changes mixed with merge results or make cleanup stop "
+                "instead of overwriting them."
+            ),
+            details={
+                "repository": str(repo_path),
+                "submodules": format_dirty_submodule_list(blocked_dirty_submodules).splitlines(),
+            },
+            failure_message=failure_message,
+        )
+        allowed_dirty_submodules.extend(blocked_dirty_submodules)
 
     return MergePreflightResult(allowed_dirty_submodules=allowed_dirty_submodules)
 

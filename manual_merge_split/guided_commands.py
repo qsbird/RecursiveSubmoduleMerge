@@ -51,21 +51,35 @@ def run_guided(
     set_verbose: Any,
     input_func: Any = input,
 ) -> int:
+    from .config_persistence import load_config
+
+    saved_config = load_config()
+
     set_verbose(getattr(args, "verbose", False))
     print("Recursive Submodule Merge Wizard")
     print("================================")
     print("Merge branch inputs default to remote refs: non-origin names become origin/<branch>.")
     print("Nested submodules follow the parent repository's recorded gitlink commits.")
     print("Merge now runs preflight checks only; if a repository needs recovery, run cleanup explicitly before merging.")
-    repo = Path(prompt_with_default("Repository path", str(Path(args.repo).resolve()), input_func=input_func)).resolve()
-    action = prompt_with_default("Choose action: merge or cleanup", "merge", input_func=input_func).lower()
+
+    default_repo = saved_config.merge.repo if saved_config.last_command in {"merge", "cleanup"} else str(Path(args.repo).resolve())
+    repo = Path(prompt_with_default("Repository path", default_repo, input_func=input_func)).resolve()
+    action = prompt_with_default("Choose action: merge or cleanup",
+                                  saved_config.last_command if saved_config.last_command in {"merge", "cleanup"} else "merge",
+                                  input_func=input_func).lower()
     if action not in {"merge", "cleanup"}:
         print("Unsupported action. Please choose merge or cleanup.", file=sys.stderr)
         return 1
 
     if action == "merge":
+        mc = saved_config.merge
+        default_branches_raw = ", ".join(mc.merge_branches) if mc.merge_branches else ""
         merge_branches = common.parse_branch_tokens(
-            input_func("Merge branches in order (branch name or origin/branch; comma or line separated): ").strip()
+            input_func(
+                f"Merge branches in order (branch name or origin/branch; comma or line separated)"
+                f"{' [' + default_branches_raw + ']' if default_branches_raw else ''}: "
+            ).strip()
+            or default_branches_raw
         )
         if not merge_branches:
             print("At least one merge branch is required.", file=sys.stderr)
@@ -73,7 +87,7 @@ def run_guided(
 
         continue_current_branch = prompt_yes_no(
             "Continue merging on the current root branch instead of creating/resetting a work branch",
-            False,
+            mc.continue_current_branch,
             input_func=input_func,
         )
         base_remote_branch = ROOT_BASE_REMOTE_BRANCH
@@ -81,12 +95,12 @@ def run_guided(
         if not continue_current_branch:
             base_remote_branch = prompt_with_default(
                 "Root base remote branch",
-                ROOT_BASE_REMOTE_BRANCH,
+                mc.base_remote_branch,
                 input_func=input_func,
             )
             work_branch = prompt_optional(
                 "Work branch name (leave empty to auto-pick)",
-                common.compute_work_branch(None),
+                mc.work_branch or common.compute_work_branch(None),
                 input_func=input_func,
             )
         merge_args = argparse.Namespace(
@@ -101,7 +115,7 @@ def run_guided(
             work_branch=work_branch,
             allow_dirty_submodules=prompt_yes_no(
                 "Allow unaffected dirty submodules to remain dirty when preflight can prove they are untouched",
-                False,
+                mc.allow_dirty_submodules,
                 input_func=input_func,
             ),
             no_prompt_dirty_submodules=False,
@@ -110,41 +124,43 @@ def run_guided(
             file_conflict_mode="tool",
             conflict_tool_command=prompt_with_default(
                 "Conflict tool command",
-                DEFAULT_CONFLICT_TOOL_COMMAND,
+                mc.conflict_tool_command,
                 input_func=input_func,
             ),
             conflict_tool_timeout_seconds=int(
                 prompt_with_default(
                     "Conflict tool timeout seconds (0 means wait forever)",
-                    str(DEFAULT_CONFLICT_TOOL_TIMEOUT_SECONDS),
+                    str(mc.conflict_tool_timeout_seconds),
                     input_func=input_func,
                 )
             ),
-            verbose=prompt_yes_no("Enable verbose command output", getattr(args, "verbose", False), input_func=input_func),
+            verbose=prompt_yes_no("Enable verbose command output", mc.verbose, input_func=input_func),
         )
         if merge_args.clone_branch:
             merge_args.clone_url = prompt_optional("Clone git URL", input_func=input_func)
             merge_args.clone_path = prompt_optional("Clone target path", input_func=input_func)
         return run_merge(merge_args)
 
-    rebuild_work_branch = prompt_yes_no("Rebuild the work branch after cleanup", True, input_func=input_func)
+    cc = saved_config.cleanup
+    rebuild_work_branch = prompt_yes_no("Rebuild the work branch after cleanup", cc.rebuild_work_branch, input_func=input_func)
     base_remote_branch = ROOT_BASE_REMOTE_BRANCH
     work_branch = None
     if rebuild_work_branch:
         base_remote_branch = prompt_with_default("Root base remote branch", ROOT_BASE_REMOTE_BRANCH, input_func=input_func)
         work_branch = prompt_with_default(
             "Work branch name",
-            common.compute_work_branch(None),
+            cc.work_branch or common.compute_work_branch(None),
             input_func=input_func,
         )
     cleanup_args = argparse.Namespace(
         command="cleanup",
         repo=str(repo),
         report_file=prompt_with_default("Conflict report filename", REPORT_FILE_NAME, input_func=input_func),
-        skip_submodule_update=not prompt_yes_no("Run submodule update after cleanup", True, input_func=input_func),
+        skip_submodule_update=not prompt_yes_no("Run submodule update after cleanup", not cc.skip_submodule_update, input_func=input_func),
         rebuild_work_branch=rebuild_work_branch,
         base_remote_branch=base_remote_branch,
         work_branch=work_branch,
+        allow_clean_x=prompt_yes_no("Allow git clean -x (remove ignored files) during cleanup", cc.allow_clean_x, input_func=input_func),
         verbose=prompt_yes_no("Enable verbose command output", getattr(args, "verbose", False), input_func=input_func),
     )
     return run_cleanup(cleanup_args)

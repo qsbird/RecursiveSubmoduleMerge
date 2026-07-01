@@ -214,6 +214,11 @@ def add_cleanup_arguments(parser: argparse.ArgumentParser) -> None:
         help="Work branch name to recreate. If omitted, WORK_BRANCH_TEMPLATE with today's date is used.",
     )
     parser.add_argument(
+        "--allow-clean-x",
+        action="store_true",
+        help="Allow git clean -x (remove ignored files) during cleanup for stubborn states.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print executed commands and key progress information.",
@@ -256,6 +261,11 @@ def add_publish_arguments(parser: argparse.ArgumentParser) -> None:
         help="Do not create a suffix branch when the requested local branch name points elsewhere.",
     )
     parser.add_argument(
+        "--no-interactive",
+        action="store_true",
+        help="Skip the interactive publish confirmation and push immediately.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print executed commands and key progress information.",
@@ -268,25 +278,64 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(normalized)
 
 
+def _check_code_at_startup(args: argparse.Namespace) -> None:
+    """Check that the conflict-tool command (typically 'code --wait') is available at startup.
+
+    Only applies when the subcommand is ``merge`` and the conflict-tool-command
+    references a VS Code executable that cannot be resolved.  If the check fails
+    the function prints the error to stderr and calls ``sys.exit(1)`` so the
+    caller never enters the merge workflow.
+    """
+    if args.command != "merge":
+        return
+
+    from .file_conflicts import prepare_conflict_tool_command
+
+    command_template = getattr(args, "conflict_tool_command", None) or DEFAULT_CONFLICT_TOOL_COMMAND
+    result = prepare_conflict_tool_command(command_template)
+    if result.error:
+        print(result.error, file=sys.stderr)
+        sys.exit(1)
+    if result.message:
+        print(result.message)
+
+
 def main(
     argv: list[str] | None = None,
     *,
     command_service: ManualCommandService | None = None,
     guided_service: ManualGuidedCommandService | None = None,
 ) -> int:
+    from .config_persistence import apply_config_to_args, save_config_from_args
+
     args = parse_args(argv)
+    _check_code_at_startup(args)
+
+    # Apply saved configuration defaults for fields the user didn't override
+    args = apply_config_to_args(args)
+
     commands = command_service or ManualCommandService()
+    exit_code = 0
+
     if args.command == "cleanup":
-        return commands.run_cleanup(args)
-    if args.command == "publish":
-        return commands.run_publish(args)
-    if args.command == "guided":
+        exit_code = commands.run_cleanup(args)
+    elif args.command == "publish":
+        exit_code = commands.run_publish(args)
+    elif args.command == "guided":
         if guided_service is not None:
-            return guided_service.run_guided(args)
-        return run_guided(
-            args,
-            run_merge=commands.run_merge,
-            run_cleanup=commands.run_cleanup,
-            set_verbose=commands.set_verbose,
-        )
-    return commands.run_merge(args)
+            exit_code = guided_service.run_guided(args)
+        else:
+            exit_code = run_guided(
+                args,
+                run_merge=commands.run_merge,
+                run_cleanup=commands.run_cleanup,
+                set_verbose=commands.set_verbose,
+            )
+    else:
+        exit_code = commands.run_merge(args)
+
+    # Persist successful runs so the next invocation can pre-fill defaults
+    if exit_code == 0:
+        save_config_from_args(args, args.command)
+
+    return exit_code

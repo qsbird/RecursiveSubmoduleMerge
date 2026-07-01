@@ -1,0 +1,110 @@
+# -*- mode: python ; coding: utf-8 -*-
+
+import os
+from pathlib import Path
+
+_base = Path(r"C:\Users\Qs\Documents\MergeTool_for_Manual")
+
+_packages = [
+    "manual_merge_split",
+    "merge_cleanup_core",
+    "merge_tool_adapters",
+    "split_gitlink_merge",
+    "ci_merge_split",
+]
+
+datas = []
+for pkg in _packages:
+    src = _base / pkg
+    if src.is_dir():
+        datas.append((str(src), pkg))
+
+# also include assets and packaging_hooks
+assets_src = _base / "assets"
+if assets_src.is_dir():
+    datas.append((str(assets_src), "assets"))
+hooks_src = _base / "packaging_hooks"
+if hooks_src.is_dir():
+    datas.append((str(hooks_src), "packaging_hooks"))
+
+a = Analysis(
+    [str(_base / "recursive_submodule_merge_gui.py")],
+    pathex=[],
+    binaries=[],
+    datas=datas,
+    hiddenimports=[
+        "tkinter",
+        "tkinter.ttk",
+        "tkinter.filedialog",
+        "tkinter.messagebox",
+        "manual_merge_split",
+        "manual_merge_split.config_persistence",
+        "manual_merge_split.guided_commands",
+        "manual_merge_split.models",
+        "manual_merge_split.publish",
+        "manual_merge_split.commands",
+        "manual_merge_split.preflight",
+        "manual_merge_split.repository_ops",
+        "manual_merge_split.file_conflicts",
+        "manual_merge_split.common",
+        "manual_merge_split.execution",
+        "manual_merge_split.workflow",
+        "manual_merge_split.cross_submodule_moves",
+        "manual_merge_split.messages",
+        "manual_merge_split.legacy",
+        "manual_merge_split.runtime",
+        "merge_cleanup_core",
+        "merge_cleanup_core.steps",
+        "merge_tool_adapters",
+        "merge_tool_adapters.ci_auto",
+        "merge_tool_adapters.manual_semiauto",
+        "split_gitlink_merge",
+        "split_gitlink_merge.engine",
+        "split_gitlink_merge.executor",
+        "split_gitlink_merge.logic",
+        "split_gitlink_merge.model",
+        "split_gitlink_merge.planner",
+        "split_gitlink_merge.policy",
+        "split_gitlink_merge.ports",
+        "ci_merge_split",
+        "ci_merge_split.commands",
+        "ci_merge_split.common",
+        "ci_merge_split.models",
+        "ci_merge_split.preflight",
+        "ci_merge_split.publish",
+        "ci_merge_split.recovery",
+        "ci_merge_split.repository_ops",
+        "ci_merge_split.runtime",
+        "ci_merge_split.workflow",
+        "subprocess_window",
+    ],
+    hookspath=["packaging_hooks"],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name="MergeToolManual",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=[str(_base / "assets" / "manual_exe_icon.ico")],
+)

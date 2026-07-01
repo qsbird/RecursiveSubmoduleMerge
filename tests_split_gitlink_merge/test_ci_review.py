@@ -19,11 +19,29 @@ class CiReviewHtmlTests(unittest.TestCase):
         report_path = root / "merge-report.json"
         repository_patch = self._write(
             root / "patches" / "root" / "repository.patch",
-            "diff --git a/demo.txt b/demo.txt\n--- a/demo.txt\n+++ b/demo.txt\n@@ -1 +1 @@\n-old line\n+new line\n",
+            (
+                "diff --git a/repository-only.txt b/repository-only.txt\n"
+                "--- a/repository-only.txt\n"
+                "+++ b/repository-only.txt\n"
+                "@@ -1 +1 @@\n"
+                "-repo aggregate old\n"
+                "+repo aggregate marker\n"
+            ),
         )
         file_patch = self._write(
             root / "patches" / "root" / "files" / "0001-demo.txt.patch",
-            "diff --git a/demo.txt b/demo.txt\n@@ -1 +1 @@\n-old line\n+new line\n",
+            "diff --git a/demo.txt b/demo.txt\n@@ -1 +1,2 @@\n-old line\n+new line\n+file patch marker\n",
+        )
+        expanded_file_patch = self._write(
+            root / "patches" / "root" / "files" / "0001-demo.txt.expanded.patch",
+            (
+                "diff --git a/demo.txt b/demo.txt\n"
+                "@@ -1 +1,3 @@\n"
+                " expanded context marker\n"
+                "-old line\n"
+                "+new line\n"
+                "+file patch marker\n"
+            ),
         )
         ours_file = self._write(root / "files" / "root" / "0001-demo.txt" / "ours", "old line\n")
         result_file = self._write(root / "files" / "root" / "0001-demo.txt" / "result", "new line\n")
@@ -37,6 +55,7 @@ class CiReviewHtmlTests(unittest.TestCase):
             "status": "success",
             "exit_code": 0,
             "failure_reason": None,
+            "input": {"diff_context_lines": 3, "expanded_diff_context_lines": 20},
             "output": {
                 "output_dir": str(root),
                 "report_path": str(report_path),
@@ -58,8 +77,8 @@ class CiReviewHtmlTests(unittest.TestCase):
             },
             "repositories": [
                 {
-                    "path": "root",
-                    "repo_path": str(root / "missing-repo"),
+                    "path": ".",
+                    "repo_path": str(root / "qemu"),
                     "base": "base",
                     "ours": "ours",
                     "theirs": "theirs",
@@ -74,6 +93,10 @@ class CiReviewHtmlTests(unittest.TestCase):
                             "path": "demo.txt",
                             "patch_path": str(file_patch),
                             "patch_relative_path": "patches/root/files/0001-demo.txt.patch",
+                            "patch_context_lines": 3,
+                            "expanded_patch_path": str(expanded_file_patch),
+                            "expanded_patch_relative_path": "patches/root/files/0001-demo.txt.expanded.patch",
+                            "expanded_patch_context_lines": 20,
                             "content_artifacts": {
                                 "ours": {"path": str(ours_file), "relative_path": "files/root/0001-demo.txt/ours"},
                                 "result": {"path": str(result_file), "relative_path": "files/root/0001-demo.txt/result"},
@@ -132,6 +155,14 @@ class CiReviewHtmlTests(unittest.TestCase):
 
         self.assertIn("Self-contained offline HTML", html_text)
         self.assertIn("Rapid Diffs Review Workbench", html_text)
+        self.assertNotIn("Review Checklist", html_text)
+        self.assertNotIn('class="review-checklist"', html_text)
+        self.assertIn("qemu (root)", html_text)
+        self.assertIn('class="report-link"', html_text)
+        self.assertIn('href="file:', html_text)
+        self.assertIn('<details class="panel command-panel">', html_text)
+        self.assertIn('class="sidebar-resizer"', html_text)
+        self.assertIn('Commands <span class="muted">1 records, collapsed by default</span>', html_text)
         self.assertIn('class="rd-diff-file rd-diff-workbench"', html_text)
         self.assertIn('class="rd-hunk-lines rd-hunk-lines-inline"', html_text)
         self.assertIn('class="rd-hunk-lines rd-hunk-lines-parallel"', html_text)
@@ -140,8 +171,16 @@ class CiReviewHtmlTests(unittest.TestCase):
         self.assertIn('data-view-mode="unified"', html_text)
         self.assertIn('data-view-mode="split"', html_text)
         self.assertIn('class="nav-link nav-file"', html_text)
+        self.assertIn('href="#patch-1-1"', html_text)
+        self.assertIn('id="patch-1-1"', html_text)
+        self.assertIn('class="rd-context-switcher"', html_text)
+        self.assertIn('class="js-context-toggle" data-context="compact">3 lines</button>', html_text)
+        self.assertIn('class="js-context-toggle" data-context="expanded">20 lines</button>', html_text)
         self.assertIn("old line", html_text)
         self.assertIn("new line", html_text)
+        self.assertIn("file patch marker", html_text)
+        self.assertIn("expanded context marker", html_text)
+        self.assertNotIn("repo aggregate marker", html_text)
         self.assertIn("base conflict", html_text)
         self.assertIn("ours conflict", html_text)
         self.assertIn("theirs conflict", html_text)
@@ -152,6 +191,97 @@ class CiReviewHtmlTests(unittest.TestCase):
         self.assertNotIn("import(", html_text)
         self.assertNotIn('<pre class="patch"', html_text)
         self.assertNotIn("CodeMirror Review Workbench", html_text)
+
+    def test_gitlink_pointer_diffs_are_grouped_away_from_source_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            report_path = root / "merge-report.json"
+            source_patch = self._write(
+                root / "patches" / "root" / "files" / "0001-demo.txt.patch",
+                "diff --git a/demo.txt b/demo.txt\n@@ -1 +1 @@\n-old\n+new\n",
+            )
+            gitlink_patch = self._write(
+                root / "patches" / "root" / "files" / "0002-sdk.patch",
+                (
+                    "diff --git a/sdk b/sdk\n"
+                    "index ac607de..8368903 160000\n"
+                    "--- a/sdk\n"
+                    "+++ b/sdk\n"
+                    "@@ -1 +1 @@\n"
+                    "-Subproject commit ac607de3a288d717eb2d1fc3d6209436e4d7ea29\n"
+                    "+Subproject commit 83689032f6cbd644748ab44108a4dcd5d3a8f779\n"
+                ),
+            )
+            report = {
+                "schema_version": "1.0",
+                "status": "success",
+                "exit_code": 0,
+                "output": {"output_dir": str(root), "report_path": str(report_path)},
+                "resolved": {},
+                "summary": {},
+                "repositories": [
+                    {
+                        "path": ".",
+                        "repo_path": str(root / "repo"),
+                        "result": "result",
+                        "strategy": "merge",
+                        "changed_files": [
+                            {
+                                "status": "M",
+                                "path": "demo.txt",
+                                "patch_path": str(source_patch),
+                                "patch_relative_path": "patches/root/files/0001-demo.txt.patch",
+                            },
+                            {
+                                "status": "M",
+                                "path": "sdk",
+                                "patch_path": str(gitlink_patch),
+                                "patch_relative_path": "patches/root/files/0002-sdk.patch",
+                            },
+                        ],
+                    }
+                ],
+                "conflicts": [
+                    {
+                        "repo_path": str(root / "repo"),
+                        "path": "sdk",
+                        "type": "gitlink_conflict",
+                        "action": "recursive_merge",
+                        "stages": [
+                            {
+                                "mode": "160000",
+                                "sha": "ac607de3a288d717eb2d1fc3d6209436e4d7ea29",
+                                "stage": "2",
+                            },
+                            {
+                                "mode": "160000",
+                                "sha": "83689032f6cbd644748ab44108a4dcd5d3a8f779",
+                                "stage": "3",
+                            },
+                        ],
+                    }
+                ],
+                "commands": [],
+                "errors": [],
+                "restore": {},
+                "publish": {},
+            }
+            report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            output_path = generate_html_file(report_path)
+            html_text = output_path.read_text(encoding="utf-8")
+
+        self.assertIn("Submodule Pointer Changes", html_text)
+        self.assertIn('class="nav-link nav-file nav-gitlink"', html_text)
+        self.assertIn('id="gitlink-1"', html_text)
+        self.assertNotIn("Conflict: sdk", html_text)
+        self.assertNotIn("gitlink_conflict", html_text)
+        changed_files_region = html_text.split("<h3>Changed Files</h3>", 1)[1].split("<h3>Patch</h3>", 1)[0]
+        self.assertIn("demo.txt", changed_files_region)
+        self.assertNotIn("sdk", changed_files_region)
+        normal_patch_region = html_text.split("<h3>Patch</h3>", 1)[1].split('<details class="gitlink-section"', 1)[0]
+        self.assertNotIn("Subproject commit", normal_patch_region)
+        self.assertIn("8368903", html_text)
 
     def test_patch_rows_track_unified_diff_line_numbers(self) -> None:
         rows = parse_patch_rows(

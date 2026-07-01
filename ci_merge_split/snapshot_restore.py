@@ -37,8 +37,16 @@ class CiSnapshotRestoreService:
         repo_path: Path,
         level_name: str,
         steps: list[dict[str, Any]],
+        *,
+        scope: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return recovery.run_cleanup_steps(ctx, repo_path, level_name, steps)
+        return recovery.run_cleanup_steps(ctx, repo_path, level_name, steps, scope=scope)
 
-    def clean_and_prepare_repo(self, ctx: Any, repo_path: Path) -> None:
-        recovery.clean_and_prepare_repo(ctx, repo_path, self.ci_module)
+    def clean_and_prepare_repo(
+        self,
+        ctx: Any,
+        repo_path: Path,
+        *,
+        scope: dict[str, Any] | None = None,
+    ) -> None:
+        recovery.clean_and_prepare_repo(ctx, repo_path, self.ci_module, scope=scope)

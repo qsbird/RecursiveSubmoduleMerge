@@ -14,6 +14,8 @@ from manual_merge_split.publish import run_publish_workflow
 ROOT_SHA = "a" * 40
 CHILD_SHA = "b" * 40
 REMOTE_SHA = "c" * 40
+ROOT_BASE_SHA = "d" * 40
+CHILD_BASE_SHA = "e" * 40
 
 
 class FakeGitResult:
@@ -46,6 +48,7 @@ class FakePublishOps:
             self.submodule: None,
         }
         self.ancestor_result: dict[tuple[Path, str, str], bool] = {}
+        self.root_base_child_sha: str | None = CHILD_BASE_SHA
 
     def _repo_key(self, repo_path: Path) -> Path:
         return repo_path.resolve(strict=False)
@@ -102,8 +105,16 @@ class FakePublishOps:
             return FakeGitResult(args, returncode=1)
         if args == ["ls-tree", ROOT_SHA, "--", "sub"]:
             return FakeGitResult(args, stdout=f"160000 commit {CHILD_SHA}\tsub\n")
+        if args == ["ls-tree", ROOT_BASE_SHA, "--", "sub"]:
+            if self.root_base_child_sha:
+                return FakeGitResult(args, stdout=f"160000 commit {self.root_base_child_sha}\tsub\n")
+            return FakeGitResult(args, returncode=1)
         if args[:2] == ["rev-parse", "--verify"]:
             commitish = args[2]
+            if repo == self.root and commitish == f"{ROOT_SHA}^1^{{commit}}":
+                return FakeGitResult(args, stdout=f"{ROOT_BASE_SHA}\n")
+            if repo == self.submodule and commitish == f"{CHILD_SHA}^1^{{commit}}":
+                return FakeGitResult(args, stdout=f"{CHILD_BASE_SHA}\n")
             if commitish.startswith("refs/heads/"):
                 branch = commitish.removeprefix("refs/heads/").removesuffix("^{commit}")
                 sha = self.branches[repo].get(branch)
@@ -112,6 +123,7 @@ class FakePublishOps:
                 return FakeGitResult(args, stderr="unknown revision", returncode=1)
             if commitish == "FETCH_HEAD":
                 return FakeGitResult(args, stdout=f"{self.remote_heads[repo] or ''}\n")
+            return FakeGitResult(args, stderr="unknown revision", returncode=1)
         if args == ["rev-parse", "FETCH_HEAD"]:
             return FakeGitResult(args, stdout=f"{self.remote_heads[repo] or ''}\n")
         if args[:1] == ["branch"]:
@@ -177,6 +189,31 @@ class ManualPublishWorkflowTests(unittest.TestCase):
             self.assertEqual([repo for repo, _args in pushes], [submodule.resolve(), root.resolve()])
             self.assertEqual(pushes[0][1][-1], f"{CHILD_SHA}:refs/heads/publish-target")
             self.assertEqual(pushes[1][1][-1], f"{ROOT_SHA}:refs/heads/publish-target")
+
+    def test_publish_skips_submodule_when_gitlink_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, submodule, ops = self.make_ops(temp_dir)
+            ops.root_base_child_sha = CHILD_SHA
+
+            with redirect_stdout(StringIO()):
+                result = run_publish_workflow(
+                    root,
+                    remote="origin",
+                    push_target="publish-target",
+                    check_only=False,
+                    sync_local_branches=True,
+                    allow_suffix_branch=True,
+                    ops=ops,  # type: ignore[arg-type]
+                )
+
+            self.assertTrue(result.success)
+            self.assertEqual([item.repo_path for item in result.items], [root.resolve()])
+            call_args = [(repo, args) for repo, args, _kwargs in ops.calls]
+            self.assertNotIn((submodule.resolve(), ("branch", "publish-target", CHILD_SHA)), call_args)
+            self.assertFalse(
+                any(repo == submodule.resolve() and args[:1] == ("push",) for repo, args in call_args)
+            )
+            self.assertIn((root.resolve(), ("branch", "publish-target", ROOT_SHA)), call_args)
 
     def test_publish_check_only_does_not_create_branches_or_push(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

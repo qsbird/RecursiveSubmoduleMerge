@@ -153,6 +153,20 @@ def resolve_patch_path(report: dict[str, Any], owner: dict[str, Any] | None, rep
     )
 
 
+def resolve_expanded_patch_path(
+    report: dict[str, Any],
+    owner: dict[str, Any] | None,
+    report_dir: Path | None = None,
+) -> Path | None:
+    return resolve_artifact_path(
+        report,
+        owner,
+        report_dir,
+        path_keys=("expanded_patch_path",),
+        relative_keys=("expanded_patch_relative_path",),
+    )
+
+
 def resolve_content_artifact_path(
     report: dict[str, Any],
     record: dict[str, Any] | None,

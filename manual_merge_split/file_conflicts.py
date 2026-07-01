@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +22,14 @@ CONFLICT_TOOL_CONFIRMATION_MESSAGE = "Manual confirmation required after conflic
 CONFLICT_TOOL_CONFIRMATION_PROMPT = (
     "Press Enter to continue, type r to reopen the conflict tool, or type s to stop and report branch failure: "
 )
+VSCODE_COMMAND_NAMES = {"code", "code.cmd", "code.exe"}
+
+
+@dataclass(frozen=True)
+class ConflictToolCommand:
+    command: str
+    message: str | None = None
+    error: str | None = None
 
 
 def render_conflict_tool_command(repo_path: Path, relative_path: str, command_template: str) -> str:
@@ -27,6 +37,83 @@ def render_conflict_tool_command(repo_path: Path, relative_path: str, command_te
         file=str((repo_path / relative_path).resolve()),
         repo=str(repo_path.resolve()),
         relative=relative_path,
+    )
+
+
+def split_shell_command_token(command: str) -> tuple[str, str, str] | None:
+    stripped = command.lstrip()
+    if not stripped:
+        return None
+    leading = command[: len(command) - len(stripped)]
+    quote = stripped[0] if stripped[0] in {'"', "'"} else ""
+    if quote:
+        end_index = stripped.find(quote, 1)
+        if end_index == -1:
+            return leading, stripped[1:], ""
+        return leading, stripped[1:end_index], stripped[end_index + 1 :]
+
+    for index, char in enumerate(stripped):
+        if char.isspace():
+            return leading, stripped[:index], stripped[index:]
+    return leading, stripped, ""
+
+
+def vscode_command_candidates(env: dict[str, str] | None = None) -> list[Path]:
+    env = env or os.environ
+    candidates: list[Path] = []
+    if os.name != "nt":
+        return candidates
+
+    candidate_roots = [
+        Path(env_value) / "Programs" / "Microsoft VS Code"
+        for env_value in [env.get("LOCALAPPDATA", "")]
+        if env_value
+    ]
+    candidate_roots.extend(
+        Path(env_value) / "Microsoft VS Code"
+        for env_value in [env.get("ProgramFiles", ""), env.get("ProgramFiles(x86)", "")]
+        if env_value
+    )
+
+    for root in candidate_roots:
+        candidates.append(root / "bin" / "code.cmd")
+        candidates.append(root / "Code.exe")
+    candidates.append(Path("D:/vscode/bin/code.cmd"))
+    return candidates
+
+
+def prepare_conflict_tool_command(command: str) -> ConflictToolCommand:
+    token_parts = split_shell_command_token(command)
+    if token_parts is None:
+        return ConflictToolCommand(command=command)
+
+    leading, executable, rest = token_parts
+    executable_name = Path(executable).name.lower()
+    if executable_name not in VSCODE_COMMAND_NAMES or Path(executable).parent != Path("."):
+        return ConflictToolCommand(command=command)
+
+    if shutil.which(executable) is not None:
+        return ConflictToolCommand(command=command)
+
+    for candidate in vscode_command_candidates():
+        if candidate.exists():
+            quoted_candidate = subprocess.list2cmdline([str(candidate)])
+            resolved_command = f"{leading}{quoted_candidate}{rest}"
+            return ConflictToolCommand(
+                command=resolved_command,
+                message=(
+                    "VS Code command 'code' was not found in PATH; using detected VS Code command: "
+                    f"{candidate}"
+                ),
+            )
+
+    return ConflictToolCommand(
+        command=command,
+        error=(
+            "VS Code command 'code' was not found in PATH, so the conflict tool could not be opened. "
+            "Install the VS Code shell command, add VS Code to PATH, or set Conflict tool command to a full path "
+            'such as "C:\\Users\\<user>\\AppData\\Local\\Programs\\Microsoft VS Code\\bin\\code.cmd" --wait "{file}".'
+        ),
     )
 
 
@@ -133,6 +220,13 @@ def resolve_single_file_conflict(
             relative_path,
             context.conflict_tool_command,
         )
+        prepared_command = prepare_conflict_tool_command(command)
+        if prepared_command.error is not None:
+            emit_line(output_func, prepared_command.error)
+            return FileConflictResolution(reason=prepared_command.error)
+        if prepared_command.message is not None:
+            emit_line(output_func, prepared_command.message)
+        command = prepared_command.command
         try:
             process = popen_factory(command, cwd=repo_path, shell=True, **hidden_subprocess_kwargs())
         except OSError as exc:

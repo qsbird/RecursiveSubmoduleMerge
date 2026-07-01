@@ -23,6 +23,7 @@ from .review_common import (
     read_text,
     render_original_repository_diff,
     report_dir_from_report,
+    resolve_expanded_patch_path,
     resolve_patch_path,
     safe_get,
     short_sha,
@@ -33,6 +34,7 @@ from .review_common import (
 
 
 DEFAULT_DIFF_CONTEXT_LINES = 3
+DEFAULT_EXPANDED_DIFF_CONTEXT_LINES = 20
 
 
 CSS = """
@@ -60,6 +62,7 @@ CSS = """
   --hunk-text: #1d4ed8;
   --meta-bg: #f1f5f9;
   --focus: #f97316;
+  --sidebar-width: 340px;
 }
 * { box-sizing: border-box; }
 body {
@@ -75,7 +78,29 @@ header {
   color: #fff;
 }
 header h1 { margin: 0 0 8px; font-size: 24px; letter-spacing: 0; }
-header code { color: #e6f0ff; }
+header .report-line { margin: 2px 0 4px; }
+header .report-link {
+  display: inline-block;
+  max-width: min(100%, 980px);
+  padding: 2px 6px;
+  color: #1d4ed8;
+  background: #f8fafc;
+  border: 1px solid #93c5fd;
+  border-radius: 5px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 13px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  text-decoration: none;
+  vertical-align: middle;
+}
+header .report-link:hover, header .report-link:focus {
+  background: #eff6ff;
+  border-color: #60a5fa;
+  text-decoration: underline;
+  outline: none;
+}
+header .muted { color: #cbd5e1; }
 main { padding: 18px 28px 40px; }
 a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
 code, pre { font-family: Consolas, "Cascadia Mono", monospace; }
@@ -90,6 +115,19 @@ code {
   border-radius: 8px;
 }
 .panel { padding: 14px; margin: 14px 0; }
+.command-panel { padding: 0; }
+.command-panel > summary {
+  cursor: pointer;
+  padding: 14px;
+  font-size: 20px;
+  font-weight: 700;
+}
+.command-panel > summary .muted {
+  margin-left: 8px;
+  font-size: 13px;
+  font-weight: 400;
+}
+.command-panel-body { padding: 0 14px 14px; }
 .panel h2, .repo-header h2 { letter-spacing: 0; }
 .review-bar {
   position: sticky;
@@ -150,16 +188,40 @@ code {
 .metric strong { display: block; font-size: 22px; margin-top: 4px; }
 .layout {
   display: grid;
-  grid-template-columns: minmax(250px, 340px) minmax(0, 1fr);
-  gap: 16px;
+  grid-template-columns: minmax(260px, var(--sidebar-width)) 8px minmax(0, 1fr);
+  column-gap: 12px;
   align-items: start;
 }
+.review-content { min-width: 0; }
 .sidebar {
   position: sticky;
   top: 58px;
   max-height: calc(100vh - 68px);
   overflow: auto;
 }
+.sidebar-resizer {
+  position: sticky;
+  top: 58px;
+  height: calc(100vh - 68px);
+  border-radius: 999px;
+  cursor: col-resize;
+  background: transparent;
+}
+.sidebar-resizer::before {
+  content: "";
+  display: block;
+  width: 3px;
+  height: 100%;
+  margin: 0 auto;
+  border-radius: 999px;
+  background: transparent;
+}
+.sidebar-resizer:hover::before,
+.sidebar-resizer:focus::before,
+body.sidebar-resizing .sidebar-resizer::before {
+  background: var(--border-strong);
+}
+.sidebar-resizer:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
 .nav-list { display: grid; gap: 8px; }
 .nav-link {
   display: grid;
@@ -172,10 +234,31 @@ code {
   background: #fff;
 }
 .nav-link:hover, .nav-link:focus { border-color: var(--accent); outline: none; }
+.nav-link strong { overflow-wrap: anywhere; word-break: break-word; }
 .nav-link span { color: var(--muted); font-size: 12px; }
 .nav-file {
   margin-left: 12px;
   border-left: 3px solid var(--accent-soft);
+}
+.nav-gitlink {
+  border-left-color: var(--warn);
+  background: #fffaf0;
+}
+.nav-group {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
+.nav-group > summary {
+  cursor: pointer;
+  padding: 9px 10px;
+  font-weight: 700;
+}
+.nav-group-body {
+  display: grid;
+  gap: 8px;
+  padding: 0 8px 8px;
 }
 .toolbar {
   display: flex;
@@ -226,13 +309,35 @@ pre {
   border: 1px solid var(--border);
   border-radius: 6px;
 }
-.file-view, .conflict-card, .command-card { margin: 12px 0; overflow: hidden; }
-.file-view summary, .conflict-card summary, .command-card summary {
+.file-view, .gitlink-section, .patch-file, .conflict-card, .command-card { margin: 12px 0; overflow: hidden; }
+.file-view summary, .gitlink-section summary, .conflict-card summary, .command-card summary {
   cursor: pointer;
   padding: 10px 12px;
   font-weight: 600;
   background: var(--surface-soft);
   border-bottom: 1px solid var(--border);
+}
+.patch-file, .gitlink-section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.patch-file-header {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  background: var(--surface-soft);
+  border-bottom: 1px solid var(--border);
+}
+.patch-file-title {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-weight: 600;
+}
+.patch-file-meta {
+  color: var(--muted);
+  font-size: 12px;
 }
 .file-columns {
   display: grid;
@@ -288,6 +393,15 @@ pre {
 .rd-diff-toolbar .segmented button[aria-pressed="true"] {
   background: #1f6feb;
   color: #fff;
+}
+.rd-context-switcher {
+  display: grid;
+  gap: 8px;
+}
+.rd-context-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 8px 8px 0;
 }
 .rd-diff-workbench[data-view="unified"] .rd-parallel-view { display: none; }
 .rd-diff-workbench[data-view="split"] .rd-inline-view { display: none; }
@@ -430,6 +544,7 @@ pre {
   .review-bar { margin-left: -16px; margin-right: -16px; align-items: flex-start; flex-direction: column; }
   .layout, .details-grid, .file-columns, .conflict-columns { grid-template-columns: 1fr; }
   .sidebar { position: static; max-height: none; }
+  .sidebar-resizer { display: none; }
   .repo-header { flex-direction: column; }
   .repo-meta { text-align: left; }
   .toolbar input { min-width: 100%; }
@@ -446,7 +561,94 @@ SCRIPT = """
     });
   }
 
+  function setPatchContext(switcher, context) {
+    switcher.setAttribute('data-context', context);
+    switcher.querySelectorAll('.js-context-toggle').forEach(function (button) {
+      button.setAttribute('aria-pressed', String(button.getAttribute('data-context') === context));
+    });
+    switcher.querySelectorAll('[data-context-panel]').forEach(function (panel) {
+      panel.classList.toggle('hidden', panel.getAttribute('data-context-panel') !== context);
+    });
+  }
+
+  function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+  }
+
+  function setupSidebarResize() {
+    const layout = document.querySelector('.layout');
+    const resizer = document.querySelector('.sidebar-resizer');
+    if (!layout || !resizer) {
+      return;
+    }
+    const storageKey = 'ci-review-sidebar-width';
+    const minWidth = 260;
+    function maxWidth() {
+      return Math.max(minWidth, Math.min(620, Math.floor(window.innerWidth * 0.55)));
+    }
+    function setWidth(value, persist) {
+      const width = clamp(Math.round(value), minWidth, maxWidth());
+      document.documentElement.style.setProperty('--sidebar-width', width + 'px');
+      resizer.setAttribute('aria-valuemin', String(minWidth));
+      resizer.setAttribute('aria-valuemax', String(maxWidth()));
+      resizer.setAttribute('aria-valuenow', String(width));
+      if (persist) {
+        try {
+          window.localStorage.setItem(storageKey, String(width));
+        } catch (_error) {
+          // Ignore storage failures in offline HTML contexts.
+        }
+      }
+    }
+    try {
+      const saved = Number(window.localStorage.getItem(storageKey));
+      if (Number.isFinite(saved) && saved > 0) {
+        setWidth(saved, false);
+      } else {
+        setWidth(340, false);
+      }
+    } catch (_error) {
+      setWidth(340, false);
+    }
+    window.addEventListener('resize', function () {
+      const current = Number(resizer.getAttribute('aria-valuenow')) || 340;
+      setWidth(current, false);
+    });
+    resizer.addEventListener('pointerdown', function (event) {
+      if (window.innerWidth <= 900) {
+        return;
+      }
+      event.preventDefault();
+      resizer.setPointerCapture(event.pointerId);
+      document.body.classList.add('sidebar-resizing');
+      function onMove(moveEvent) {
+        const bounds = layout.getBoundingClientRect();
+        setWidth(moveEvent.clientX - bounds.left, true);
+      }
+      function onUp(upEvent) {
+        document.body.classList.remove('sidebar-resizing');
+        resizer.releasePointerCapture(upEvent.pointerId);
+        resizer.removeEventListener('pointermove', onMove);
+        resizer.removeEventListener('pointerup', onUp);
+        resizer.removeEventListener('pointercancel', onUp);
+      }
+      resizer.addEventListener('pointermove', onMove);
+      resizer.addEventListener('pointerup', onUp);
+      resizer.addEventListener('pointercancel', onUp);
+    });
+    resizer.addEventListener('keydown', function (event) {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') {
+        return;
+      }
+      event.preventDefault();
+      const current = Number(resizer.getAttribute('aria-valuenow')) || 340;
+      setWidth(current + (event.key === 'ArrowRight' ? 24 : -24), true);
+    });
+  }
+
   document.addEventListener('DOMContentLoaded', function () {
+    setupSidebarResize();
+
     const filter = document.getElementById('file-filter');
     if (filter) {
       filter.addEventListener('input', function () {
@@ -461,11 +663,22 @@ SCRIPT = """
     document.querySelectorAll('.rd-diff-workbench').forEach(function (workbench) {
       setDiffView(workbench, workbench.getAttribute('data-view') || 'unified');
     });
+    document.querySelectorAll('.rd-context-switcher').forEach(function (switcher) {
+      setPatchContext(switcher, switcher.getAttribute('data-context') || 'compact');
+    });
     document.querySelectorAll('.js-view-toggle').forEach(function (button) {
       button.addEventListener('click', function () {
         const workbench = button.closest('.rd-diff-workbench');
         if (workbench) {
           setDiffView(workbench, button.getAttribute('data-view') || 'unified');
+        }
+      });
+    });
+    document.querySelectorAll('.js-context-toggle').forEach(function (button) {
+      button.addEventListener('click', function () {
+        const switcher = button.closest('.rd-context-switcher');
+        if (switcher) {
+          setPatchContext(switcher, button.getAttribute('data-context') || 'compact');
         }
       });
     });
@@ -482,7 +695,7 @@ SCRIPT = """
     document.querySelectorAll('[data-details-action]').forEach(function (button) {
       button.addEventListener('click', function () {
         const open = button.getAttribute('data-details-action') === 'expand';
-        document.querySelectorAll('details.file-view, details.conflict-card, details.command-card').forEach(function (details) {
+        document.querySelectorAll('details.nav-group, details.file-view, details.gitlink-section, details.conflict-card, details.command-panel, details.command-card').forEach(function (details) {
           details.open = open;
         });
       });
@@ -492,6 +705,10 @@ SCRIPT = """
       link.addEventListener('click', function () {
         const id = link.getAttribute('href').slice(1);
         const target = document.getElementById(id);
+        const parentDetails = target ? target.closest('details') : null;
+        if (parentDetails) {
+          parentDetails.open = true;
+        }
         if (target && target.tagName === 'DETAILS') {
           target.open = true;
         }
@@ -531,6 +748,21 @@ def changed_file_path(changed_file: dict[str, Any], fallback: str) -> str:
     return str(changed_file.get("path") or changed_file.get("old_path") or fallback)
 
 
+def path_leaf(value: Any) -> str:
+    text = str(value or "").rstrip("/\\")
+    if not text:
+        return ""
+    return re.split(r"[\\/]+", text)[-1]
+
+
+def repository_display_name(repo: dict[str, Any]) -> str:
+    report_path = str(repo.get("path") or "")
+    if report_path and report_path != ".":
+        return report_path
+    repo_name = path_leaf(repo.get("repo_path"))
+    return f"{repo_name} (root)" if repo_name else "root repository"
+
+
 def patch_line_class(line: str) -> str:
     if line == "" or line.startswith("\\ No newline"):
         return "note"
@@ -546,6 +778,110 @@ def patch_line_class(line: str) -> str:
 
 
 PATCH_HUNK_RE = re.compile(r"@@ -(?P<old>\d+)(?:,\d+)? \+(?P<new>\d+)(?:,\d+)? @@")
+GITLINK_PATCH_RE = re.compile(
+    r"(?m)^(?:index [0-9a-f]+\.\.[0-9a-f]+ 160000|[-+]Subproject commit [0-9a-f]+)"
+)
+
+
+def is_gitlink_patch_text(text: str | None) -> bool:
+    return bool(GITLINK_PATCH_RE.search(text or ""))
+
+
+def is_gitlink_changed_file(changed_file: dict[str, Any], patch_view: dict[str, Any] | None = None) -> bool:
+    kind = str(changed_file.get("kind") or changed_file.get("type") or "").lower()
+    if kind in {"gitlink", "gitlink_update", "submodule", "submodule_pointer"}:
+        return True
+    if "160000" in {
+        str(changed_file.get("mode") or ""),
+        str(changed_file.get("old_mode") or ""),
+        str(changed_file.get("new_mode") or ""),
+    }:
+        return True
+    if patch_view and is_gitlink_patch_text(str(patch_view.get("patch_text") or "")):
+        return True
+    return False
+
+
+def collect_gitlink_file_indices(
+    repo: dict[str, Any],
+    file_patch_views: list[dict[str, Any]],
+) -> list[int]:
+    patch_views = {view.get("index"): view for view in file_patch_views}
+    indices: list[int] = []
+    for index, changed_file in enumerate(repo.get("changed_files") or [], start=1):
+        if is_gitlink_changed_file(changed_file, patch_views.get(index)):
+            indices.append(index)
+    return indices
+
+
+def gitlink_index_set(repo: dict[str, Any]) -> set[int]:
+    return {int(index) for index in repo.get("gitlink_file_indices") or []}
+
+
+def gitlink_count(repo: dict[str, Any]) -> int:
+    return len(gitlink_index_set(repo))
+
+
+def review_path_key(value: Any) -> str:
+    text = str(value or "").replace("\\", "/").strip()
+    while text.startswith("./"):
+        text = text[2:]
+    return text.rstrip("/")
+
+
+def review_repo_key(value: Any) -> str:
+    return review_path_key(value).casefold()
+
+
+def rendered_gitlink_conflict_keys(repositories: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    keys: set[tuple[str, str]] = set()
+    for repo in repositories:
+        repo_keys = {
+            review_repo_key(repo.get("repo_path")),
+            review_repo_key(repo.get("path")),
+        }
+        repo_keys.discard("")
+        changed_files = repo.get("changed_files") or []
+        for index in gitlink_index_set(repo):
+            if index < 1 or index > len(changed_files):
+                continue
+            path = review_path_key(changed_file_path(changed_files[index - 1], f"file-{index}"))
+            if not path:
+                continue
+            for repo_key in repo_keys:
+                keys.add((repo_key, path))
+    return keys
+
+
+def is_gitlink_conflict_record(conflict: dict[str, Any]) -> bool:
+    conflict_type = str(conflict.get("type") or conflict.get("kind") or "").lower()
+    return conflict_type in {"gitlink_conflict", "gitlink"}
+
+
+def is_rendered_gitlink_conflict(
+    conflict_view: dict[str, Any],
+    gitlink_keys: set[tuple[str, str]],
+) -> bool:
+    conflict = conflict_view.get("conflict") or {}
+    if not is_gitlink_conflict_record(conflict):
+        return False
+    repo_key = review_repo_key(conflict.get("repo_path"))
+    path = review_path_key(conflict.get("path"))
+    return bool(repo_key and path and (repo_key, path) in gitlink_keys)
+
+
+def filter_rendered_gitlink_conflicts(
+    conflicts: list[dict[str, Any]],
+    repositories: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    gitlink_keys = rendered_gitlink_conflict_keys(repositories)
+    if not gitlink_keys:
+        return conflicts
+    return [
+        conflict
+        for conflict in conflicts
+        if not is_rendered_gitlink_conflict(conflict, gitlink_keys)
+    ]
 
 
 def html_token(value: str | None) -> str:
@@ -761,10 +1097,28 @@ def render_patch_split(rows: list[dict[str, Any]]) -> str:
     )
 
 
-def render_patch_block(text: str, empty_text: str = "No patch content is available.") -> str:
+def patch_context_label(context_lines: Any, fallback: str) -> str:
+    if context_lines is None or context_lines == "":
+        return fallback
+    try:
+        lines = int(context_lines)
+    except (TypeError, ValueError):
+        return fallback
+    return f"{lines} lines"
+
+
+def render_single_patch_block(
+    text: str,
+    *,
+    empty_text: str = "No patch content is available.",
+    context_label: str | None = None,
+) -> str:
     if not text:
         return f'<div class="warning">{esc(empty_text)}</div>'
     rows = parse_patch_rows(text)
+    meta = f"{len(rows)} patch lines"
+    if context_label:
+        meta = f"{meta} - {context_label}"
     return (
         f'<div class="rd-diff-file rd-diff-workbench" data-view="unified" data-line-count="{len(rows)}">'
         '<div class="rd-diff-toolbar">'
@@ -772,10 +1126,40 @@ def render_patch_block(text: str, empty_text: str = "No patch content is availab
         '<button type="button" class="js-view-toggle" data-view="unified">Unified</button>'
         '<button type="button" class="js-view-toggle" data-view="split">Split</button>'
         "</div>"
-        f'<span class="rd-diff-meta">{len(rows)} patch lines</span>'
+        f'<span class="rd-diff-meta">{esc(meta)}</span>'
         "</div>"
         f"{render_patch_unified(rows)}"
         f"{render_patch_split(rows)}"
+        "</div>"
+    )
+
+
+def render_patch_block(
+    text: str,
+    empty_text: str = "No patch content is available.",
+    *,
+    expanded_text: str | None = None,
+    context_lines: Any = None,
+    expanded_context_lines: Any = None,
+) -> str:
+    compact_label = patch_context_label(context_lines, "compact")
+    expanded_label = patch_context_label(expanded_context_lines, "expanded")
+    if not expanded_text or expanded_text == text:
+        return render_single_patch_block(text, empty_text=empty_text, context_label=compact_label)
+    return (
+        '<div class="rd-context-switcher" data-context="compact">'
+        '<div class="rd-context-toolbar">'
+        '<div class="segmented" role="group" aria-label="Diff context">'
+        f'<button type="button" class="js-context-toggle" data-context="compact">{esc(compact_label)}</button>'
+        f'<button type="button" class="js-context-toggle" data-context="expanded">{esc(expanded_label)}</button>'
+        "</div>"
+        "</div>"
+        '<div data-context-panel="compact">'
+        f'{render_single_patch_block(text, empty_text=empty_text, context_label=compact_label)}'
+        "</div>"
+        '<div data-context-panel="expanded" class="hidden">'
+        f'{render_single_patch_block(expanded_text, empty_text=empty_text, context_label=expanded_label)}'
+        "</div>"
         "</div>"
     )
 
@@ -796,6 +1180,39 @@ def read_text_if_available(path: Path | None) -> str | None:
     if not path:
         return None
     return read_text(path)
+
+
+def context_lines_value(report: dict[str, Any], owner: dict[str, Any], owner_key: str, input_key: str, default: int) -> int:
+    value = owner.get(owner_key)
+    if value is None:
+        value = safe_get(report, "input", input_key)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def collect_expanded_patch_text(
+    report: dict[str, Any],
+    repo: dict[str, Any],
+    owner: dict[str, Any],
+    report_dir: Path,
+    expanded_diff_context_lines: int,
+    *,
+    file_path: str | None = None,
+) -> tuple[str | None, str | None]:
+    expanded_patch_path = resolve_expanded_patch_path(report, owner, report_dir)
+    expanded_patch_text = read_text_if_available(expanded_patch_path)
+    if expanded_patch_text is not None:
+        return expanded_patch_text, str(expanded_patch_path)
+    original_available, original_diff = render_original_repository_diff(
+        repo,
+        expanded_diff_context_lines,
+        file_path=file_path,
+    )
+    if original_available:
+        return original_diff, "original repository"
+    return None, None
 
 
 def read_changed_file_side(
@@ -849,36 +1266,153 @@ def collect_full_file_views(report: dict[str, Any], repo: dict[str, Any], report
     return views
 
 
+def collect_file_patch_views(
+    report: dict[str, Any],
+    repo: dict[str, Any],
+    report_dir: Path,
+    expanded_diff_context_lines: int,
+) -> list[dict[str, Any]]:
+    views: list[dict[str, Any]] = []
+    for index, changed_file in enumerate(repo.get("changed_files") or [], start=1):
+        patch_path = resolve_patch_path(report, changed_file, report_dir)
+        patch_text = read_text_if_available(patch_path)
+        if patch_text is None:
+            continue
+        path = changed_file_path(changed_file, f"file-{index}")
+        expanded_patch_text, expanded_patch_source = collect_expanded_patch_text(
+            report,
+            repo,
+            changed_file,
+            report_dir,
+            expanded_diff_context_lines,
+            file_path=path,
+        )
+        views.append(
+            {
+                "index": index,
+                "path": path,
+                "status": str(changed_file.get("status") or ""),
+                "old_path": changed_file.get("old_path"),
+                "patch_text": patch_text,
+                "expanded_patch_text": expanded_patch_text,
+                "patch_path": str(patch_path) if patch_path else None,
+                "patch_relative_path": changed_file.get("patch_relative_path"),
+                "expanded_patch_source": expanded_patch_source,
+                "expanded_patch_path": changed_file.get("expanded_patch_path"),
+                "expanded_patch_relative_path": changed_file.get("expanded_patch_relative_path"),
+                "context_lines": context_lines_value(
+                    report,
+                    changed_file,
+                    "patch_context_lines",
+                    "diff_context_lines",
+                    DEFAULT_DIFF_CONTEXT_LINES,
+                ),
+                "expanded_context_lines": context_lines_value(
+                    report,
+                    changed_file,
+                    "expanded_patch_context_lines",
+                    "expanded_diff_context_lines",
+                    expanded_diff_context_lines,
+                ),
+                "line_count": line_count(patch_text),
+                "size_bytes": text_size_bytes(patch_text),
+                "expanded_line_count": line_count(expanded_patch_text),
+                "expanded_size_bytes": text_size_bytes(expanded_patch_text),
+            }
+        )
+    return views
+
+
 def collect_repository_patch(
     report: dict[str, Any],
     repo: dict[str, Any],
     report_dir: Path,
     diff_context_lines: int,
-) -> tuple[str, str, str | None, list[str]]:
+    expanded_diff_context_lines: int,
+) -> tuple[str, str | None, str, str | None, str | None, list[str], int, int]:
     warnings: list[str] = []
     patch_path = resolve_patch_path(report, repo, report_dir)
     patch_text = read_text_if_available(patch_path)
     if patch_text is not None:
-        return patch_text, "artifact", str(patch_path), warnings
+        expanded_patch_text, expanded_patch_source = collect_expanded_patch_text(
+            report,
+            repo,
+            repo,
+            report_dir,
+            expanded_diff_context_lines,
+        )
+        return (
+            patch_text,
+            expanded_patch_text,
+            "artifact",
+            str(patch_path),
+            expanded_patch_source,
+            warnings,
+            context_lines_value(report, repo, "patch_context_lines", "diff_context_lines", diff_context_lines),
+            context_lines_value(
+                report,
+                repo,
+                "expanded_patch_context_lines",
+                "expanded_diff_context_lines",
+                expanded_diff_context_lines,
+            ),
+        )
 
     file_patches: list[str] = []
+    expanded_file_patches: list[str] = []
     for changed_file in repo.get("changed_files") or []:
         file_patch_path = resolve_patch_path(report, changed_file, report_dir)
         file_patch_text = read_text_if_available(file_patch_path)
         if file_patch_text is not None:
             file_patches.append(file_patch_text)
+        path = changed_file_path(changed_file, "")
+        expanded_file_patch_text, _expanded_file_patch_source = collect_expanded_patch_text(
+            report,
+            repo,
+            changed_file,
+            report_dir,
+            expanded_diff_context_lines,
+            file_path=path or None,
+        )
+        if expanded_file_patch_text is not None:
+            expanded_file_patches.append(expanded_file_patch_text)
     if file_patches:
-        return "\n".join(file_patches), "file artifacts", None, warnings
+        return (
+            "\n".join(file_patches),
+            "\n".join(expanded_file_patches) if expanded_file_patches else None,
+            "file artifacts",
+            None,
+            "file artifacts" if expanded_file_patches else None,
+            warnings,
+            context_lines_value(report, repo, "patch_context_lines", "diff_context_lines", diff_context_lines),
+            context_lines_value(
+                report,
+                repo,
+                "expanded_patch_context_lines",
+                "expanded_diff_context_lines",
+                expanded_diff_context_lines,
+            ),
+        )
 
     original_available, original_diff = render_original_repository_diff(repo, diff_context_lines)
     if original_available:
-        return original_diff, "original repository", None, warnings
+        expanded_available, expanded_diff = render_original_repository_diff(repo, expanded_diff_context_lines)
+        return (
+            original_diff,
+            expanded_diff if expanded_available else None,
+            "original repository",
+            None,
+            "original repository" if expanded_available else None,
+            warnings,
+            diff_context_lines,
+            expanded_diff_context_lines,
+        )
 
     warnings.append(
         f"No patch artifact or original repository diff found for {repo.get('path') or repo.get('repo_path')}. "
         f"Original attempt: {original_diff}"
     )
-    return "", "missing", None, warnings
+    return "", None, "missing", None, None, warnings, diff_context_lines, expanded_diff_context_lines
 
 
 def find_stage(conflict: dict[str, Any], stage_number: str) -> dict[str, str] | None:
@@ -950,22 +1484,59 @@ def collect_review_model(
     report_path: Path,
     *,
     diff_context_lines: int = DEFAULT_DIFF_CONTEXT_LINES,
+    expanded_diff_context_lines: int = DEFAULT_EXPANDED_DIFF_CONTEXT_LINES,
 ) -> dict[str, Any]:
     report_dir = report_dir_from_report(report, report_path)
     repositories: list[dict[str, Any]] = []
     warnings: list[str] = []
     for index, repo in enumerate(report.get("repositories") or [], start=1):
-        patch_text, patch_source, patch_path, patch_warnings = collect_repository_patch(
-            report,
-            repo,
-            report_dir,
-            diff_context_lines,
-        )
+        file_patch_views = collect_file_patch_views(report, repo, report_dir, expanded_diff_context_lines)
+        gitlink_file_indices = collect_gitlink_file_indices(repo, file_patch_views)
+        if file_patch_views:
+            repository_patch_path = resolve_patch_path(report, repo, report_dir)
+            patch_text = ""
+            expanded_patch_text = None
+            patch_source = "file artifacts"
+            patch_path = str(repository_patch_path) if repository_patch_path else None
+            expanded_patch_path = None
+            patch_warnings = []
+            patch_context_lines = context_lines_value(
+                report,
+                repo,
+                "patch_context_lines",
+                "diff_context_lines",
+                diff_context_lines,
+            )
+            expanded_patch_context_lines = context_lines_value(
+                report,
+                repo,
+                "expanded_patch_context_lines",
+                "expanded_diff_context_lines",
+                expanded_diff_context_lines,
+            )
+        else:
+            (
+                patch_text,
+                expanded_patch_text,
+                patch_source,
+                patch_path,
+                expanded_patch_path,
+                patch_warnings,
+                patch_context_lines,
+                expanded_patch_context_lines,
+            ) = collect_repository_patch(
+                report,
+                repo,
+                report_dir,
+                diff_context_lines,
+                expanded_diff_context_lines,
+            )
         warnings.extend(patch_warnings)
         repositories.append(
             {
                 "index": index,
                 "path": repo.get("path") or repo.get("repo_path") or f"repo-{index}",
+                "display_name": repository_display_name(repo),
                 "repo_path": repo.get("repo_path"),
                 "strategy": repo.get("strategy"),
                 "base": repo.get("base"),
@@ -976,17 +1547,25 @@ def collect_review_model(
                 "commits": repo.get("commits") or [],
                 "diff_stat": repo.get("diff_stat") or "",
                 "patch_text": patch_text,
+                "expanded_patch_text": expanded_patch_text,
                 "patch_source": patch_source,
                 "patch_path": patch_path,
+                "expanded_patch_path": expanded_patch_path,
+                "context_lines": patch_context_lines,
+                "expanded_context_lines": expanded_patch_context_lines,
+                "file_patch_views": file_patch_views,
                 "full_file_views": collect_full_file_views(report, repo, report_dir),
+                "gitlink_file_indices": gitlink_file_indices,
             }
         )
+    conflicts = collect_conflict_views(report, report_dir)
+    visible_conflicts = filter_rendered_gitlink_conflicts(conflicts, repositories)
     return {
         "report": report,
         "report_path": report_path,
         "report_dir": report_dir,
         "repositories": repositories,
-        "conflicts": collect_conflict_views(report, report_dir),
+        "conflicts": visible_conflicts,
         "warnings": warnings,
         "risks": build_risk_items(report),
     }
@@ -1018,25 +1597,55 @@ def render_risks(risks: list[dict[str, str]]) -> str:
 
 def render_repo_nav(repositories: list[dict[str, Any]], conflicts: list[dict[str, Any]]) -> str:
     rows: list[str] = []
+    gitlink_rows: list[str] = []
+    gitlink_keys: list[str] = []
     for repo in repositories:
-        key = f"repo {repo.get('path')} {repo.get('strategy')}".lower()
+        repo_gitlinks = gitlink_index_set(repo)
+        code_file_count = len(repo.get("changed_files") or []) - len(repo_gitlinks)
+        gitlink_summary = f" - {len(repo_gitlinks)} submodule pointers" if repo_gitlinks else ""
+        key = f"repo {repo.get('path')} {repo.get('display_name')} {repo.get('strategy')}".lower()
         rows.append(
             f'<a class="nav-link" data-filter-key="{esc(key)}" href="#repo-{repo["index"]}">'
-            f'<strong>{esc(repo.get("path"))}</strong>'
-            f'<span>{esc(repo.get("strategy"))} - {len(repo.get("changed_files") or [])} files - {esc(short_sha(repo.get("result")))}</span>'
+            f'<strong>{esc(repo.get("display_name") or repo.get("path"))}</strong>'
+            f'<span>{esc(repo.get("strategy"))} - {code_file_count} files{esc(gitlink_summary)} - {esc(short_sha(repo.get("result")))}</span>'
             "</a>"
         )
-        for view in repo.get("full_file_views") or []:
+        patch_views = {view.get("index"): view for view in repo.get("file_patch_views") or []}
+        full_file_views = {view.get("index"): view for view in repo.get("full_file_views") or []}
+        for index, changed_file in enumerate(repo.get("changed_files") or [], start=1):
+            path = changed_file_path(changed_file, f"file-{index}")
+            status = str(changed_file.get("status") or "")
+            patch_view = patch_views.get(index)
+            full_file_view = full_file_views.get(index)
+            is_gitlink = index in repo_gitlinks
+            if patch_view:
+                href = f'#patch-{repo["index"]}-{index}'
+                detail = f"{status} - patch - {patch_view.get('line_count')} lines"
+            elif full_file_view:
+                href = f'#file-{repo["index"]}-{index}'
+                detail = (
+                    f"{status} - {full_file_view.get('language')} - {full_file_view.get('line_count')} lines"
+                )
+            else:
+                href = f'#repo-{repo["index"]}'
+                detail = f"{status} - changed file"
             file_key = (
-                f"file {repo.get('path')} {view.get('path')} {view.get('status')} {view.get('language')}"
+                f"file {repo.get('path')} {repo.get('display_name')} {path} {status}"
             ).lower()
-            rows.append(
-                f'<a class="nav-link nav-file" data-filter-key="{esc(file_key)}" '
-                f'href="#file-{repo["index"]}-{view["index"]}">'
-                f'<strong>{esc(view.get("path"))}</strong>'
-                f'<span>{esc(view.get("status"))} - {esc(view.get("language"))} - {esc(view.get("line_count"))} lines</span>'
+            if is_gitlink:
+                file_key = f"{file_key} submodule pointer gitlink"
+            item = (
+                f'<a class="nav-link nav-file{" nav-gitlink" if is_gitlink else ""}" data-filter-key="{esc(file_key)}" '
+                f'href="{esc(href)}">'
+                f'<strong>{esc(path)}</strong>'
+                f'<span>{esc(detail)}</span>'
                 "</a>"
             )
+            if is_gitlink:
+                gitlink_rows.append(item)
+                gitlink_keys.append(file_key)
+                continue
+            rows.append(item)
     for conflict in conflicts:
         item = conflict.get("conflict") or {}
         key = f"conflict {item.get('path')} {item.get('type')}".lower()
@@ -1046,26 +1655,127 @@ def render_repo_nav(repositories: list[dict[str, Any]], conflicts: list[dict[str
             f'<span>{esc(item.get("type"))}</span>'
             "</a>"
         )
+    if gitlink_rows:
+        group_key = "submodule pointer gitlink " + " ".join(gitlink_keys)
+        rows.append(
+            '<details class="nav-group" data-filter-key="'
+            f'{esc(group_key)}">'
+            f'<summary>Submodule Pointer Changes <span class="muted">{len(gitlink_rows)}</span></summary>'
+            f'<div class="nav-group-body">{"".join(gitlink_rows)}</div>'
+            "</details>"
+        )
     return "\n".join(rows) or '<p class="muted">No repository or conflict entries.</p>'
 
 
 def render_changed_files(repo: dict[str, Any]) -> str:
     rows: list[str] = []
+    patch_views = {view.get("index"): view for view in repo.get("file_patch_views") or []}
+    repo_gitlinks = gitlink_index_set(repo)
     for index, changed_file in enumerate(repo.get("changed_files") or [], start=1):
+        if index in repo_gitlinks:
+            continue
         path = changed_file_path(changed_file, f"file-{index}")
+        patch_label = changed_file.get("patch_relative_path") or changed_file.get("patch_path") or ""
+        if index in patch_views:
+            patch_cell = f'<a href="#patch-{repo["index"]}-{index}"><code>{esc(patch_label or "patch")}</code></a>'
+        elif patch_label:
+            patch_cell = f"<code>{esc(patch_label)}</code>"
+        else:
+            patch_cell = ""
         rows.append(
             "<tr>"
             f'<td><span class="tag">{esc(changed_file.get("status") or "")}</span></td>'
             f"<td><code>{esc(path)}</code></td>"
             f"<td>{esc(changed_file.get('old_path') or '')}</td>"
-            f"<td>{esc(changed_file.get('patch_relative_path') or '')}</td>"
+            f"<td>{patch_cell}</td>"
             "</tr>"
         )
     if not rows:
-        rows.append('<tr><td colspan="4" class="muted">No changed file entries.</td></tr>')
+        rows.append('<tr><td colspan="4" class="muted">No source file entries.</td></tr>')
     return (
         "<table><thead><tr><th>Status</th><th>Path</th><th>Old Path</th><th>Patch</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def render_patch_views(repo: dict[str, Any], *, gitlink_only: bool = False) -> str:
+    sections: list[str] = []
+    repo_gitlinks = gitlink_index_set(repo)
+    for view in repo.get("file_patch_views") or []:
+        is_gitlink = int(view.get("index") or 0) in repo_gitlinks
+        if is_gitlink != gitlink_only:
+            continue
+        patch_label = view.get("patch_relative_path") or view.get("patch_path") or "patch artifact"
+        expanded_label = view.get("expanded_patch_relative_path") or view.get("expanded_patch_source") or ""
+        if expanded_label:
+            patch_label = f"{patch_label} / expanded: {expanded_label}"
+        patch_block = render_patch_block(
+            str(view.get("patch_text") or ""),
+            expanded_text=view.get("expanded_patch_text"),
+            context_lines=view.get("context_lines"),
+            expanded_context_lines=view.get("expanded_context_lines"),
+        )
+        sections.append(
+            f'<section class="patch-file" id="patch-{repo["index"]}-{view["index"]}">'
+            '<div class="patch-file-header">'
+            f'<div class="patch-file-title"><span class="tag">{esc(view.get("status"))}</span>'
+            f'<code>{esc(view.get("path"))}</code></div>'
+            f'<div class="patch-file-meta">{esc(view.get("line_count"))} patch lines - '
+            f'{format_size(view.get("size_bytes"))} - {esc(patch_label)}</div>'
+            "</div>"
+            f"{patch_block}"
+            "</section>"
+        )
+    if sections:
+        return "\n".join(sections)
+    if gitlink_only:
+        return '<p class="muted">No submodule pointer patch entries.</p>'
+    if repo.get("file_patch_views"):
+        return '<p class="muted">No source file patch entries.</p>'
+    return render_patch_block(
+        str(repo.get("patch_text") or ""),
+        expanded_text=repo.get("expanded_patch_text"),
+        context_lines=repo.get("context_lines"),
+        expanded_context_lines=repo.get("expanded_context_lines"),
+    )
+
+
+def render_gitlink_changes(repo: dict[str, Any]) -> str:
+    repo_gitlinks = gitlink_index_set(repo)
+    if not repo_gitlinks:
+        return ""
+    rows: list[str] = []
+    patch_views = {view.get("index"): view for view in repo.get("file_patch_views") or []}
+    for index, changed_file in enumerate(repo.get("changed_files") or [], start=1):
+        if index not in repo_gitlinks:
+            continue
+        path = changed_file_path(changed_file, f"file-{index}")
+        patch_view = patch_views.get(index)
+        patch_label = changed_file.get("patch_relative_path") or changed_file.get("patch_path") or ""
+        if patch_view:
+            patch_cell = f'<a href="#patch-{repo["index"]}-{index}"><code>{esc(patch_label or "patch")}</code></a>'
+        elif patch_label:
+            patch_cell = f"<code>{esc(patch_label)}</code>"
+        else:
+            patch_cell = ""
+        rows.append(
+            "<tr>"
+            f'<td><span class="tag">{esc(changed_file.get("status") or "")}</span></td>'
+            f"<td><code>{esc(path)}</code></td>"
+            f"<td><code>{esc(short_sha(changed_file.get('old_sha')))}</code></td>"
+            f"<td><code>{esc(short_sha(changed_file.get('new_sha')))}</code></td>"
+            f"<td>{patch_cell}</td>"
+            "</tr>"
+        )
+    table = (
+        "<table><thead><tr><th>Status</th><th>Path</th><th>Old SHA</th><th>New SHA</th><th>Patch</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+    return (
+        f'<details class="gitlink-section" id="gitlink-{repo["index"]}">'
+        f'<summary>Submodule Pointer Changes <span class="muted">{len(rows)}</span></summary>'
+        f'<div class="repo-body">{table}{render_patch_views(repo, gitlink_only=True)}</div>'
+        "</details>"
     )
 
 
@@ -1096,7 +1806,12 @@ def render_file_views(repo: dict[str, Any]) -> str:
 
 
 def repo_filter_key(repo: dict[str, Any]) -> str:
-    parts = ["repo", str(repo.get("path") or ""), str(repo.get("strategy") or "")]
+    parts = [
+        "repo",
+        str(repo.get("path") or ""),
+        str(repo.get("display_name") or ""),
+        str(repo.get("strategy") or ""),
+    ]
     for changed_file in repo.get("changed_files") or []:
         parts.append(changed_file_path(changed_file, ""))
         parts.append(str(changed_file.get("old_path") or ""))
@@ -1108,7 +1823,7 @@ def render_repo_section(repo: dict[str, Any]) -> str:
     return f"""
 <section class="repo-section" id="repo-{repo["index"]}" data-filter-key="{esc(repo_filter_key(repo))}">
   <div class="repo-header">
-    <h2>{esc(repo.get("path"))}</h2>
+    <h2>{esc(repo.get("display_name") or repo.get("path"))}</h2>
     <div class="repo-meta">
       <span>strategy: {esc(repo.get("strategy"))}</span>
       <span>result: <code>{esc(short_sha(repo.get("result")))}</code></span>
@@ -1133,7 +1848,8 @@ def render_repo_section(repo: dict[str, Any]) -> str:
     <h3>Changed Files</h3>
     {render_changed_files(repo)}
     <h3>Patch</h3>
-    {render_patch_block(str(repo.get("patch_text") or ""))}
+    {render_patch_views(repo)}
+    {render_gitlink_changes(repo)}
     <h3>Full File Views</h3>
     {render_file_views(repo)}
   </div>
@@ -1226,8 +1942,14 @@ def render_html(
     *,
     title: str = "CI Merge Code Review",
     diff_context_lines: int = DEFAULT_DIFF_CONTEXT_LINES,
+    expanded_diff_context_lines: int = DEFAULT_EXPANDED_DIFF_CONTEXT_LINES,
 ) -> str:
-    model = collect_review_model(report, report_path, diff_context_lines=diff_context_lines)
+    model = collect_review_model(
+        report,
+        report_path,
+        diff_context_lines=diff_context_lines,
+        expanded_diff_context_lines=expanded_diff_context_lines,
+    )
     resolved = report.get("resolved") or {}
     output = report.get("output") or {}
     repositories = model["repositories"]
@@ -1236,7 +1958,14 @@ def render_html(
     warning_items = "".join(f'<li class="warning">{esc(item)}</li>' for item in warnings)
     repo_sections = "\n".join(render_repo_section(repo) for repo in repositories)
     conflict_sections = "\n".join(render_conflict_section(conflict) for conflict in conflicts)
-    changed_file_count = sum(len(repo.get("changed_files") or []) for repo in repositories)
+    gitlink_file_count = sum(gitlink_count(repo) for repo in repositories)
+    changed_file_count = sum(len(repo.get("changed_files") or []) for repo in repositories) - gitlink_file_count
+    command_count = len(report.get("commands") or [])
+    resolved_report_path = report_path.resolve(strict=False)
+    try:
+        report_href = resolved_report_path.as_uri()
+    except ValueError:
+        report_href = str(resolved_report_path)
     if not conflict_sections:
         conflict_sections = '<p class="muted">No conflict entries.</p>'
     return f"""<!doctype html>
@@ -1250,12 +1979,12 @@ def render_html(
 <body>
   <header>
     <h1>{esc(title)}</h1>
-    <div>Report: <code>{esc(report_path.resolve(strict=False))}</code></div>
+    <div class="report-line">Report: <a class="report-link" href="{esc(report_href)}">{esc(resolved_report_path)}</a></div>
     <div class="muted">Self-contained offline HTML. GitLab Rapid Diffs-style review workbench with no external CSS, JavaScript, CDN, or network resources.</div>
   </header>
   <main>
     <div class="review-bar">
-      <strong>Rapid Diffs Review Workbench - {len(repositories)} repos - {changed_file_count} files - {len(conflicts)} conflicts</strong>
+      <strong>Rapid Diffs Review Workbench - {len(repositories)} repos - {changed_file_count} files - {gitlink_file_count} submodule pointers - {len(conflicts)} conflicts</strong>
       <div class="review-actions">
         <button type="button" class="review-button js-wrap-toggle" aria-pressed="false">Wrap</button>
         <button type="button" class="review-button" data-details-action="expand">Expand all</button>
@@ -1275,10 +2004,6 @@ def render_html(
       <ul>{render_risks(model["risks"])}</ul>
       {"<h3>Artifact Warnings</h3><ul>" + warning_items + "</ul>" if warnings else ""}
     </section>
-    <section class="panel">
-      <h2>Review Checklist</h2>
-      <div class="review-checklist">{render_review_checklist()}</div>
-    </section>
     <div class="layout">
       <aside class="panel sidebar">
         <h2>Files</h2>
@@ -1287,7 +2012,8 @@ def render_html(
         </div>
         <div class="nav-list">{render_repo_nav(repositories, conflicts)}</div>
       </aside>
-      <div>
+      <div class="sidebar-resizer" role="separator" aria-label="Resize Files navigation" aria-orientation="vertical" tabindex="0"></div>
+      <div class="review-content">
         <section class="panel">
           <h2>Repositories</h2>
           {repo_sections or '<p class="muted">No repository entries.</p>'}
@@ -1302,10 +2028,10 @@ def render_html(
           <h3>Publish</h3>
           {render_json_editor(report.get("publish") or {}, aria_label="Publish")}
         </section>
-        <section class="panel">
-          <h2>Commands</h2>
-          {render_commands(report)}
-        </section>
+        <details class="panel command-panel">
+          <summary>Commands <span class="muted">{command_count} records, collapsed by default</span></summary>
+          <div class="command-panel-body">{render_commands(report)}</div>
+        </details>
       </div>
     </div>
   </main>
@@ -1337,6 +2063,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=DEFAULT_DIFF_CONTEXT_LINES,
         help="Fallback git diff context lines when patch artifacts are missing.",
     )
+    parser.add_argument(
+        "--expanded-diff-context-lines",
+        "--expanded_diff_context_lines",
+        dest="expanded_diff_context_lines",
+        type=int,
+        default=DEFAULT_EXPANDED_DIFF_CONTEXT_LINES,
+        help="Expanded fallback git diff context lines when expanded patch artifacts are missing.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1346,6 +2080,7 @@ def generate_html_file(
     *,
     title: str = "CI Merge Code Review",
     diff_context_lines: int = DEFAULT_DIFF_CONTEXT_LINES,
+    expanded_diff_context_lines: int = DEFAULT_EXPANDED_DIFF_CONTEXT_LINES,
     codemirror_only: bool = False,
 ) -> Path:
     report_path = report_path.expanduser().resolve(strict=False)
@@ -1355,7 +2090,13 @@ def generate_html_file(
         if output_path
         else default_output_path(report_path, codemirror_only=codemirror_only)
     )
-    html_text = render_html(report, report_path, title=title, diff_context_lines=diff_context_lines)
+    html_text = render_html(
+        report,
+        report_path,
+        title=title,
+        diff_context_lines=diff_context_lines,
+        expanded_diff_context_lines=expanded_diff_context_lines,
+    )
     write_text(output, html_text)
     return output
 
@@ -1369,6 +2110,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.diff_context_lines < 0:
         print("--diff-context-lines must be >= 0", file=sys.stderr)
         return 2
+    if args.expanded_diff_context_lines < args.diff_context_lines:
+        print("--expanded-diff-context-lines must be >= --diff-context-lines", file=sys.stderr)
+        return 2
     output_path = Path(args.output).expanduser().resolve(strict=False) if args.output else None
     try:
         generated = generate_html_file(
@@ -1376,6 +2120,7 @@ def main(argv: list[str] | None = None) -> int:
             output_path,
             title=args.title,
             diff_context_lines=args.diff_context_lines,
+            expanded_diff_context_lines=args.expanded_diff_context_lines,
             codemirror_only=args.codemirror_only,
         )
     except (OSError, ValueError) as exc:

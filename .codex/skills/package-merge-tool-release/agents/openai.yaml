@@ -1,0 +1,4 @@
+interface:
+  display_name: "Package Merge Tool Release"
+  short_description: "Package this repository's MergeTool release."
+  default_prompt: "Package the MergeTool_for_Manual release using the local release workflow."

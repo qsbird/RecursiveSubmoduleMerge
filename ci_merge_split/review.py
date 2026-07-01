@@ -16,7 +16,7 @@ from .review_common import (
     write_json,
 )
 from .review_common import write_text
-from .review_html import DEFAULT_DIFF_CONTEXT_LINES, generate_html_file
+from .review_html import DEFAULT_DIFF_CONTEXT_LINES, DEFAULT_EXPANDED_DIFF_CONTEXT_LINES, generate_html_file
 
 
 def default_reviewer() -> str:
@@ -88,6 +88,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_DIFF_CONTEXT_LINES,
         help="Fallback git diff context lines when patch artifacts are missing.",
     )
+    html_parser.add_argument(
+        "--expanded-diff-context-lines",
+        "--expanded_diff_context_lines",
+        dest="expanded_diff_context_lines",
+        type=int,
+        default=DEFAULT_EXPANDED_DIFF_CONTEXT_LINES,
+        help="Expanded fallback git diff context lines when expanded patch artifacts are missing.",
+    )
 
     record_parser = subparsers.add_parser("record", help="Export a review decision JSON and Markdown summary.")
     record_parser.add_argument("--report", required=True, help="Path to merge-report.json")
@@ -115,6 +123,9 @@ def run_html(args: argparse.Namespace) -> int:
     if args.diff_context_lines < 0:
         print("--diff-context-lines must be >= 0", file=sys.stderr)
         return 2
+    if args.expanded_diff_context_lines < args.diff_context_lines:
+        print("--expanded-diff-context-lines must be >= --diff-context-lines", file=sys.stderr)
+        return 2
     report_path = Path(args.report).expanduser().resolve(strict=False)
     if not report_path.exists():
         print(f"report not found: {report_path}", file=sys.stderr)
@@ -125,6 +136,7 @@ def run_html(args: argparse.Namespace) -> int:
         output_path,
         title=args.title,
         diff_context_lines=args.diff_context_lines,
+        expanded_diff_context_lines=args.expanded_diff_context_lines,
         codemirror_only=args.codemirror_only,
     )
     print(generated)

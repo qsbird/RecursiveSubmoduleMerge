@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -93,6 +94,25 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
         self.assertIn("Conflict tool timed out", friendly)
         self.assertIn("exit code 0", friendly)
         self.assertNotIn("[STDOUT]", friendly)
+
+    def test_risk_confirmation_event_is_parsed_and_hidden_from_friendly_output(self) -> None:
+        line = desktop_gui.RISK_CONFIRMATION_EVENT_PREFIX + json.dumps(
+            {
+                "protocol": desktop_gui.RISK_CONFIRMATION_PROTOCOL_VERSION,
+                "reason": "LOCAL_BRANCH_RESET_RISK",
+                "message": "Continuing will reset a branch.",
+                "details": {"branch": "work", "affected_files": ["a.txt"]},
+            }
+        )
+
+        event = desktop_gui.parse_risk_confirmation_event(line)
+        friendly = desktop_gui.format_friendly_output(line + "\n")
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.reason, "LOCAL_BRANCH_RESET_RISK")
+        self.assertEqual(event.details["affected_files"], ["a.txt"])
+        self.assertEqual(friendly, "")
 
     def test_friendly_output_supports_chinese_language(self) -> None:
         friendly = desktop_gui.format_friendly_output("$ git status\n[EXIT] 1\n", desktop_gui.LANGUAGE_ZH)
@@ -303,6 +323,50 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
         self.assertEqual(env["GIT_CONFIG_COUNT"], "2")
         self.assertEqual(env["GIT_CONFIG_KEY_1"], "safe.directory")
         self.assertNotIn("\\", env["GIT_CONFIG_VALUE_1"])
+
+    def test_git_safe_directory_env_can_enable_risk_confirmation_protocol(self) -> None:
+        env = desktop_gui.git_safe_directory_env(
+            r"C:\repo",
+            enable_risk_confirmation_protocol=True,
+        )
+
+        self.assertEqual(
+            env[desktop_gui.RISK_CONFIRMATION_PROTOCOL_ENV],
+            desktop_gui.RISK_CONFIRMATION_PROTOCOL_VERSION,
+        )
+
+    def test_risk_confirmation_dialog_writes_yes_or_no_to_process(self) -> None:
+        class FakeVariable:
+            def get(self) -> str:
+                return desktop_gui.LANGUAGE_EN
+
+        app = object.__new__(desktop_gui.MergeGuiApp)
+        app.root = object()
+        app.language_var = FakeVariable()
+        sent: list[str] = []
+        logs: list[str] = []
+        statuses: list[str] = []
+        button_states: list[str] = []
+        app._send_process_input = sent.append
+        app._append_log = lambda content, **_kwargs: logs.append(content)
+        app._set_status = lambda key, **_kwargs: statuses.append(key)
+        app._set_confirmation_buttons = button_states.append
+
+        event = desktop_gui.RiskConfirmationEvent(
+            reason="LOCAL_BRANCH_RESET_RISK",
+            message="Continuing will reset a branch.",
+            details={"branch": "work"},
+        )
+        with mock.patch("tkinter.messagebox.askyesno", return_value=True):
+            desktop_gui.MergeGuiApp._handle_risk_confirmation_event(app, event)
+        with mock.patch("tkinter.messagebox.askyesno", return_value=False):
+            desktop_gui.MergeGuiApp._handle_risk_confirmation_event(app, event)
+
+        self.assertEqual(sent, ["y\n", "n\n"])
+        self.assertIn("status_waiting_risk_confirmation", statuses)
+        self.assertEqual(button_states, ["disabled", "disabled"])
+        self.assertTrue(any("Risk confirmed" in item for item in logs))
+        self.assertTrue(any("Risk rejected" in item for item in logs))
 
     def test_run_git_query_hides_windows_child_console(self) -> None:
         fake_completed = subprocess.CompletedProcess(

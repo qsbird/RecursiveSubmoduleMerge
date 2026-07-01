@@ -1,0 +1,56 @@
+{
+  "schema_version": "1.0",
+  "status": "success",
+  "exit_code": 0,
+  "failure_reason": null,
+  "input": {
+    "diff_context_lines": 3,
+    "expanded_diff_context_lines": 20
+  },
+  "output": {
+    "output_dir": "review_preview",
+    "report_path": "review_preview/merge-report.json",
+    "patch_dir": "review_preview/patches",
+    "conflict_dir": "review_preview/conflicts",
+    "file_dir": "review_preview/files",
+    "generated_file_inside_repo": false
+  },
+  "resolved": {
+    "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "target_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "result_sha": "cccccccccccccccccccccccccccccccccccccccc"
+  },
+  "summary": {
+    "merged_repositories": 1,
+    "submodules_processed": 0,
+    "submodule_recursive_merges": 0,
+    "conflicts": 0
+  },
+  "repositories": [
+    {
+      "path": ".",
+      "repo_path": "review_preview/source-repo",
+      "base": "base",
+      "ours": "ours",
+      "theirs": "theirs",
+      "result": "result",
+      "strategy": "merge",
+      "diff_stat": " src/context_demo.c | 2 +-\n",
+      "changed_files": [
+        {
+          "status": "M",
+          "path": "src/context_demo.c",
+          "patch_relative_path": "patches/root/files/0001-context-demo.c.patch",
+          "patch_context_lines": 3,
+          "expanded_patch_relative_path": "patches/root/files/0001-context-demo.c.expanded.patch",
+          "expanded_patch_context_lines": 20
+        }
+      ]
+    }
+  ],
+  "conflicts": [],
+  "commands": [],
+  "errors": [],
+  "restore": {},
+  "publish": {}
+}

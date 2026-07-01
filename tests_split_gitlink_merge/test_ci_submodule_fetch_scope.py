@@ -110,7 +110,12 @@ class CiSubmoduleFetchScopeTests(unittest.TestCase):
             preflight.sync_remote_refs(ctx, repo)
 
             called_args = [call[1] for call in runner.calls]
-            fetch_repos = [call[0] for call in runner.calls if call[1] == ("fetch", "--all", "--prune")]
+            self.assertIn(("fetch", "--no-recurse-submodules", "origin", "--prune"), called_args)
+            fetch_repos = [
+                call[0]
+                for call in runner.calls
+                if call[1] == ("fetch", "--no-recurse-submodules", "--all", "--prune")
+            ]
             self.assertEqual(fetch_repos, [repo / "libs" / "changed"])
             self.assertNotIn(("submodule", "foreach", "--recursive", "git fetch --all --prune"), called_args)
             self.assertEqual(ctx.report.data["remote_sync"]["submodule_fetch_scope_effective"], "needed")
@@ -125,7 +130,12 @@ class CiSubmoduleFetchScopeTests(unittest.TestCase):
             preflight.sync_remote_refs(ctx, repo)
 
             called_args = [call[1] for call in runner.calls]
-            fetch_repos = [call[0] for call in runner.calls if call[1] == ("fetch", "--all", "--prune")]
+            self.assertIn(("fetch", "--no-recurse-submodules", "origin", "--prune"), called_args)
+            fetch_repos = [
+                call[0]
+                for call in runner.calls
+                if call[1] == ("fetch", "--no-recurse-submodules", "--all", "--prune")
+            ]
             self.assertEqual(fetch_repos, [repo / "libs" / "one", repo / "libs" / "two"])
             self.assertNotIn(("submodule", "foreach", "--recursive", "git fetch --all --prune"), called_args)
             self.assertEqual(ctx.report.data["remote_sync"]["submodule_fetch_scope_effective"], "all")

@@ -8,8 +8,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-
-from subprocess_window import hidden_subprocess_kwargs
+from typing import Any
 
 from .model import (
     Ancestry,
@@ -215,6 +214,12 @@ def format_git_failure(result: GitCommandResult) -> str:
         f"cwd: {result.cwd}\n"
         f"{detail}"
     )
+
+
+def hidden_subprocess_kwargs() -> dict[str, Any]:
+    from subprocess_window import hidden_subprocess_kwargs as build_kwargs
+
+    return build_kwargs()
 
 
 def add_git_config(env: dict[str, str], key: str, value: str) -> None:

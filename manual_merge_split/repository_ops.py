@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -11,10 +14,14 @@ from merge_cleanup_core import steps as cleanup_steps
 
 from . import common
 from . import execution
+from .messages import ManualCommitMessage
 from .models import KNOWN_MISSING_REVISION_MARKERS, CleanupResult, MergeAutomationError, RepoSnapshot, UnmergedConflict
 
 
 REPOSITORY_OP_FUNCTIONS: tuple[str, ...] = ()
+RISK_CONFIRMATION_PROTOCOL_ENV = "MERGE_TOOL_RISK_CONFIRMATION_PROTOCOL"
+RISK_CONFIRMATION_PROTOCOL_VERSION = "stdio-json-v1"
+RISK_CONFIRMATION_EVENT_PREFIX = "MERGE_TOOL_RISK_CONFIRMATION_REQUIRED "
 
 
 @dataclass(frozen=True)
@@ -81,17 +88,95 @@ class ManualRepositoryOps:
         return result.returncode == 0
 
     def branch_exists(self, repo_path: Path, branch: str) -> bool:
-        result = self.run_git(repo_path, ["show-ref", "--verify", f"refs/heads/{branch}"], check=False)
-        return result.returncode == 0
+        result = self.run_git(repo_path, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], check=False)
+        if result.returncode == 0:
+            return True
+        if result.returncode in (1, 128):
+            return False
+        raise self._automation_error(self._format_git_failure(result))
 
-    def resolve_commit(self, repo_path: Path, ref: str) -> str | None:
-        result = self.run_git(repo_path, ["rev-parse", "--verify", f"{ref}^{{commit}}"], check=False)
+    def try_resolve_commit(self, repo_path: Path, commitish: str) -> str | None:
+        result = self.run_git(repo_path, ["rev-parse", "--verify", f"{commitish}^{{commit}}"], check=False)
         if result.returncode != 0:
-            return None
+            if self.is_missing_revision_error(result.stderr):
+                return None
+            raise self._automation_error(self._format_git_failure(result))
         return result.stdout.strip() or None
 
     def local_branch_head(self, repo_path: Path, branch: str) -> str | None:
+        if not self.branch_exists(repo_path, branch):
+            return None
         return self.resolve_commit(repo_path, f"refs/heads/{branch}")
+
+    def _json_safe_value(self, value: Any) -> Any:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(key): self._json_safe_value(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [self._json_safe_value(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    def _emit_risk_confirmation_event(self, *, reason: str, message: str, details: dict[str, Any]) -> None:
+        payload = {
+            "protocol": RISK_CONFIRMATION_PROTOCOL_VERSION,
+            "reason": reason,
+            "message": message,
+            "details": self._json_safe_value(details),
+        }
+        print(
+            RISK_CONFIRMATION_EVENT_PREFIX + json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def confirm_risky_operation(self, *, reason: str, message: str, details: dict[str, Any]) -> bool:
+        confirmer = getattr(self.manual_module, "confirm_risky_operation", None)
+        if callable(confirmer):
+            return bool(confirmer(reason=reason, message=message, details=details))
+
+        print("", file=sys.stderr)
+        print(f"WARNING {reason}: {message}", file=sys.stderr)
+        for key, value in details.items():
+            if value in (None, "", [], (), {}):
+                continue
+            print(f"{key}:", file=sys.stderr)
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    print(f"  - {item}", file=sys.stderr)
+            else:
+                print(f"  {value}", file=sys.stderr)
+
+        if not sys.stdin.isatty():
+            if os.environ.get(RISK_CONFIRMATION_PROTOCOL_ENV) == RISK_CONFIRMATION_PROTOCOL_VERSION:
+                self._emit_risk_confirmation_event(reason=reason, message=message, details=details)
+                answer = sys.stdin.readline().strip().lower()
+                return answer in {"y", "yes"}
+            print("Non-interactive run cannot confirm this risky operation.", file=sys.stderr)
+            return False
+
+        answer = input("Continue despite this risk? [y/N]: ").strip().lower()
+        return answer in {"y", "yes"}
+
+    def require_risky_operation_confirmation(
+        self,
+        *,
+        reason: str,
+        message: str,
+        details: dict[str, Any],
+        failure_message: str,
+    ) -> None:
+        if self.confirm_risky_operation(reason=reason, message=message, details=details):
+            return
+        raise self._automation_error(failure_message)
+
+    def changed_files_between_commits(self, repo_path: Path, left_ref: str, right_ref: str) -> list[str]:
+        result = self.run_git(repo_path, ["diff", "--name-only", left_ref, right_ref, "--"], check=False)
+        if result.returncode != 0:
+            return []
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
     def ensure_branch_reset_is_safe(
         self,
@@ -106,21 +191,32 @@ class ManualRepositoryOps:
             return
 
         target_head = self.resolve_commit(repo_path, target_ref)
-        if target_head is None:
-            raise self._automation_error(
-                "Cannot verify branch reset safety before "
-                f"{operation}: branch '{branch}' exists in {repo_path}, "
-                f"but target ref '{target_ref}' could not be resolved."
-            )
 
         if current_head == target_head:
             return
 
-        raise self._automation_error(
+        failure_message = (
             "Refusing to reset existing local branch "
             f"'{branch}' in {repo_path} from {current_head} to {target_head} during {operation}. "
             "This could hide local committed work. Use an unused work branch name, "
             "or manually preserve/delete the existing branch before retrying."
+        )
+        self.require_risky_operation_confirmation(
+            reason="LOCAL_BRANCH_RESET_RISK",
+            message=(
+                f"Continuing will reset local branch '{branch}' from {current_head} to {target_head}. "
+                "Local commits that are only reachable from that branch may become hidden."
+            ),
+            details={
+                "repository": str(repo_path),
+                "operation": operation,
+                "branch": branch,
+                "current_head": current_head,
+                "target_ref": target_ref,
+                "target_head": target_head,
+                "affected_files": self.changed_files_between_commits(repo_path, target_head, current_head),
+            },
+            failure_message=failure_message,
         )
 
     def ensure_detached_head_checkout_is_safe(
@@ -133,16 +229,32 @@ class ManualRepositoryOps:
         if self.current_branch_name(repo_path) is not None:
             return
 
-        current_head = self.resolve_commit(repo_path, "HEAD")
+        current_head = self.try_resolve_commit(repo_path, "HEAD")
         target_head = self.resolve_commit(repo_path, target_ref)
-        if current_head is None or target_head is None or current_head == target_head:
+        if current_head is None or current_head == target_head:
             return
 
-        raise self._automation_error(
+        failure_message = (
             "Refusing to leave detached HEAD "
             f"{current_head} in {repo_path} for {target_head} during {operation}. "
             "This could hide local committed work that is not protected by a branch. "
             "Create a branch for the current HEAD or choose Continue Current Branch from a named branch."
+        )
+        self.require_risky_operation_confirmation(
+            reason="DETACHED_HEAD_CHECKOUT_RISK",
+            message=(
+                f"Continuing will move detached HEAD from {current_head} to {target_head}. "
+                "The current detached commit may become difficult to find if it is not referenced elsewhere."
+            ),
+            details={
+                "repository": str(repo_path),
+                "operation": operation,
+                "current_head": current_head,
+                "target_ref": target_ref,
+                "target_head": target_head,
+                "affected_files": self.changed_files_between_commits(repo_path, target_head, current_head),
+            },
+            failure_message=failure_message,
         )
 
     def current_branch_name(self, repo_path: Path) -> str | None:
@@ -160,14 +272,13 @@ class ManualRepositoryOps:
         result = self.run_git(repo_path, ["rev-parse", "-q", "--verify", "MERGE_HEAD"], check=False)
         return result.returncode == 0
 
-    def working_tree_has_changes(
+    def _filter_status_lines(
         self,
-        repo_path: Path,
+        status_output: str,
         *,
         ignored_untracked_paths: Iterable[str] = (),
         ignored_paths: Iterable[str] = (),
-    ) -> bool:
-        result = self.run_git(repo_path, ["status", "--porcelain"])
+    ) -> list[str]:
         ignored = {
             common.normalize_status_relative_path(path)
             for path in ignored_untracked_paths
@@ -178,10 +289,9 @@ class ManualRepositoryOps:
             for path in ignored_paths
             if path.strip()
         }
-        if not ignored and not ignored_dirty:
-            return bool(result.stdout)
 
-        for line in result.stdout.splitlines():
+        filtered_lines: list[str] = []
+        for line in status_output.splitlines():
             normalized_line = line.rstrip()
             if not normalized_line:
                 continue
@@ -190,8 +300,46 @@ class ManualRepositoryOps:
                 continue
             if relative_path in ignored_dirty:
                 continue
-            return True
-        return False
+            filtered_lines.append(normalized_line)
+        return filtered_lines
+
+    def working_tree_status_lines(
+        self,
+        repo_path: Path,
+        *,
+        ignored_untracked_paths: Iterable[str] = (),
+        ignored_paths: Iterable[str] = (),
+    ) -> list[str]:
+        result = self.run_git(repo_path, ["status", "--porcelain"])
+        return self._filter_status_lines(
+            result.stdout,
+            ignored_untracked_paths=ignored_untracked_paths,
+            ignored_paths=ignored_paths,
+        )
+
+    def working_tree_has_changes(
+        self,
+        repo_path: Path,
+        *,
+        ignored_untracked_paths: Iterable[str] = (),
+        ignored_paths: Iterable[str] = (),
+    ) -> bool:
+        return bool(
+            self.working_tree_status_lines(
+                repo_path,
+                ignored_untracked_paths=ignored_untracked_paths,
+                ignored_paths=ignored_paths,
+            )
+        )
+
+    def repo_direct_status_lines(
+        self,
+        repo_path: Path,
+        *,
+        ignored_untracked_paths: Iterable[str] = (),
+    ) -> list[str]:
+        result = self.run_git(repo_path, ["status", "--porcelain", "--ignore-submodules=dirty"])
+        return self._filter_status_lines(result.stdout, ignored_untracked_paths=ignored_untracked_paths)
 
     def repo_has_direct_changes(
         self,
@@ -199,25 +347,7 @@ class ManualRepositoryOps:
         *,
         ignored_untracked_paths: Iterable[str] = (),
     ) -> bool:
-        result = self.run_git(repo_path, ["status", "--porcelain", "--ignore-submodules=dirty"])
-        ignored = {
-            common.normalize_status_relative_path(path)
-            for path in ignored_untracked_paths
-            if path.strip()
-        }
-        if not ignored:
-            return bool(result.stdout)
-
-        for line in result.stdout.splitlines():
-            normalized_line = line.rstrip()
-            if not normalized_line:
-                continue
-            if normalized_line.startswith("?? "):
-                relative_path = common.normalize_status_relative_path(normalized_line[3:])
-                if relative_path in ignored:
-                    continue
-            return True
-        return False
+        return bool(self.repo_direct_status_lines(repo_path, ignored_untracked_paths=ignored_untracked_paths))
 
     def get_unmerged_paths(self, repo_path: Path) -> list[str]:
         result = self.run_git(repo_path, ["diff", "--name-only", "--diff-filter=U"])
@@ -327,7 +457,20 @@ class ManualRepositoryOps:
             return True
 
         for remote_name in self.get_remote_names(repo_path):
-            fetch_result = self.run_git(repo_path, ["fetch", remote_name], check=False, stream_output=self._verbose())
+            exact_fetch_result = self.run_git(
+                repo_path,
+                ["fetch", "--no-recurse-submodules", remote_name, commitish],
+                check=False,
+                stream_output=self._verbose(),
+            )
+            if exact_fetch_result.returncode == 0 and self.commit_exists(repo_path, commitish):
+                return True
+            fetch_result = self.run_git(
+                repo_path,
+                ["fetch", "--no-recurse-submodules", remote_name],
+                check=False,
+                stream_output=self._verbose(),
+            )
             if fetch_result.returncode != 0:
                 continue
             if self.commit_exists(repo_path, commitish):
@@ -338,12 +481,23 @@ class ManualRepositoryOps:
         remote, _, remote_branch = ref.partition("/")
         if not remote_branch or not self.remote_exists(repo_path, remote):
             return
-        self.run_git(repo_path, ["fetch", remote, remote_branch], stream_output=self._verbose())
+        remote_ref = f"refs/heads/{remote_branch}"
+        tracking_ref = common.remote_tracking_ref(ref)
+        self.run_git(
+            repo_path,
+            ["fetch", "--no-recurse-submodules", remote, f"+{remote_ref}:{tracking_ref}"],
+            stream_output=self._verbose(),
+        )
 
     def fetch_all_remotes(self, repo_path: Path) -> None:
         if not self.get_remote_names(repo_path):
             return
-        self.run_git(repo_path, ["fetch", "--all", "--prune"], check=False, stream_output=self._verbose())
+        self.run_git(
+            repo_path,
+            ["fetch", "--no-recurse-submodules", "--all", "--prune"],
+            check=False,
+            stream_output=self._verbose(),
+        )
 
     def create_root_branch(self, repo_path: Path, base_remote_branch: str, work_branch: str) -> None:
         self.fetch_ref_if_remote(repo_path, base_remote_branch)
@@ -379,14 +533,14 @@ class ManualRepositoryOps:
             return
         self.run_git(repo_path, ["checkout", "-B", work_branch])
 
-    def merge_branch(self, repo_path: Path, merge_ref: str) -> None:
+    def merge_branch(self, repo_path: Path, merge_ref: str) -> str:
         self.fetch_ref_if_remote(repo_path, merge_ref)
         merge_target = common.remote_tracking_ref(merge_ref)
-        result = self.run_git(repo_path, ["merge", "--no-ff", merge_target], check=False)
+        result = self.run_git(repo_path, ["merge", "--no-ff", "--no-commit", merge_target], check=False)
         if result.returncode == 0:
-            return
+            return merge_target
         if self.get_unmerged_paths(repo_path):
-            return
+            return merge_target
         raise self._automation_error(self._format_git_failure(result))
 
     def update_submodules(self, repo_path: Path, paths: Iterable[str] = ()) -> None:
@@ -405,14 +559,26 @@ class ManualRepositoryOps:
             return True
         raise self._automation_error(self._format_git_failure(result))
 
-    def commit_if_needed(self, repo_path: Path, *, fallback_message: str | None = None) -> None:
+    def commit_if_needed(
+        self,
+        repo_path: Path,
+        *,
+        message: ManualCommitMessage | None = None,
+        fallback_message: str | None = None,
+    ) -> None:
         if self.get_unmerged_paths(repo_path):
             return
 
         if self.merge_in_progress(repo_path):
-            result = self.run_git(repo_path, ["commit", "--no-edit"], check=False)
-        elif fallback_message and self.staged_changes_exist(repo_path):
-            result = self.run_git(repo_path, ["commit", "-m", fallback_message], check=False)
+            commit_args = ["commit", *message.git_args()] if message else ["commit", "--no-edit"]
+            result = self.run_git(repo_path, commit_args, check=False)
+        elif self.staged_changes_exist(repo_path):
+            if message:
+                result = self.run_git(repo_path, ["commit", *message.git_args()], check=False)
+            elif fallback_message:
+                result = self.run_git(repo_path, ["commit", "-m", fallback_message], check=False)
+            else:
+                return
         else:
             return
 
@@ -482,11 +648,20 @@ class ManualRepositoryOps:
         result: Any,
         *,
         skip_submodule_update: bool,
+        allow_clean_x: bool = False,
         ignored_root_untracked_paths: Iterable[str] = (),
         is_root: bool = True,
         preserved_dirty_paths_by_repo: dict[Path, set[str]] | None = None,
         preserved_dirty_repos: set[Path] | None = None,
     ) -> None:
+        """Recursively clean a repository using multi-level fallback.
+
+        Each repository is first visited recursively into its submodules, then
+        the repository itself is cleaned by trying Level 1 → Level 2 → Level 3
+        → Level 4.  The first level that succeeds ends the cleanup for that
+        repo.  If all levels fail, the method raises with a detailed manual-
+        recovery message so the user knows exactly what went wrong.
+        """
         self.ensure_git_repo(repo_path)
         resolved_repo_path = repo_path.resolve()
         preserved_dirty_repos = preserved_dirty_repos or set()
@@ -497,6 +672,7 @@ class ManualRepositoryOps:
         )
         result.visited_repos.append(repo_path)
 
+        # --- recurse into submodules first ---
         for submodule_path in self.get_submodule_paths(repo_path):
             child_repo = repo_path / submodule_path
             if not child_repo.exists():
@@ -506,72 +682,160 @@ class ManualRepositoryOps:
                     child_repo,
                     result,
                     skip_submodule_update=skip_submodule_update,
+                    allow_clean_x=allow_clean_x,
                     ignored_root_untracked_paths=(),
                     is_root=False,
                     preserved_dirty_paths_by_repo=preserved_dirty_paths_by_repo,
                     preserved_dirty_repos=preserved_dirty_repos,
                 )
             except self._automation_error_class() as exc:
-                raise self._automation_error(f"Failed to cleanup submodule repository {child_repo}: {exc}") from exc
+                raise self._automation_error(
+                    f"Failed to cleanup submodule repository {child_repo}: {exc}"
+                ) from exc
 
+        # --- mark aborted merges and hard resets in the result (best-effort) ---
         if self.merge_in_progress(repo_path):
-            abort_result = self.run_cleanup_step(repo_path, cleanup_steps.abort_operation_step("merge"), check=False)
-            if abort_result.returncode != 0:
-                reset_result = self.run_cleanup_step(repo_path, cleanup_steps.reset_merge_step(), check=False)
-                if reset_result.returncode != 0:
-                    result.failed_steps.append(self._format_git_failure(abort_result))
-                    result.failed_steps.append(self._format_git_failure(reset_result))
-                    raise self._automation_error(f"Cleanup could not abort the in-progress merge in {repo_path}")
             result.aborted_merges.append(repo_path)
         elif self.get_unmerged_paths(repo_path):
-            if resolved_repo_path in preserved_dirty_repos:
-                raise self._automation_error(
-                    "A preserved dirty submodule became part of the failed merge and cannot be cleaned "
-                    f"without overwriting local changes: {repo_path}"
-                )
-            reset_result = self.run_cleanup_step(repo_path, cleanup_steps.reset_merge_step(), check=False)
-            if reset_result.returncode != 0:
-                result.failed_steps.append(self._format_git_failure(reset_result))
-                raise self._automation_error(f"Cleanup could not reset unmerged paths in {repo_path}")
-            result.aborted_merges.append(repo_path)
+            if resolved_repo_path not in preserved_dirty_repos:
+                result.aborted_merges.append(repo_path)
 
         if (
             self.head_exists(repo_path)
             and self.working_tree_has_changes(repo_path, ignored_paths=ignored_dirty_paths)
             and resolved_repo_path not in preserved_dirty_repos
         ):
-            hard_reset_result = self.run_cleanup_step(
-                repo_path,
-                cleanup_steps.reset_hard_step("HEAD"),
-                check=False,
-            )
-            if hard_reset_result.returncode != 0:
-                result.failed_steps.append(self._format_git_failure(hard_reset_result))
-                raise self._automation_error(f"Cleanup could not discard local changes in {repo_path}")
             result.hard_resets.append(repo_path)
 
-        if not skip_submodule_update and is_root:
-            update_result = self.run_cleanup_step(
-                repo_path,
-                cleanup_steps.submodule_update_step(),
-                check=False,
-                stream_output=self._verbose(),
-            )
-            if update_result.returncode != 0:
-                result.failed_steps.append(self._format_git_failure(update_result))
-                raise self._automation_error(f"Cleanup could not refresh submodules in {repo_path}")
-            result.submodule_updates.append(repo_path)
+        # --- multi-level cleanup fallback ---
+        submodule_paths = self.get_submodule_paths(repo_path)
+        levels = self._build_cleanup_levels(
+            repo_path, submodule_paths, allow_clean_x, skip_submodule_update, is_root,
+        )
 
-        ignored_untracked_paths = ignored_root_untracked_paths if is_root else ()
-        if self.merge_in_progress(repo_path) or self.working_tree_has_changes(
-            repo_path,
-            ignored_untracked_paths=ignored_untracked_paths,
-            ignored_paths=ignored_dirty_paths,
-        ):
-            if resolved_repo_path in preserved_dirty_repos and not self.merge_in_progress(repo_path):
+        tried: list[str] = []
+        for level_name, steps in levels:
+            success = self._try_cleanup_level(
+                repo_path,
+                level_name,
+                steps,
+                result,
+                ignored_paths=ignored_dirty_paths,
+            )
+            tried.append(level_name)
+            if success:
                 return
-            result.not_clean_repos.append(repo_path)
-            raise self._automation_error(f"Repository is still not clean after cleanup: {repo_path}")
+
+        # all levels failed — build a detailed error message
+        detail_lines = "\n".join(f"  - {name}" for name in tried)
+        allow_x_hint = ""
+        if not allow_clean_x:
+            allow_x_hint = "\n  3. Re-run with --allow-clean-x to let git clean remove ignored files."
+        raise self._automation_error(
+            f"Cleanup failed for repository: {repo_path}\n"
+            f"All cleanup levels exhausted:\n{detail_lines}\n\n"
+            "Manual recovery options:\n"
+            f"  1. cd {repo_path}\n"
+            "  2. git status  # inspect the remaining untracked/ignored files\n"
+            + allow_x_hint +
+            f"\n  4. If still failing, manually delete and re-clone this repository."
+        )
+
+    def _try_cleanup_level(
+        self,
+        repo_path: Path,
+        level_name: str,
+        steps: list[cleanup_steps.CleanupStep],
+        result: Any,
+        *,
+        ignored_paths: set[str] = frozenset(),
+    ) -> bool:
+        """Execute one cleanup level; return True if the repo is clean afterward."""
+        for step in steps:
+            step_result = self.run_cleanup_step(repo_path, step, check=False, stream_output=self._verbose())
+            if step_result.returncode != 0 and not step.allow_failure:
+                self._verbose_print(f"[cleanup] {level_name}: step failed: {' '.join(step.args)}")
+                return False
+
+        if self.merge_in_progress(repo_path):
+            return False
+        if self.working_tree_has_changes(repo_path, ignored_paths=ignored_paths):
+            return False
+        return True
+
+    def _build_cleanup_levels(
+        self,
+        repo_path: Path,
+        submodule_paths: list[str],
+        allow_clean_x: bool,
+        skip_submodule_update: bool,
+        is_root: bool,
+    ) -> list[tuple[str, list[cleanup_steps.CleanupStep]]]:
+        """Build the ordered list of cleanup levels for a single repository."""
+        levels: list[tuple[str, list[cleanup_steps.CleanupStep]]] = []
+
+        # Level 1 — basic (matching the original single-level behaviour)
+        level1: list[cleanup_steps.CleanupStep] = [
+            cleanup_steps.abort_operation_step("merge"),
+            cleanup_steps.abort_operation_step("rebase"),
+            cleanup_steps.abort_operation_step("cherry-pick"),
+            cleanup_steps.reset_merge_step(),
+            cleanup_steps.reset_hard_step("HEAD"),
+            cleanup_steps.clean_step(allow_clean_x),
+        ]
+        if not skip_submodule_update and is_root:
+            level1.append(cleanup_steps.submodule_update_step())
+        levels.append(("level_1_basic", level1))
+
+        # Level 2 — remove nested git repos too
+        level2: list[cleanup_steps.CleanupStep] = [
+            cleanup_steps.abort_operation_step("merge"),
+            cleanup_steps.abort_operation_step("rebase"),
+            cleanup_steps.abort_operation_step("cherry-pick"),
+            cleanup_steps.reset_merge_step(),
+            cleanup_steps.reset_hard_step("HEAD"),
+            cleanup_steps.clean_step(allow_clean_x, remove_nested_git_repos=True),
+        ]
+        if not skip_submodule_update and is_root:
+            level2.append(cleanup_steps.submodule_update_step())
+        levels.append(("level_2_delete_nested_git", level2))
+
+        # Level 3 — foreach-abort and foreach-clean
+        level3: list[cleanup_steps.CleanupStep] = [
+            cleanup_steps.abort_operation_step("merge"),
+            cleanup_steps.abort_operation_step("rebase"),
+            cleanup_steps.abort_operation_step("cherry-pick"),
+            cleanup_steps.foreach_abort_operation_step("merge"),
+            cleanup_steps.foreach_abort_operation_step("rebase"),
+            cleanup_steps.foreach_abort_operation_step("cherry-pick"),
+            cleanup_steps.reset_hard_step("HEAD"),
+            cleanup_steps.clean_step(allow_clean_x, remove_nested_git_repos=True),
+            cleanup_steps.foreach_reset_hard_step(),
+            cleanup_steps.foreach_clean_step(allow_clean_x, remove_nested_git_repos=True),
+        ]
+        if not skip_submodule_update and is_root:
+            level3.append(cleanup_steps.submodule_update_step())
+        levels.append(("level_3_foreach_abort_and_clean", level3))
+
+        # Level 4 — deep submodule cleanup (per-submodule fetch + reset + clean)
+        if submodule_paths:
+            deep_steps = cleanup_steps.ci_deep_submodule_cleanup_steps(
+                repo_path, submodule_paths, allow_clean_x,
+            )
+            level4: list[cleanup_steps.CleanupStep] = [
+                cleanup_steps.abort_operation_step("merge"),
+                cleanup_steps.abort_operation_step("rebase"),
+                cleanup_steps.abort_operation_step("cherry-pick"),
+                cleanup_steps.reset_merge_step(),
+                cleanup_steps.reset_hard_step("HEAD"),
+                *deep_steps,
+                cleanup_steps.clean_step(allow_clean_x, remove_nested_git_repos=True),
+            ]
+            if not skip_submodule_update and is_root:
+                level4.append(cleanup_steps.submodule_update_step())
+            levels.append(("level_4_deep_submodule_cleanup", level4))
+
+        return levels
 
     def restore_snapshot(self, repo_path: Path, snapshots: dict[Path, Any], *, is_root: bool) -> None:
         self.ensure_git_repo(repo_path)

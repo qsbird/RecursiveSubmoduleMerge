@@ -1,0 +1,48 @@
+diff --git a/src/context_demo.c b/src/context_demo.c
+index 1111111..2222222 100644
+--- a/src/context_demo.c
++++ b/src/context_demo.c
+@@ -1,43 +1,43 @@
+ #include "context_demo.h"
+ 
+ static int clamp_positive(int value)
+ {
+     if (value < 0) {
+         return 0;
+     }
+     return value;
+ }
+ 
+ static int normalize_limit(int value)
+ {
+     int clamped = clamp_positive(value);
+     if (clamped > 64) {
+         return 64;
+     }
+     return clamped;
+ }
+ 
+ static int finalize_score(int total)
+ {
+     if (total > 1000) {
+         return 1000;
+     }
+     return total;
+ }
+ 
+ int compute_score(int value)
+ {
+     int limit = normalize_limit(value);
+     int total = 0;
+     for (int i = 0; i < limit; ++i) {
+-        total += i * 2;
++        total += i * 3;
+     }
+     return finalize_score(total);
+ }
+ 
+ int score_with_bonus(int value, int bonus)
+ {
+     int base = compute_score(value);
+     return finalize_score(base + bonus);
+ }

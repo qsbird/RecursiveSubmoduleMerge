@@ -97,9 +97,13 @@ def normalize_user_merge_ref(ref: str) -> str:
 
 
 def remote_tracking_ref(ref: str) -> str:
-    remote, _, remote_branch = ref.partition("/")
+    normalized = ref.strip()
+    # Already a fully-qualified ref — return as-is.
+    if normalized.startswith("refs/"):
+        return normalized
+    remote, _, remote_branch = normalized.partition("/")
     if not remote_branch:
-        return ref
+        return normalized
     return f"refs/remotes/{remote}/{remote_branch}"
 
 

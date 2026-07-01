@@ -80,6 +80,7 @@ class JsonReport:
                 "git_network_retries": getattr(args, "git_network_retries", 2),
                 "git_network_retry_delay": getattr(args, "git_network_retry_delay", 3.0),
                 "diff_context_lines": args.diff_context_lines,
+                "expanded_diff_context_lines": getattr(args, "expanded_diff_context_lines", 20),
                 "allow_clean_x": bool(args.allow_clean_x),
                 "console_log": bool(args.console_log),
                 "allow_create_publish_target": bool(getattr(args, "allow_create_publish_target", False)),
@@ -111,7 +112,7 @@ class JsonReport:
                 "failure_step": None,
                 "steps": [],
                 "manual_publish": None,
-                "failure_mode": getattr(args, "batch_failure_mode", "fail-fast"),
+                "failure_mode": getattr(args, "batch_failure_mode", "continue-success"),
                 "status": None,
                 "successful_steps": [],
                 "failed_steps": [],
@@ -209,6 +210,31 @@ class JsonReport:
                     "timestamp": now_iso(),
                 }
             )
+
+    @staticmethod
+    def _json_safe_log_value(value: Any) -> Any:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(key): JsonReport._json_safe_log_value(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [JsonReport._json_safe_log_value(item) for item in value]
+        return value
+
+    def add_logic_event(
+        self,
+        name: str,
+        message: str,
+        *,
+        repo_path: str | Path | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        repo_text = f" repo={repo_path}" if repo_path is not None else ""
+        self.append_log(f"\n[{now_iso()}] LOGIC {name}{repo_text} {message}\n")
+        if details:
+            safe_details = self._json_safe_log_value(details)
+            self.append_log(json.dumps(safe_details, ensure_ascii=False, sort_keys=True) + "\n")
+        self.console(f"LOGIC {name}{repo_text} {message}")
 
     def console(self, message: str) -> None:
         if not self.console_log:
@@ -408,7 +434,7 @@ class GitRunner:
         patterns = (
             ("GIT_NETWORK_DNS_FAILED", (r"could not resolve host", r"name or service not known", r"temporary failure in name resolution")),
             ("GIT_NETWORK_CONNECT_FAILED", (r"failed to connect", r"connection timed out", r"connection refused", r"couldn't connect")),
-            ("GIT_NETWORK_CONNECTION_RESET", (r"connection reset", r"connection was reset", r"connection aborted")),
+            ("GIT_NETWORK_CONNECTION_RESET", (r"connection reset", r"connection was reset", r"connection aborted", r"connection closed")),
             ("GIT_NETWORK_REMOTE_CLOSED", (r"remote end hung up", r"the remote end hung up", r"early eof", r"unexpected disconnect")),
             ("GIT_NETWORK_TLS_FAILED", (r"ssl.*(error|failed)", r"tls.*(error|failed)", r"gnutls recv error")),
             ("GIT_NETWORK_HTTP_TRANSIENT", (r"http code = 50[0234]", r"the requested url returned error: 50[0234]", r"bad gateway", r"service unavailable", r"gateway timeout")),
@@ -687,6 +713,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help="number of unchanged context lines to include in exported patch files",
     )
+    parser.add_argument(
+        "--expanded_diff_context_lines",
+        type=int,
+        default=20,
+        help="number of unchanged context lines to include in expanded patch files for review HTML",
+    )
     parser.add_argument("--allow_clean_x", type=common.parse_bool, default=False, help="allow git clean -fdx")
     parser.add_argument("--publish", type=common.parse_bool, default=False, help="publish result to target branch")
     parser.add_argument("--publish_only", type=common.parse_bool, default=False, help="publish a previously generated merge report without merging")
@@ -711,7 +743,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--batch_failure_mode",
         choices=("fail-fast", "continue-success"),
-        default="fail-fast",
+        default="continue-success",
         help="how repeated --source batch merges behave after a step fails",
     )
     parser.add_argument(
@@ -782,14 +814,6 @@ def validate_args(args: argparse.Namespace) -> None:
             "--source is not used with --publish_only; use --from_report instead",
             details={"sources": args.sources, "from_report": args.from_report},
         )
-    if not args.publish_only and len(getattr(args, "sources", []) or []) > 1 and args.publish:
-        raise CiMergeError(
-            ExitCode.ARGUMENT_ERROR,
-            Phase.INIT,
-            "BATCH_PUBLISH_UNSUPPORTED",
-            "publishing is not supported when multiple --source values are provided",
-            details={"sources": args.sources, "target": args.target},
-        )
     if args.timeout <= 0:
         raise CiMergeError(
             ExitCode.ARGUMENT_ERROR,
@@ -833,6 +857,18 @@ def validate_args(args: argparse.Namespace) -> None:
             "INVALID_DIFF_CONTEXT_LINES",
             "--diff_context_lines must be greater than or equal to 0",
             details={"diff_context_lines": args.diff_context_lines},
+        )
+    expanded_diff_context_lines = getattr(args, "expanded_diff_context_lines", 20)
+    if expanded_diff_context_lines < args.diff_context_lines:
+        raise CiMergeError(
+            ExitCode.ARGUMENT_ERROR,
+            Phase.INIT,
+            "INVALID_EXPANDED_DIFF_CONTEXT_LINES",
+            "--expanded_diff_context_lines must be greater than or equal to --diff_context_lines",
+            details={
+                "diff_context_lines": args.diff_context_lines,
+                "expanded_diff_context_lines": expanded_diff_context_lines,
+            },
         )
     if args.publish and args.publish_mode != "force-with-lease":
         raise CiMergeError(

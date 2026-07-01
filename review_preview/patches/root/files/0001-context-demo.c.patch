@@ -1,0 +1,13 @@
+diff --git a/src/context_demo.c b/src/context_demo.c
+index 1111111..2222222 100644
+--- a/src/context_demo.c
++++ b/src/context_demo.c
+@@ -30,9 +30,9 @@ int compute_score(int value)
+     int limit = normalize_limit(value);
+     int total = 0;
+     for (int i = 0; i < limit; ++i) {
+-        total += i * 2;
++        total += i * 3;
+     }
+     return finalize_score(total);
+ }

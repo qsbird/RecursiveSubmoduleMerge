@@ -223,6 +223,58 @@ def artifact_category_dir(ctx: Any, category: str) -> Path:
     return root
 
 
+def artifact_prefix(ctx: Any) -> str:
+    merge_step = getattr(ctx, "merge_step", None)
+    return str(getattr(merge_step, "artifact_prefix", None) or "")
+
+
+def repository_diff_export_key(ctx: Any, repo_path: Path, ours_sha: str, result_sha: str) -> tuple[str, str, str, str]:
+    return (
+        artifact_prefix(ctx),
+        str(repo_path.resolve(strict=False)),
+        str(ours_sha),
+        str(result_sha),
+    )
+
+
+def repository_diff_export_keys(ctx: Any) -> set[tuple[str, str, str, str]]:
+    keys = getattr(ctx, "_ci_report_repository_diff_export_keys", None)
+    if keys is None:
+        keys = set()
+        setattr(ctx, "_ci_report_repository_diff_export_keys", keys)
+    return keys
+
+
+def reserve_repository_diff_export(ctx: Any, repo_path: Path, ours_sha: str, result_sha: str) -> bool:
+    key = repository_diff_export_key(ctx, repo_path, ours_sha, result_sha)
+    keys = repository_diff_export_keys(ctx)
+    if key in keys:
+        return False
+    keys.add(key)
+    return True
+
+
+def duplicate_repository_record(
+    repo_path: Path,
+    display_path: str,
+    base_sha: str | None,
+    ours_sha: str,
+    theirs_sha: str,
+    result_sha: str,
+    strategy: str,
+) -> dict[str, Any]:
+    return {
+        "path": display_path,
+        "repo_path": str(repo_path),
+        "base": base_sha,
+        "ours": ours_sha,
+        "theirs": theirs_sha,
+        "result": result_sha,
+        "strategy": strategy,
+        "duplicate_export_skipped": True,
+    }
+
+
 def write_patch_file(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8", newline="")
@@ -237,8 +289,13 @@ def patch_pathspecs(changed_file: dict[str, str]) -> list[str]:
     return specs
 
 
-def diff_context_arg(ctx: Any) -> str:
-    return f"--unified={ctx.args.diff_context_lines}"
+def expanded_diff_context_lines(ctx: Any) -> int:
+    return int(getattr(ctx.args, "expanded_diff_context_lines", 20))
+
+
+def diff_context_arg(ctx: Any, context_lines: int | None = None) -> str:
+    lines = ctx.args.diff_context_lines if context_lines is None else context_lines
+    return f"--unified={lines}"
 
 
 def export_patch(
@@ -248,6 +305,8 @@ def export_patch(
     output_path: Path,
     warnings: list[dict[str, Any]],
     reason: str,
+    *,
+    context_lines: int | None = None,
 ) -> dict[str, Any] | None:
     result = ctx.runner.run(repo_path, args, allow_failure=True)
     if result.exit_code != 0:
@@ -268,7 +327,7 @@ def export_patch(
         "path": str(output_path),
         "relative_path": relative_output_path(ctx, output_path),
         "size_bytes": output_path.stat().st_size,
-        "context_lines": ctx.args.diff_context_lines,
+        "context_lines": ctx.args.diff_context_lines if context_lines is None else context_lines,
     }
 
 
@@ -284,6 +343,8 @@ def export_repository_patches(
     repo_name = common.sanitize_patch_name(display_path, "root")
     patch_root = artifact_category_dir(ctx, "patches") / repo_name
     diff_range = f"{ours_sha}..{result_sha}"
+    compact_context_lines = int(ctx.args.diff_context_lines)
+    expanded_context_lines = expanded_diff_context_lines(ctx)
     repo_patch_path = patch_root / "repository.patch"
     repo_patch = export_patch(
         ctx,
@@ -292,9 +353,28 @@ def export_repository_patches(
         repo_patch_path,
         warnings,
         "REPOSITORY_PATCH_EXPORT_FAILED",
+        context_lines=compact_context_lines,
+    )
+    repo_expanded_patch_path = patch_root / "repository-expanded.patch"
+    repo_expanded_patch = export_patch(
+        ctx,
+        repo_path,
+        [
+            "diff",
+            "--no-ext-diff",
+            "--binary",
+            "--find-renames",
+            diff_context_arg(ctx, expanded_context_lines),
+            diff_range,
+        ],
+        repo_expanded_patch_path,
+        warnings,
+        "REPOSITORY_EXPANDED_PATCH_EXPORT_FAILED",
+        context_lines=expanded_context_lines,
     )
 
     file_patches: list[dict[str, Any]] = []
+    expanded_file_patches: list[dict[str, Any]] = []
     files_dir = patch_root / "files"
     for index, changed_file in enumerate(changed_files, start=1):
         specs = patch_pathspecs(changed_file)
@@ -316,10 +396,31 @@ def export_repository_patches(
             file_patch_path,
             warnings,
             "FILE_PATCH_EXPORT_FAILED",
+            context_lines=compact_context_lines,
+        )
+        expanded_file_patch_path = files_dir / f"{index:04d}-{file_name}.expanded.patch"
+        expanded_file_patch = export_patch(
+            ctx,
+            repo_path,
+            [
+                "diff",
+                "--no-ext-diff",
+                "--binary",
+                "--find-renames",
+                diff_context_arg(ctx, expanded_context_lines),
+                diff_range,
+                "--",
+                *specs,
+            ],
+            expanded_file_patch_path,
+            warnings,
+            "FILE_EXPANDED_PATCH_EXPORT_FAILED",
+            context_lines=expanded_context_lines,
         )
         if file_patch:
             changed_file["patch_path"] = file_patch["path"]
             changed_file["patch_relative_path"] = file_patch["relative_path"]
+            changed_file["patch_context_lines"] = file_patch["context_lines"]
             file_patch.update(
                 {
                     "status": changed_file.get("status"),
@@ -328,8 +429,25 @@ def export_repository_patches(
                 }
             )
             file_patches.append(file_patch)
+        if expanded_file_patch:
+            changed_file["expanded_patch_path"] = expanded_file_patch["path"]
+            changed_file["expanded_patch_relative_path"] = expanded_file_patch["relative_path"]
+            changed_file["expanded_patch_context_lines"] = expanded_file_patch["context_lines"]
+            expanded_file_patch.update(
+                {
+                    "status": changed_file.get("status"),
+                    "path": changed_file.get("path"),
+                    "old_path": changed_file.get("old_path"),
+                }
+            )
+            expanded_file_patches.append(expanded_file_patch)
 
-    return {"repository": repo_patch, "files": file_patches}
+    return {
+        "repository": repo_patch,
+        "repository_expanded": repo_expanded_patch,
+        "files": file_patches,
+        "expanded_files": expanded_file_patches,
+    }
 
 
 def changed_file_primary_path(changed_file: dict[str, str], fallback: str) -> str:
@@ -464,6 +582,176 @@ def export_changed_file_artifacts(
     return {"files": files}
 
 
+def parse_changed_gitlink_raw_diff(stdout: str, warnings: list[dict[str, Any]], repo_path: Path) -> list[dict[str, str]]:
+    changes: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for line in common.split_lines(stdout):
+        if not line.startswith(":") or "\t" not in line:
+            warnings.append({"reason": "GITLINK_DIFF_RAW_UNPARSEABLE", "repo_path": str(repo_path), "line": line})
+            continue
+        meta, path_text = line[1:].split("\t", 1)
+        fields = meta.split()
+        if len(fields) < 5:
+            warnings.append({"reason": "GITLINK_DIFF_RAW_UNPARSEABLE", "repo_path": str(repo_path), "line": line})
+            continue
+        old_mode, new_mode, old_sha, new_sha, status = fields[:5]
+        paths = [part.strip() for part in path_text.split("\t") if part.strip()]
+        path = paths[-1] if paths else ""
+        if not path:
+            warnings.append({"reason": "GITLINK_DIFF_PATH_MISSING", "repo_path": str(repo_path), "line": line})
+            continue
+        status_letter = status[:1]
+        if old_mode == "160000" and new_mode == "160000" and status_letter == "M" and old_sha != new_sha:
+            key = (path, old_sha, new_sha)
+            if key in seen:
+                continue
+            seen.add(key)
+            changes.append(
+                {
+                    "path": path,
+                    "old_sha": old_sha,
+                    "new_sha": new_sha,
+                    "old_mode": old_mode,
+                    "new_mode": new_mode,
+                    "status": status,
+                }
+            )
+        elif "160000" in {old_mode, new_mode}:
+            warnings.append(
+                {
+                    "reason": "GITLINK_DIFF_TOPOLOGY_SKIPPED",
+                    "repo_path": str(repo_path),
+                    "path": path,
+                    "status": status,
+                    "old_mode": old_mode,
+                    "new_mode": new_mode,
+                    "old_sha": old_sha,
+                    "new_sha": new_sha,
+                }
+            )
+    return changes
+
+
+def collect_changed_gitlink_diffs(
+    ctx: Any,
+    repo_path: Path,
+    ours_sha: str,
+    result_sha: str,
+    warnings: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    raw = ctx.runner.run(
+        repo_path,
+        ["diff", "--raw", "--no-abbrev", ours_sha, result_sha, "--"],
+        allow_failure=True,
+    )
+    if raw.exit_code != 0:
+        warnings.append({"reason": "GITLINK_DIFF_SCAN_FAILED", "repo_path": str(repo_path), "command": raw.to_dict()})
+        return []
+    return parse_changed_gitlink_raw_diff(raw.stdout, warnings, repo_path)
+
+
+def mark_changed_gitlink_files(
+    changed_files: list[dict[str, str]],
+    gitlink_changes: list[dict[str, str]],
+) -> None:
+    changes_by_path = {change.get("path"): change for change in gitlink_changes if change.get("path")}
+    for changed_file in changed_files:
+        path = changed_file.get("path") or changed_file.get("old_path")
+        change = changes_by_path.get(path)
+        if not change:
+            continue
+        changed_file["kind"] = "gitlink"
+        changed_file["old_sha"] = change.get("old_sha", "")
+        changed_file["new_sha"] = change.get("new_sha", "")
+        changed_file["old_mode"] = change.get("old_mode", "160000")
+        changed_file["new_mode"] = change.get("new_mode", "160000")
+
+
+def report_submodule_diff_max_depth(ctx: Any) -> int:
+    args = getattr(ctx, "args", None)
+    configured = getattr(args, "max_report_submodule_depth", None)
+    if configured is None:
+        configured = getattr(ctx, "max_depth", getattr(args, "max_depth", 16))
+    try:
+        return max(0, int(configured))
+    except (TypeError, ValueError):
+        return 16
+
+
+def export_changed_submodule_diffs(
+    ctx: Any,
+    repo_path: Path,
+    ours_sha: str,
+    result_sha: str,
+    warnings: list[dict[str, Any]],
+    *,
+    depth: int,
+    gitlink_changes: list[dict[str, str]] | None = None,
+) -> None:
+    if depth >= report_submodule_diff_max_depth(ctx):
+        warnings.append(
+            {
+                "reason": "GITLINK_DIFF_DEPTH_EXCEEDED",
+                "repo_path": str(repo_path),
+                "depth": depth,
+                "max_depth": report_submodule_diff_max_depth(ctx),
+            }
+        )
+        return
+
+    changes = (
+        gitlink_changes
+        if gitlink_changes is not None
+        else collect_changed_gitlink_diffs(ctx, repo_path, ours_sha, result_sha, warnings)
+    )
+    for change in changes:
+        sub_repo = common.resolve_path(repo_path / change["path"])
+        if not sub_repo.exists():
+            warnings.append(
+                {
+                    "reason": "GITLINK_DIFF_SUBMODULE_PATH_MISSING",
+                    "repo_path": str(repo_path),
+                    "path": change["path"],
+                    "submodule_repo_path": str(sub_repo),
+                }
+            )
+            continue
+        probe = ctx.runner.run(sub_repo, ["rev-parse", "--is-inside-work-tree"], allow_failure=True)
+        if probe.exit_code != 0 or probe.stdout.strip() != "true":
+            warnings.append(
+                {
+                    "reason": "GITLINK_DIFF_SUBMODULE_NOT_WORKTREE",
+                    "repo_path": str(repo_path),
+                    "path": change["path"],
+                    "submodule_repo_path": str(sub_repo),
+                    "command": probe.to_dict(),
+                }
+            )
+            continue
+        try:
+            collect_repository_details(
+                ctx,
+                sub_repo,
+                display_path_for(ctx, sub_repo),
+                change["old_sha"],
+                change["old_sha"],
+                change["new_sha"],
+                change["new_sha"],
+                "gitlink_update",
+                _submodule_diff_depth=depth + 1,
+            )
+        except Exception as exc:  # noqa: BLE001 - report export is best-effort.
+            warnings.append(
+                {
+                    "reason": "GITLINK_DIFF_EXPORT_FAILED",
+                    "repo_path": str(repo_path),
+                    "path": change["path"],
+                    "submodule_repo_path": str(sub_repo),
+                    "message": str(exc),
+                }
+            )
+
+
 def collect_repository_details(
     ctx: Any,
     repo_path: Path,
@@ -473,7 +761,13 @@ def collect_repository_details(
     theirs_sha: str,
     result_sha: str,
     strategy: str,
+    *,
+    _submodule_diff_depth: int = 0,
 ) -> dict[str, Any]:
+    repo = repo_path.resolve(strict=False)
+    if not reserve_repository_diff_export(ctx, repo, ours_sha, result_sha):
+        return duplicate_repository_record(repo, display_path, base_sha, ours_sha, theirs_sha, result_sha, strategy)
+
     ctx.set_state(Phase.COLLECTING_REPORT)
     commits: list[dict[str, str]] = []
     changed_files: list[dict[str, str]] = []
@@ -482,7 +776,7 @@ def collect_repository_details(
 
     if base_sha:
         log = ctx.runner.run(
-            repo_path,
+            repo,
             ["log", "--pretty=format:%H%x09%an%x09%ae%x09%aI%x09%s", f"{base_sha}..{result_sha}"],
             allow_failure=True,
         )
@@ -491,21 +785,24 @@ def collect_repository_details(
         else:
             warnings.append({"reason": "COMMIT_LOG_FAILED", "command": log.to_dict()})
 
-    stat = ctx.runner.run(repo_path, ["diff", "--stat", "--find-renames", f"{ours_sha}..{result_sha}"], allow_failure=True)
+    stat = ctx.runner.run(repo, ["diff", "--stat", "--find-renames", f"{ours_sha}..{result_sha}"], allow_failure=True)
     if stat.exit_code == 0:
         diff_stat = stat.stdout
     else:
         warnings.append({"reason": "DIFF_STAT_FAILED", "command": stat.to_dict()})
 
-    names = ctx.runner.run(repo_path, ["diff", "--name-status", "--find-renames", f"{ours_sha}..{result_sha}"], allow_failure=True)
+    names = ctx.runner.run(repo, ["diff", "--name-status", "--find-renames", f"{ours_sha}..{result_sha}"], allow_failure=True)
     if names.exit_code == 0:
         changed_files = common.parse_name_status(names.stdout)
     else:
         warnings.append({"reason": "CHANGED_FILES_FAILED", "command": names.to_dict()})
 
+    gitlink_changes = collect_changed_gitlink_diffs(ctx, repo, ours_sha, result_sha, warnings)
+    mark_changed_gitlink_files(changed_files, gitlink_changes)
+
     patches = export_repository_patches(
         ctx,
-        repo_path,
+        repo,
         display_path,
         ours_sha,
         result_sha,
@@ -514,7 +811,7 @@ def collect_repository_details(
     )
     content_artifacts = export_changed_file_artifacts(
         ctx,
-        repo_path,
+        repo,
         display_path,
         ours_sha,
         result_sha,
@@ -524,7 +821,7 @@ def collect_repository_details(
 
     repository = {
         "path": display_path,
-        "repo_path": str(repo_path),
+        "repo_path": str(repo),
         "base": base_sha,
         "ours": ours_sha,
         "theirs": theirs_sha,
@@ -535,9 +832,26 @@ def collect_repository_details(
         "diff_stat": diff_stat,
         "patch_path": patches["repository"]["path"] if patches.get("repository") else None,
         "patch_relative_path": patches["repository"]["relative_path"] if patches.get("repository") else None,
+        "patch_context_lines": patches["repository"]["context_lines"] if patches.get("repository") else None,
+        "expanded_patch_path": patches["repository_expanded"]["path"] if patches.get("repository_expanded") else None,
+        "expanded_patch_relative_path": (
+            patches["repository_expanded"]["relative_path"] if patches.get("repository_expanded") else None
+        ),
+        "expanded_patch_context_lines": (
+            patches["repository_expanded"]["context_lines"] if patches.get("repository_expanded") else None
+        ),
         "patches": patches,
         "content_artifacts": content_artifacts,
         "warnings": warnings,
     }
     ctx.report.add_repository(repository)
+    export_changed_submodule_diffs(
+        ctx,
+        repo,
+        ours_sha,
+        result_sha,
+        warnings,
+        depth=_submodule_diff_depth,
+        gitlink_changes=gitlink_changes,
+    )
     return repository

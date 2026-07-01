@@ -8,6 +8,7 @@ with the local manual_merge_split package.
 from __future__ import annotations
 
 import argparse
+import json
 import locale
 import os
 import queue
@@ -18,6 +19,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from manual_merge_split.repository_ops import (
+    RISK_CONFIRMATION_EVENT_PREFIX,
+    RISK_CONFIRMATION_PROTOCOL_ENV,
+    RISK_CONFIRMATION_PROTOCOL_VERSION,
+)
 from manual_merge_split.window_icon import apply_window_icon
 from subprocess_window import hidden_subprocess_kwargs
 
@@ -179,6 +185,10 @@ UI_TEXT: dict[str, dict[str, str]] = {
         LANGUAGE_EN: "Conflict tool timed out; stopping...",
         LANGUAGE_ZH: "冲突工具超时，正在停止...",
     },
+    "status_waiting_risk_confirmation": {
+        LANGUAGE_EN: "Waiting for risk confirmation...",
+        LANGUAGE_ZH: "\u7b49\u5f85\u98ce\u9669\u786e\u8ba4...",
+    },
     "status_completed": {LANGUAGE_EN: "Completed", LANGUAGE_ZH: "已完成"},
     "status_failed": {
         LANGUAGE_EN: "Failed with exit code {exit_code}",
@@ -243,6 +253,32 @@ UI_TEXT: dict[str, dict[str, str]] = {
     "log_send_confirmation_failed": {
         LANGUAGE_EN: "\nCould not send confirmation: {error}\n",
         LANGUAGE_ZH: "\n无法发送确认：{error}\n",
+    },
+    "message_risk_confirmation_title": {
+        LANGUAGE_EN: "Risk Confirmation",
+        LANGUAGE_ZH: "\u98ce\u9669\u786e\u8ba4",
+    },
+    "message_risk_confirmation_body": {
+        LANGUAGE_EN: (
+            "{message}\n\n"
+            "Reason: {reason}\n\n"
+            "{details}\n\n"
+            "Continuing may overwrite, hide, or mix local changes. Continue?"
+        ),
+        LANGUAGE_ZH: (
+            "{message}\n\n"
+            "\u539f\u56e0\uff1a{reason}\n\n"
+            "{details}\n\n"
+            "\u7ee7\u7eed\u64cd\u4f5c\u53ef\u80fd\u8986\u76d6\u3001\u9690\u85cf\u6216\u6df7\u5165\u672c\u5730\u4fee\u6539\u3002\u662f\u5426\u7ee7\u7eed\uff1f"
+        ),
+    },
+    "log_risk_confirmed": {
+        LANGUAGE_EN: "\nRisk confirmed by user; continuing.\n",
+        LANGUAGE_ZH: "\n\u7528\u6237\u5df2\u786e\u8ba4\u98ce\u9669\uff0c\u7ee7\u7eed\u6267\u884c\u3002\n",
+    },
+    "log_risk_rejected": {
+        LANGUAGE_EN: "\nRisk rejected by user; stopping this operation.\n",
+        LANGUAGE_ZH: "\n\u7528\u6237\u62d2\u7edd\u98ce\u9669\uff0c\u505c\u6b62\u672c\u6b21\u64cd\u4f5c\u3002\n",
     },
     "log_finished": {
         LANGUAGE_EN: "\nCommand finished with exit code {exit_code}.\n",
@@ -320,6 +356,8 @@ def format_friendly_output_line(line: str, language: str = LANGUAGE_EN) -> str:
         return f"{stripped}{newline}"
     if CONFLICT_TOOL_CONFIRMATION_MESSAGE in stripped:
         return localized_text("friendly_conflict_closed", language)
+    if stripped.startswith(RISK_CONFIRMATION_EVENT_PREFIX):
+        return ""
     if "conflict tool timed out after" in lower:
         return localized_text("friendly_conflict_timeout", language)
     if stripped.startswith("Merge stopped on branch"):
@@ -338,7 +376,7 @@ def format_friendly_output_line(line: str, language: str = LANGUAGE_EN) -> str:
         return localized_text("friendly_publish_success", language)
     if stripped.startswith("Publish check completed successfully."):
         return localized_text("friendly_publish_check_success", language)
-    if lower.startswith(("fatal:", "error:", "failed", "merge preflight found", "cannot ")):
+    if lower.startswith(("fatal:", "error:", "failed", "merge preflight found", "cannot ", "vs code command")):
         return localized_text("friendly_error", language, message=stripped).rstrip("\n") + newline
     return line
 
@@ -361,6 +399,13 @@ class CommandSpec:
 class CloneSpec:
     command: list[str]
     target_path: Path
+
+
+@dataclass(frozen=True)
+class RiskConfirmationEvent:
+    reason: str
+    message: str
+    details: dict[str, Any]
 
 
 def _string_value(values: dict[str, Any], key: str, default: str = "") -> str:
@@ -406,6 +451,50 @@ def parse_branch_tokens(raw_value: str) -> list[str]:
 def text_lines(raw_value: str) -> list[str]:
     normalized = raw_value.replace("\r", "\n")
     return [line.strip() for line in normalized.splitlines() if line.strip()]
+
+
+def parse_risk_confirmation_event(line: str) -> RiskConfirmationEvent | None:
+    stripped = line.strip()
+    if not stripped.startswith(RISK_CONFIRMATION_EVENT_PREFIX):
+        return None
+
+    raw_payload = stripped.removeprefix(RISK_CONFIRMATION_EVENT_PREFIX).strip()
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError:
+        return None
+
+    if payload.get("protocol") != RISK_CONFIRMATION_PROTOCOL_VERSION:
+        return None
+
+    details = payload.get("details")
+    return RiskConfirmationEvent(
+        reason=str(payload.get("reason") or "UNKNOWN_RISK"),
+        message=str(payload.get("message") or "A risky operation requires confirmation."),
+        details=details if isinstance(details, dict) else {},
+    )
+
+
+def format_risk_confirmation_details(details: dict[str, Any], *, max_items: int = 30) -> str:
+    lines: list[str] = []
+    remaining = max_items
+    for key, value in details.items():
+        if value in (None, "", [], (), {}):
+            continue
+        label = str(key)
+        if isinstance(value, list):
+            lines.append(f"{label}:")
+            for item in value[:remaining]:
+                lines.append(f"  - {item}")
+            if len(value) > remaining:
+                lines.append("  - ...")
+            remaining -= min(len(value), remaining)
+        else:
+            lines.append(f"{label}: {value}")
+        if remaining <= 0:
+            lines.append("...")
+            break
+    return "\n".join(lines) if lines else "No additional details."
 
 
 def clone_target_path(destination: str | Path, directory_name: str) -> Path:
@@ -611,9 +700,11 @@ def add_git_config_env(env: dict[str, str], key: str, value: str) -> None:
     env["GIT_CONFIG_COUNT"] = str(index + 1)
 
 
-def git_safe_directory_env(repo: str | Path) -> dict[str, str]:
+def git_safe_directory_env(repo: str | Path, *, enable_risk_confirmation_protocol: bool = False) -> dict[str, str]:
     env = os.environ.copy()
     add_git_config_env(env, "safe.directory", safe_directory_value(repo))
+    if enable_risk_confirmation_protocol:
+        env[RISK_CONFIRMATION_PROTOCOL_ENV] = RISK_CONFIRMATION_PROTOCOL_VERSION
     return env
 
 
@@ -1023,6 +1114,8 @@ class MergeGuiApp:
         self._build_cleanup_tab()
         self._build_publish_tab()
         self._build_output(right)
+
+        self._apply_saved_config()
 
     def _build_merge_tab(self) -> None:
         ttk = self.ttk
@@ -1512,7 +1605,7 @@ class MergeGuiApp:
             encoding=locale.getpreferredencoding(False) or "utf-8",
             errors="replace",
             bufsize=1,
-            env=git_safe_directory_env(self.repo_var.get()),
+            env=git_safe_directory_env(self.repo_var.get(), enable_risk_confirmation_protocol=True),
             **hidden_subprocess_kwargs(),
         )
         self.reader_thread = threading.Thread(target=self._read_process_output, args=(self.process,), daemon=True)
@@ -1603,6 +1696,29 @@ class MergeGuiApp:
         self._set_confirmation_buttons("disabled")
         self._set_status("status_running")
 
+    def _handle_risk_confirmation_event(self, event: RiskConfirmationEvent) -> None:
+        from tkinter import messagebox
+
+        self._set_confirmation_buttons("disabled")
+        self._set_status("status_waiting_risk_confirmation")
+        details = format_risk_confirmation_details(event.details)
+        confirmed = messagebox.askyesno(
+            self._t("message_risk_confirmation_title"),
+            self._t(
+                "message_risk_confirmation_body",
+                reason=event.reason,
+                message=event.message,
+                details=details,
+            ),
+            parent=self.root,
+        )
+        if confirmed:
+            self._append_log(self._t("log_risk_confirmed"))
+            self._send_process_input("y\n")
+            return
+        self._append_log(self._t("log_risk_rejected"))
+        self._send_process_input("n\n")
+
     def _drain_events(self) -> None:
         try:
             while True:
@@ -1610,7 +1726,10 @@ class MergeGuiApp:
                 if kind == "log":
                     line = str(payload)
                     self._append_log(line, friendly=format_friendly_output(line, self.language_var.get()))
-                    if CONFLICT_TOOL_CONFIRMATION_MESSAGE in line:
+                    risk_event = parse_risk_confirmation_event(line)
+                    if risk_event is not None:
+                        self._handle_risk_confirmation_event(risk_event)
+                    elif CONFLICT_TOOL_CONFIRMATION_MESSAGE in line:
                         self._set_confirmation_buttons("normal")
                         self._set_status("status_waiting_conflict")
                     elif "conflict tool timed out after" in line.lower():
@@ -1704,6 +1823,62 @@ class MergeGuiApp:
             if label == selected_label:
                 self.repo_var.set(path)
                 return
+
+    def _apply_saved_config(self) -> None:
+        """Pre-fill GUI form fields with values from the last successful run."""
+        try:
+            from manual_merge_split.config_persistence import load_config
+        except Exception:
+            return
+
+        config = load_config()
+        last_cmd = config.last_command
+
+        # --- Merge tab ---
+        mc = config.merge
+        if mc.repo and mc.repo != ".":
+            self.repo_var.set(mc.repo)
+        if mc.base_remote_branch:
+            self.base_remote_branch_var.set(mc.base_remote_branch)
+        if mc.work_branch:
+            self.work_branch_var.set(mc.work_branch)
+        if mc.merge_branches:
+            self.merge_branches_text.delete("1.0", "end")
+            self.merge_branches_text.insert("1.0", "\n".join(mc.merge_branches))
+        if mc.continue_current_branch:
+            self.branch_mode_var.set("continue")
+        self.allow_dirty_var.set(mc.allow_dirty_submodules)
+        self.enable_cross_submodule_moves_var.set(mc.enable_cross_submodule_moves)
+        if mc.conflict_tool_command:
+            self.conflict_tool_command_var.set(mc.conflict_tool_command)
+        if mc.conflict_tool_timeout_seconds:
+            self.conflict_tool_timeout_var.set(str(mc.conflict_tool_timeout_seconds))
+
+        # --- Publish tab ---
+        pc = config.publish
+        if pc.remote:
+            self.publish_remote_var.set(pc.remote)
+        if pc.push_target:
+            self.publish_target_var.set(pc.push_target)
+        self.publish_sync_local_branches_var.set(not pc.no_sync_local_branches)
+        self.publish_allow_branch_suffix_var.set(not pc.no_branch_suffix)
+
+        # --- Cleanup tab ---
+        cc = config.cleanup
+        if cc.repo and cc.repo != ".":
+            self.repo_var.set(cc.repo)
+        if cc.work_branch:
+            self.cleanup_work_branch_var.set(cc.work_branch)
+        self.rebuild_work_branch_var.set(cc.rebuild_work_branch)
+        self.skip_submodule_update_var.set(cc.skip_submodule_update)
+
+        # Switch to the last-used tab for convenience
+        if last_cmd == "publish" and hasattr(self, "tabs"):
+            self.tabs.select(self.publish_tab_container)
+        elif last_cmd == "cleanup" and hasattr(self, "tabs"):
+            self.tabs.select(self.cleanup_tab_container)
+
+        self._update_enabled_state()
 
     def _update_enabled_state(self) -> None:
         self._sync_branch_mode_fields()

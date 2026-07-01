@@ -79,6 +79,7 @@ class DirtyRepoAssessment:
     repo_path: Path
     lineage: tuple[str, ...]
     reason: str
+    risk_confirmed: bool = False
 
     @property
     def root_relative_path(self) -> str:
@@ -189,3 +190,15 @@ class CrossSubmoduleMove:
     new_added_commit: str
     move_side: int
     score: float
+
+
+@dataclass
+class PublishCandidate:
+    """A single repository that may need to be pushed during publish."""
+    repo_path: Path
+    display_path: str
+    commit_sha: str
+    remote_before_sha: str | None = None
+    remote_state: str = "unknown"
+    depth: int = 0
+    selected: bool = True

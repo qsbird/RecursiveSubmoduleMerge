@@ -12,7 +12,10 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterable
 
+import sys as _sys
+
 from . import execution
+from .models import PublishCandidate
 from .repository_ops import ManualRepositoryOps
 
 
@@ -162,6 +165,24 @@ def gitlink_sha_at_commit(repo_path: Path, commitish: str, submodule_path: str, 
     return None
 
 
+def first_parent_commit(repo_path: Path, commitish: str, ops: ManualRepositoryOps) -> str | None:
+    result = ops.run_git(repo_path, ["rev-parse", "--verify", f"{commitish}^1^{{commit}}"], check=False)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def gitlink_baseline_sha(
+    repo_path: Path,
+    baseline_sha: str | None,
+    submodule_path: str,
+    ops: ManualRepositoryOps,
+) -> str | None:
+    if not baseline_sha:
+        return None
+    return gitlink_sha_at_commit(repo_path, baseline_sha, submodule_path, ops)
+
+
 def collect_publish_plan(
     repo_path: Path,
     desired_sha: str,
@@ -169,6 +190,8 @@ def collect_publish_plan(
     *,
     display_path: str = ".",
     depth: int = 0,
+    baseline_sha: str | None = None,
+    infer_baseline: bool = True,
     seen: set[tuple[Path, str]] | None = None,
 ) -> list[PublishPlanItem]:
     resolved_repo = repo_path.resolve(strict=False)
@@ -189,12 +212,18 @@ def collect_publish_plan(
             depth=depth,
         )
     ]
+    parent_baseline_sha = (
+        first_parent_commit(repo_path, desired_sha, ops) if infer_baseline and baseline_sha is None else baseline_sha
+    )
     for submodule_path in submodule_paths_at_commit(repo_path, desired_sha, ops):
         child_sha = gitlink_sha_at_commit(repo_path, desired_sha, submodule_path, ops)
         if not child_sha:
             raise ops._automation_error(
                 f"Could not resolve gitlink commit for submodule {submodule_path} at {repo_path}:{desired_sha}"
             )
+        child_baseline_sha = gitlink_baseline_sha(repo_path, parent_baseline_sha, submodule_path, ops)
+        if child_baseline_sha == child_sha:
+            continue
         child_repo = repo_path / submodule_path
         if not child_repo.exists():
             raise ops._automation_error(
@@ -209,6 +238,8 @@ def collect_publish_plan(
                 ops,
                 display_path=normalize_display_path(display_path, submodule_path),
                 depth=depth + 1,
+                baseline_sha=child_baseline_sha,
+                infer_baseline=False,
                 seen=seen_items,
             )
         )
@@ -447,6 +478,222 @@ def run_publish_workflow(
     return result
 
 
+# -------------------------------------------------------------------- #
+#  Interactive / discovery helpers for the three-phase publish workflow
+# -------------------------------------------------------------------- #
+
+def discover_publish_candidates(
+    repo_path: Path,
+    remote: str,
+    push_target: str,
+    ops: ManualRepositoryOps,
+) -> list[PublishCandidate]:
+    """Phase 1 – discover every repository that would be pushed.
+
+    1.  Use the existing ``collect_publish_plan`` to find repos whose gitlink
+        has changed relative to the first-parent baseline.
+    2.  Augment the list with every repository reachable via
+        ``collect_existing_repositories`` so the user can add back repos
+        that are not detected by gitlink-diff (e.g. unchanged baseline but
+        local commits that still need to go out).
+    3.  Deduplicate by (resolved repo_path, commit_sha).
+    """
+    root_sha = ops.resolve_commit(repo_path, "HEAD")
+    plan = collect_publish_plan(repo_path, root_sha, ops)
+
+    candidate_map: dict[tuple[str, str], PublishCandidate] = {}
+    for item in plan:
+        key = (str(item.repo_path.resolve()), item.desired_sha)
+        if key in candidate_map:
+            continue
+        remote_before = None
+        remote_state = "unknown"
+        try:
+            if ops.remote_exists(item.repo_path, remote):
+                remote_before = remote_branch_sha(item.repo_path, remote, push_target, ops)
+                if remote_before is None:
+                    remote_state = "missing"
+                elif remote_before == item.desired_sha:
+                    remote_state = "up_to_date"
+                else:
+                    remote_state = "needs_push"
+        except Exception:
+            pass
+        candidate_map[key] = PublishCandidate(
+            repo_path=item.repo_path,
+            display_path=item.display_path,
+            commit_sha=item.desired_sha,
+            remote_before_sha=remote_before,
+            remote_state=remote_state,
+            depth=item.depth,
+        )
+
+    # also include repos that collect_publish_plan skipped so the user
+    # can manually add them in the interactive phase
+    for existing_path in collect_existing_repositories(repo_path, ops):
+        try:
+            sha = ops.resolve_commit(existing_path, "HEAD")
+        except Exception:
+            continue
+        key = (str(existing_path.resolve()), sha)
+        if key in candidate_map:
+            continue
+        candidate_map[key] = PublishCandidate(
+            repo_path=existing_path,
+            display_path=_repo_display_path(repo_path, existing_path),
+            commit_sha=sha,
+            remote_state="unknown",
+            depth=_compute_depth(existing_path),
+        )
+
+    candidates = list(candidate_map.values())
+    candidates.sort(key=lambda c: c.depth, reverse=True)
+    return candidates
+
+
+def _repo_display_path(root: Path, repo: Path) -> str:
+    try:
+        rel = repo.resolve().relative_to(root.resolve())
+        display = rel.as_posix()
+        return display if display != "." else "."
+    except ValueError:
+        return str(repo)
+
+
+def _compute_depth(repo: Path) -> int:
+    try:
+        parts = repo.resolve().as_posix().strip("/").split("/")
+    except Exception:
+        return 0
+    return max(0, len(parts) - 1)
+
+
+def display_publish_plan(candidates: list[PublishCandidate]) -> None:
+    """Print the publish plan without any interaction (used by --check-only + interactive)."""
+    print("=" * 60)
+    print(" Publish Plan Preview")
+    print("=" * 60)
+    print(f" Repositories to push: {len(candidates)}")
+    print("=" * 60)
+    for i, c in enumerate(candidates, 1):
+        marker = "[✓]" if c.selected else "[ ]"
+        print(f"  {marker} {i:>3}. {c.display_path:<40} (depth={c.depth})")
+        print(f"        Commit: {short_sha(c.commit_sha)}")
+        print(f"        Remote: {c.remote_state} ", end="")
+        if c.remote_before_sha:
+            print(f"(currently at {short_sha(c.remote_before_sha)})")
+        else:
+            print()
+    print("=" * 60)
+
+
+def confirm_publish_plan_interactive(
+    candidates: list[PublishCandidate],
+    *,
+    input_func: Any = input,
+    output_func: Any = print,
+) -> list[PublishCandidate] | None:
+    """Phase 2 – interactive confirmation with toggle/add/remove capabilities."""
+    if not _sys.stdin.isatty():
+        # non-interactive — just return the full list
+        return candidates
+
+    local = list(candidates)  # mutable copy for the session
+
+    while True:
+        output_func()
+        output_func("=" * 60)
+        output_func(" Publish Plan Confirmation")
+        output_func("=" * 60)
+        output_func(f" Repositories to push: {sum(1 for c in local if c.selected)}"
+                     f" of {len(local)}")
+        output_func("=" * 60)
+        for i, c in enumerate(local, 1):
+            marker = "[✓]" if c.selected else "[ ]"
+            output_func(f"  {marker} {i:>3}. {c.display_path:<40} (depth={c.depth})")
+            output_func(f"        Commit: {short_sha(c.commit_sha)}")
+            output_func(f"        Remote: {c.remote_state} ", end="")
+            if c.remote_before_sha:
+                output_func(f"(currently at {short_sha(c.remote_before_sha)})")
+            else:
+                output_func("")
+        output_func("=" * 60)
+        output_func()
+        output_func(" Commands:")
+        output_func("  1-N    Toggle selection for that repository")
+        output_func("  a      Select all")
+        output_func("  n      Deselect all")
+        output_func("  c      Confirm and execute push")
+        output_func("  q      Cancel and exit")
+        output_func()
+
+        try:
+            choice = input_func("Your choice: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            output_func("\nPublish cancelled.")
+            return None
+
+        if choice in {"q", "quit", "exit"}:
+            return None
+        if choice == "c":
+            return local
+        if choice == "a":
+            for c in local:
+                c.selected = True
+            continue
+        if choice == "n":
+            for c in local:
+                c.selected = False
+            continue
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(local):
+                local[idx].selected = not local[idx].selected
+        except ValueError:
+            pass
+
+
+# -------------------------------------------------------------------- #
+#  run_publish helpers — wrappers that handle PublishCandidate lists
+# -------------------------------------------------------------------- #
+
+def _run_publish_workflow_with_candidates(
+    candidates: list[PublishCandidate],
+    remote: str,
+    push_target: str,
+    ops: ManualRepositoryOps,
+    *,
+    check_only: bool,
+    sync_local_branches: bool,
+    allow_suffix_branch: bool,
+) -> PublishResult:
+    """Execute the actual push steps (Phase 3) using PublishCandidate list."""
+    result = PublishResult(check_only=check_only)
+    for candidate in candidates:
+        item = PublishPlanItem(
+            repo_path=candidate.repo_path,
+            display_path=candidate.display_path,
+            desired_sha=candidate.commit_sha,
+            depth=candidate.depth,
+        )
+        if not ops.remote_exists(item.repo_path, remote):
+            raise ops._automation_error(f"Remote does not exist in repository {item.repo_path}: {remote}")
+        classify_remote_state(item, remote, push_target, ops)
+        if sync_local_branches:
+            sync_local_branch_ref(
+                item, push_target, ops,
+                allow_suffix_branch=allow_suffix_branch,
+                dry_run=check_only,
+            )
+        run_push_check(item, remote, push_target, ops)
+        if not check_only and not item.skipped:
+            push_item(item, remote, push_target, ops)
+        print_publish_item(item)
+        result.items.append(item)
+        result.warnings.extend(item.messages)
+    return result
+
+
 def run_publish(
     args: Any,
     *,
@@ -456,20 +703,49 @@ def run_publish(
     execution.set_verbose(bool(getattr(args, "verbose", False)))
     resolved_ops = ops or ManualRepositoryOps(manual_module)
     repo_path = Path(args.repo).resolve()
+    remote = str(args.remote or "origin")
+    push_target = str(args.push_target or "").strip()
+    check_only = bool(getattr(args, "check_only", False))
+    no_interactive = bool(getattr(args, "no_interactive", False))
+    sync_local = not bool(getattr(args, "no_sync_local_branches", False))
+    allow_suffix = not bool(getattr(args, "no_branch_suffix", False))
+
     try:
-        result = run_publish_workflow(
-            repo_path,
-            remote=str(args.remote or "origin"),
-            push_target=str(args.push_target or "").strip(),
-            check_only=bool(getattr(args, "check_only", False)),
-            sync_local_branches=not bool(getattr(args, "no_sync_local_branches", False)),
-            allow_suffix_branch=not bool(getattr(args, "no_branch_suffix", False)),
-            ops=resolved_ops,
+        # Phase 1 – discovery
+        candidates = discover_publish_candidates(repo_path, remote, push_target, resolved_ops)
+        if not candidates:
+            print("No repositories need pushing.")
+            return 0
+
+        # Phase 2 – confirmation (skip when --no-interactive or check-only)
+        if not no_interactive and not check_only and _sys.stdin.isatty():
+            confirmed = confirm_publish_plan_interactive(candidates)
+            if confirmed is None:
+                print("Publish cancelled by user.")
+                return 0
+            candidates = [c for c in confirmed if c.selected]
+        elif not no_interactive and check_only:
+            display_publish_plan(candidates)
+            candidates = [c for c in candidates if c.selected]
+        elif no_interactive:
+            # keep all discovered candidates
+            pass
+
+        if not candidates:
+            print("No repositories selected for push.")
+            return 0
+
+        # Phase 3 – execute
+        result = _run_publish_workflow_with_candidates(
+            candidates, remote, push_target, resolved_ops,
+            check_only=check_only,
+            sync_local_branches=sync_local,
+            allow_suffix_branch=allow_suffix,
         )
     except resolved_ops._automation_error_class() as exc:
         print(str(exc))
         return 1
-    action = "Publish check completed successfully." if result.check_only else "Publish completed successfully."
+    action = "Publish check completed successfully." if check_only else "Publish completed successfully."
     print(action)
     print(f"Repositories processed: {len(result.items)}")
     return 0

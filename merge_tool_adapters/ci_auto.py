@@ -8,12 +8,14 @@ file conflicts fail, and CI-specific reporting/guards remain policy hooks.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 from ci_merge_split import CiWorkflowServices
+from ci_merge_split.models import now_iso
 from ci_merge_split.repository_ops import display_path_for as ci_display_path_for
 from split_gitlink_merge import (
     Conflict,
@@ -29,6 +31,58 @@ from split_gitlink_merge import (
 )
 from split_gitlink_merge.executor import GitBackend, format_git_failure
 from split_gitlink_merge.ports import GitExecutionPort
+
+
+def _json_safe_log_value(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe_log_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_log_value(item) for item in value]
+    return value
+
+
+def _path_preview(conflicts: list[Conflict], limit: int = 20) -> list[str]:
+    paths = [conflict.path for conflict in conflicts]
+    if len(paths) <= limit:
+        return paths
+    return [*paths[:limit], f"... {len(paths) - limit} more"]
+
+
+def _text_tail(text: str, max_chars: int = 500) -> str:
+    stripped = text.strip()
+    if len(stripped) <= max_chars:
+        return stripped
+    return "..." + stripped[-max_chars:]
+
+
+def _record_logic_event(
+    ctx: Any | None,
+    name: str,
+    message: str,
+    *,
+    repo_path: Path | str | None = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    if ctx is None or not hasattr(ctx, "report"):
+        return
+    report = ctx.report
+    safe_details = _json_safe_log_value(details or {})
+    add_logic_event = getattr(report, "add_logic_event", None)
+    if callable(add_logic_event):
+        add_logic_event(name, message, repo_path=repo_path, details=safe_details)
+        return
+    append_log = getattr(report, "append_log", None)
+    if callable(append_log):
+        repo_text = f" repo={repo_path}" if repo_path is not None else ""
+        append_log(f"\n[{now_iso()}] LOGIC {name}{repo_text} {message}\n")
+        if safe_details:
+            append_log(json.dumps(safe_details, ensure_ascii=False, sort_keys=True) + "\n")
+    console = getattr(report, "console", None)
+    if callable(console):
+        repo_text = f" repo={repo_path}" if repo_path is not None else ""
+        console(f"LOGIC {name}{repo_text} {message}")
 
 
 @dataclass
@@ -85,6 +139,7 @@ class CiAutoMergePolicy(MergePolicy):
         self.resolved_gitlink_records: list[dict[str, Any]] = []
 
     def on_event(self, event: MergeEvent) -> None:
+        _record_logic_event(self.ctx, event.name, event.message, repo_path=event.repo_path, details=dict(event.data))
         if event.name == "gitlink.conflict":
             self._record_gitlink_conflict(event)
             return
@@ -187,7 +242,18 @@ class CiAutoMergePolicy(MergePolicy):
         conflicts: list[Conflict],
         depth: int,
     ) -> None:
-        del actions, depth
+        del actions
+        _record_logic_event(
+            self.ctx,
+            "repo.non_gitlink_conflicts",
+            f"manual resolution required for {len(conflicts)} non-gitlink conflict(s)",
+            repo_path=repo_path,
+            details={
+                "depth": depth,
+                "paths": _path_preview(conflicts),
+                "kinds": sorted({conflict.kind for conflict in conflicts}),
+            },
+        )
         raise NonGitlinkConflictError(repo_path, conflicts)
 
     def validate_after_conflicts(
@@ -291,9 +357,22 @@ class CiAutoGitlinkMergeService:
         display_path: str | None = None,
     ) -> CiMergeResult:
         repo = repo_path.resolve(strict=False)
+        display = display_path or self._display_path(repo)
         if depth > self.max_depth:
             raise GitlinkMergeError(f"recursive merge depth exceeded at {repo}: {depth} > {self.max_depth}")
 
+        self._logic_event(
+            "ci.merge.start",
+            f"starting merge for {display}",
+            repo,
+            {
+                "display_path": display,
+                "depth": depth,
+                "base_sha": base_sha,
+                "target_sha": target_sha,
+                "source_sha": source_sha,
+            },
+        )
         self._record_snapshot(repo, source_sha, target_sha, depth)
         branch = self._branch_for_depth(depth)
         self.actions.run(repo, ["checkout", "-B", branch, target_sha])
@@ -304,30 +383,75 @@ class CiAutoGitlinkMergeService:
                 "type": "merge_repo_target_checkout",
                 "depth": depth,
                 "target_sha": target_sha,
-                "display_path": display_path or self._display_path(repo),
+                "display_path": display,
             },
             checkout_args=["checkout", "-B", branch, target_sha],
+        )
+        self._logic_event(
+            "ci.merge.target_ready",
+            f"checked out target for {display}",
+            repo,
+            {"display_path": display, "depth": depth, "branch": branch, "target_sha": target_sha},
         )
 
         merge = self.actions.merge_no_commit(repo, source_sha)
         strategy = "clean_merge"
         if merge.returncode == 0:
+            self._logic_event(
+                "ci.merge.clean",
+                f"source merged cleanly into {display}",
+                repo,
+                {"display_path": display, "depth": depth, "source_sha": source_sha},
+            )
             self.policy.validate_after_conflicts(self.actions, repo, depth)
         elif merge.returncode == 1:
             conflicts = self.actions.read_conflicts(repo)
             gitlinks = [conflict for conflict in conflicts if conflict.kind == "gitlink"]
             non_gitlinks = [conflict for conflict in conflicts if conflict.kind != "gitlink"]
+            self._logic_event(
+                "ci.merge.conflicts",
+                f"merge produced {len(conflicts)} conflict(s) in {display}",
+                repo,
+                {
+                    "display_path": display,
+                    "depth": depth,
+                    "total": len(conflicts),
+                    "gitlinks": len(gitlinks),
+                    "non_gitlinks": len(non_gitlinks),
+                    "gitlink_paths": _path_preview(gitlinks),
+                    "non_gitlink_paths": _path_preview(non_gitlinks),
+                },
+            )
             if not gitlinks or non_gitlinks:
                 self.policy.handle_file_conflicts(self.actions, repo, non_gitlinks or conflicts, depth)
             self.engine.resolve_active_conflicts(repo, depth=depth)
             self.policy.validate_after_conflicts(self.actions, repo, depth)
             strategy = "recursive_gitlink_merge"
+            self._logic_event(
+                "ci.merge.gitlinks_resolved",
+                f"recursive gitlink conflicts resolved for {display}",
+                repo,
+                {"display_path": display, "depth": depth, "gitlinks": len(gitlinks)},
+            )
         else:
+            self._logic_event(
+                "ci.merge.failed",
+                f"git merge failed for {display}",
+                repo,
+                {
+                    "display_path": display,
+                    "depth": depth,
+                    "source_sha": source_sha,
+                    "returncode": merge.returncode,
+                    "stderr_tail": _text_tail(merge.stderr),
+                    "stdout_tail": _text_tail(merge.stdout),
+                },
+            )
             raise GitlinkMergeError(format_git_failure(merge))
 
         message = self._build_commit_message(
             repo,
-            display_path or self._display_path(repo),
+            display,
             source_sha,
             target_sha,
             base_sha,
@@ -335,6 +459,12 @@ class CiAutoGitlinkMergeService:
             strategy,
         )
         result_sha = self.actions.commit_pending_merge(repo, message)
+        self._logic_event(
+            "ci.merge.committed",
+            f"created merge commit for {display}",
+            repo,
+            {"display_path": display, "depth": depth, "strategy": strategy, "result_sha": result_sha},
+        )
         self._sync_submodules_for_head(repo)
         self._ensure_ready_after_state_change(
             repo,
@@ -343,13 +473,22 @@ class CiAutoGitlinkMergeService:
                 "depth": depth,
                 "target_sha": target_sha,
                 "result_sha": result_sha,
-                "display_path": display_path or self._display_path(repo),
+                "display_path": display,
                 "preserve_refs": [result_sha],
             },
             checkout_args=["checkout", "--detach", result_sha],
         )
-        self._collect_repository_details(repo, display_path or self._display_path(repo), base_sha, target_sha, source_sha, result_sha, strategy)
-        return CiMergeResult(repo, display_path or self._display_path(repo), base_sha, source_sha, target_sha, result_sha, strategy)
+        self._collect_repository_details(repo, display, base_sha, target_sha, source_sha, result_sha, strategy)
+        self._logic_event(
+            "ci.merge.done",
+            f"finished merge for {display}",
+            repo,
+            {"display_path": display, "depth": depth, "strategy": strategy, "result_sha": result_sha},
+        )
+        return CiMergeResult(repo, display, base_sha, source_sha, target_sha, result_sha, strategy)
+
+    def _logic_event(self, name: str, message: str, repo: Path, details: dict[str, Any] | None = None) -> None:
+        _record_logic_event(self.ctx, name, message, repo_path=repo, details=details)
 
     def _sync_submodules_for_head(self, repo: Path) -> None:
         self.actions.run(repo, ["submodule", "update", "--init", "--recursive", "--force"], check=False)

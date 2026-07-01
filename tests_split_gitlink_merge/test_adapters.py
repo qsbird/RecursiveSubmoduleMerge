@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from merge_tool_adapters import CiAutoGitlinkMergeService, ManualSemiAutoMergeService
-from split_gitlink_merge import SubprocessGitBackend
+from split_gitlink_merge import GitCommandResult, NonGitlinkConflictError, SubprocessGitBackend
 
 
 def run_git(repo: Path, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -166,6 +166,62 @@ class AdapterIntegrationTests(unittest.TestCase):
         self.assertEqual(result.strategy, "clean_merge")
         self.assertEqual(run_git(fixture.parent, ["status", "--short"]).stdout.strip(), "")
         self.assertEqual(run_git(fixture.parent_sub, ["rev-parse", "HEAD"]).stdout.strip(), fixture.theirs_sha)
+
+    def test_ci_auto_adapter_reports_only_non_gitlink_conflicts_when_mixed(self) -> None:
+        repo = self.base / "fake-parent"
+        repo.mkdir()
+
+        class MixedConflictBackend:
+            def run(self, repo_path: Path, args: list[str], *, check: bool = True) -> GitCommandResult:
+                del check
+                if args[:1] == ["merge"]:
+                    return GitCommandResult(args=args, cwd=repo_path, returncode=1)
+                if args == ["diff", "--name-only", "--diff-filter=U"]:
+                    return GitCommandResult(
+                        args=args,
+                        cwd=repo_path,
+                        returncode=0,
+                        stdout="file-a.txt\n.gitmodules\nsub\n",
+                    )
+                if args == ["ls-files", "-u"]:
+                    return GitCommandResult(
+                        args=args,
+                        cwd=repo_path,
+                        returncode=0,
+                        stdout=(
+                            "100644 base-a 1\tfile-a.txt\n"
+                            "100644 ours-a 2\tfile-a.txt\n"
+                            "100644 theirs-a 3\tfile-a.txt\n"
+                            "100644 base-mod 1\t.gitmodules\n"
+                            "100644 ours-mod 2\t.gitmodules\n"
+                            "100644 theirs-mod 3\t.gitmodules\n"
+                            "160000 base-sub 1\tsub\n"
+                            "160000 ours-sub 2\tsub\n"
+                            "160000 theirs-sub 3\tsub\n"
+                        ),
+                    )
+                return GitCommandResult(args=args, cwd=repo_path, returncode=0)
+
+        service = CiAutoGitlinkMergeService(MixedConflictBackend())
+
+        with self.assertRaises(NonGitlinkConflictError) as raised:
+            service.merge_repo(
+                repo,
+                source_sha="theirs",
+                target_sha="ours",
+                base_sha="base",
+                depth=0,
+                display_path=".",
+            )
+
+        self.assertEqual(
+            [conflict.path for conflict in raised.exception.conflicts],
+            [".gitmodules", "file-a.txt"],
+        )
+        self.assertEqual(
+            [conflict.kind for conflict in raised.exception.conflicts],
+            ["gitmodules", "file"],
+        )
 
 
 if __name__ == "__main__":

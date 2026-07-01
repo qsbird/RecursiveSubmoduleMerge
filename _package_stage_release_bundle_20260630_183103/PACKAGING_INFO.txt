@@ -1,0 +1,23 @@
+PACKAGING INFO
+================
+Timestamp: 20260630_183103
+Source: C:/Users/Qs/Documents/MergeTool_for_Manual
+Python: 3.14.0
+PyInstaller: 6.18.0
+
+Changes included:
+- Phase 1: code command startup check (_check_code_at_startup)
+- Phase 2: Multi-level cleanup fallback (Level 1→4)
+- Phase 3: Interactive publish confirmation (3-phase workflow)
+- Phase 4: Config persistence (merge_tool_last_run.json)
+- Bugfix: safe.directory=* for cross-user repos
+- Bugfix: core.longpaths=true for Windows long paths
+- Bugfix: refs/heads/* local branch merge support
+
+Executables:
+- dist_manual_exe_20260630_182705/MergeToolManual.exe (GUI)
+- dist_manual_exe_20260630_182705/MergeToolManualCli.exe (CLI)
+
+Validation:
+- py_compile: all modules passed
+- unittest discover: passed

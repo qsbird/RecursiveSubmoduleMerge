@@ -10,6 +10,7 @@ from typing import Any, Iterable
 
 from . import common
 from . import execution
+from . import messages as manual_messages
 from .cross_submodule_moves import (
     CrossSubmoduleMoveService,
     describe_cross_submodule_move,
@@ -184,6 +185,11 @@ def process_repository(
     ignored_root_untracked_paths: Iterable[str] = (),
     moved_away_paths: Iterable[str] = (),
     moved_here_moves: Iterable[CrossSubmoduleMove] = (),
+    display_path: str = ".",
+    parent_repo: Path | None = None,
+    gitlink_base_sha: str | None = None,
+    gitlink_ours_sha: str | None = None,
+    gitlink_theirs_sha: str | None = None,
 ) -> bool:
     ops.ensure_git_repo(repo_path)
     ignored_dirty_paths = (
@@ -210,7 +216,13 @@ def process_repository(
                 start_point=submodule_start_point,
             )
 
-    ops.merge_branch(repo_path, context.merge_branch)
+    if is_root:
+        target_ref = root_base_remote_branch if prepare_branch and root_base_remote_branch else context.work_branch
+    else:
+        target_ref = gitlink_ours_sha or "HEAD"
+    target_sha = gitlink_ours_sha or ops.try_resolve_commit(repo_path, "HEAD")
+    merge_target_ref = ops.merge_branch(repo_path, context.merge_branch)
+    source_sha = gitlink_theirs_sha or ops.try_resolve_commit(repo_path, merge_target_ref)
 
     submodule_conflicts, file_conflicts, incomplete_stage_conflicts = ops.split_conflicts_by_stage(repo_path)
     if incomplete_stage_conflicts:
@@ -257,9 +269,20 @@ def process_repository(
             *moved_here_by_submodule.keys(),
         ]
     )
+    resolved_child_submodules: list[str] = []
     for submodule_path in submodules_to_process:
         child_repo = repo_path / submodule_path
         child_info = submodule_move_info_by_path.get(submodule_path)
+        child_base_commit = (
+            child_info.base_commit
+            if child_info is not None
+            else get_unmerged_submodule_stage_commit(
+                repo_path,
+                submodule_path,
+                1,
+                run_git=ops.run_git,
+            )
+        )
         child_start_commit = (
             child_info.current_commit
             if child_info is not None
@@ -319,6 +342,7 @@ def process_repository(
             report_entries=[],
             rollback_requested=False,
         )
+        child_display_path = manual_messages.join_display_path(display_path, submodule_path)
         child_completed = process_repository(
             child_repo,
             child_context,
@@ -330,6 +354,11 @@ def process_repository(
             ignored_root_untracked_paths=ignored_root_untracked_paths,
             moved_away_paths=moved_away_by_submodule.get(submodule_path, set()),
             moved_here_moves=moved_here_by_submodule.get(submodule_path, []),
+            display_path=child_display_path,
+            parent_repo=repo_path,
+            gitlink_base_sha=child_base_commit,
+            gitlink_ours_sha=child_start_commit,
+            gitlink_theirs_sha=child_merge_target,
             ops=ops,
             file_conflicts_service=file_conflicts_service,
             cross_submodule_moves_service=cross_submodule_moves_service,
@@ -338,6 +367,7 @@ def process_repository(
         context.rollback_requested = context.rollback_requested or child_context.rollback_requested
         if child_completed:
             ops.stage_path(repo_path, submodule_path)
+            resolved_child_submodules.append(child_display_path)
         else:
             failed_child_submodules.append(submodule_path)
             if submodule_path in submodule_conflicts:
@@ -408,8 +438,33 @@ def process_repository(
 
     ops.update_submodules(repo_path)
     if ops.working_tree_has_changes(repo_path) or ops.merge_in_progress(repo_path):
+        commit_message = (
+            manual_messages.build_root_commit_message(
+                repo_path=repo_path,
+                source_ref=context.merge_branch,
+                target_ref=target_ref,
+                source_sha=source_sha,
+                target_sha=target_sha,
+                work_branch=context.work_branch,
+                resolved_submodules=resolved_child_submodules,
+            )
+            if is_root
+            else manual_messages.build_submodule_commit_message(
+                repo_path=repo_path,
+                parent_repo=parent_repo,
+                display_path=display_path,
+                source_ref=context.merge_branch,
+                target_ref=target_ref,
+                source_sha=source_sha,
+                target_sha=target_sha,
+                base_sha=gitlink_base_sha,
+                work_branch=context.work_branch,
+                resolved_submodules=resolved_child_submodules,
+            )
+        )
         ops.commit_if_needed(
             repo_path,
+            message=commit_message,
             fallback_message=(
                 "Merge cross-submodule moved file changes"
                 if moved_here_moves_list
@@ -575,19 +630,22 @@ def run_merge(
             merge_branches,
             ignored_root_untracked_paths=ignored_root_untracked_paths,
         )
-        if preflight_result.allowed_dirty_submodules:
+        dirty_submodules_requiring_allowance = [
+            entry for entry in preflight_result.allowed_dirty_submodules if not entry.risk_confirmed
+        ]
+        if dirty_submodules_requiring_allowance:
             if args.allow_dirty_submodules:
                 print_dirty_submodule_warning(preflight_result.allowed_dirty_submodules)
             elif args.no_prompt_dirty_submodules:
                 print(
                     "Merge preflight found dirty submodules that appear unaffected. "
                     "Re-run with --allow-dirty-submodules to continue:\n"
-                    + format_dirty_submodule_list(preflight_result.allowed_dirty_submodules),
+                    + format_dirty_submodule_list(dirty_submodules_requiring_allowance),
                     file=sys.stderr,
                 )
                 return 1
             elif sys.stdin.isatty():
-                if not prompt_to_continue_with_dirty_submodules(preflight_result.allowed_dirty_submodules):
+                if not prompt_to_continue_with_dirty_submodules(dirty_submodules_requiring_allowance):
                     print("Merge aborted because dirty submodules were left in place.", file=sys.stderr)
                     return 1
                 print_dirty_submodule_warning(preflight_result.allowed_dirty_submodules)
@@ -595,10 +653,12 @@ def run_merge(
                 print(
                     "Merge preflight found dirty submodules that appear unaffected, but this run is "
                     "non-interactive. Re-run with --allow-dirty-submodules to continue:\n"
-                    + format_dirty_submodule_list(preflight_result.allowed_dirty_submodules),
+                    + format_dirty_submodule_list(dirty_submodules_requiring_allowance),
                     file=sys.stderr,
                 )
                 return 1
+        elif preflight_result.allowed_dirty_submodules:
+            print_dirty_submodule_warning(preflight_result.allowed_dirty_submodules)
 
         preserved_dirty_paths_by_repo = build_preserved_dirty_path_map(
             repo_path,
@@ -735,6 +795,7 @@ def run_cleanup(args: Any, *, manual_module: ModuleType | None, ops: ManualRepos
             repo_path,
             result,
             skip_submodule_update=args.skip_submodule_update,
+            allow_clean_x=bool(getattr(args, "allow_clean_x", False)),
             ignored_root_untracked_paths=(getattr(args, "report_file", REPORT_FILE_NAME),),
         )
         if report_path.exists():

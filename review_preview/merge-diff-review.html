@@ -1,0 +1,787 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Patch Context Expansion Preview</title>
+  <style>
+:root {
+  --bg: #eef2f7;
+  --surface: #ffffff;
+  --surface-soft: #f8fafc;
+  --surface-code: #0f172a;
+  --text: #111827;
+  --muted: #667085;
+  --border: #cbd5e1;
+  --border-strong: #94a3b8;
+  --accent: #2563eb;
+  --accent-soft: #dbeafe;
+  --danger: #b42318;
+  --warn: #b54708;
+  --ok: #027a48;
+  --add-bg: #e7f8ed;
+  --add-line: #cfefdc;
+  --add-text: #14532d;
+  --del-bg: #fdecec;
+  --del-line: #f8d2d2;
+  --del-text: #7f1d1d;
+  --hunk-bg: #eaf2ff;
+  --hunk-text: #1d4ed8;
+  --meta-bg: #f1f5f9;
+  --focus: #f97316;
+  --sidebar-width: 340px;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", Arial, sans-serif;
+  line-height: 1.5;
+}
+header {
+  padding: 18px 28px;
+  background: #20283a;
+  color: #fff;
+}
+header h1 { margin: 0 0 8px; font-size: 24px; letter-spacing: 0; }
+header .report-line { margin: 2px 0 4px; }
+header .report-link {
+  display: inline-block;
+  max-width: min(100%, 980px);
+  padding: 2px 6px;
+  color: #1d4ed8;
+  background: #f8fafc;
+  border: 1px solid #93c5fd;
+  border-radius: 5px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 13px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  text-decoration: none;
+  vertical-align: middle;
+}
+header .report-link:hover, header .report-link:focus {
+  background: #eff6ff;
+  border-color: #60a5fa;
+  text-decoration: underline;
+  outline: none;
+}
+header .muted { color: #cbd5e1; }
+main { padding: 18px 28px 40px; }
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+code, pre { font-family: Consolas, "Cascadia Mono", monospace; }
+code {
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: #eef2f7;
+}
+.panel, .metric, .repo-section, .file-view, .conflict-card, .command-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.panel { padding: 14px; margin: 14px 0; }
+.command-panel { padding: 0; }
+.command-panel > summary {
+  cursor: pointer;
+  padding: 14px;
+  font-size: 20px;
+  font-weight: 700;
+}
+.command-panel > summary .muted {
+  margin-left: 8px;
+  font-size: 13px;
+  font-weight: 400;
+}
+.command-panel-body { padding: 0 14px 14px; }
+.panel h2, .repo-header h2 { letter-spacing: 0; }
+.review-bar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 14px;
+  margin: -18px -28px 16px;
+  background: rgba(255, 255, 255, 0.94);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(10px);
+}
+.review-bar strong { font-size: 14px; }
+.review-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.review-button, .segmented button {
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.review-button:hover, .segmented button:hover { border-color: var(--accent); }
+.segmented {
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+}
+.segmented button {
+  border: 0;
+  border-radius: 0;
+  border-right: 1px solid var(--border);
+}
+.segmented button:last-child { border-right: 0; }
+.segmented button[aria-pressed="true"] {
+  background: var(--accent);
+  color: #fff;
+}
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+.metric { padding: 12px; }
+.metric span { display: block; color: var(--muted); font-size: 12px; }
+.metric strong { display: block; font-size: 22px; margin-top: 4px; }
+.layout {
+  display: grid;
+  grid-template-columns: minmax(260px, var(--sidebar-width)) 8px minmax(0, 1fr);
+  column-gap: 12px;
+  align-items: start;
+}
+.review-content { min-width: 0; }
+.sidebar {
+  position: sticky;
+  top: 58px;
+  max-height: calc(100vh - 68px);
+  overflow: auto;
+}
+.sidebar-resizer {
+  position: sticky;
+  top: 58px;
+  height: calc(100vh - 68px);
+  border-radius: 999px;
+  cursor: col-resize;
+  background: transparent;
+}
+.sidebar-resizer::before {
+  content: "";
+  display: block;
+  width: 3px;
+  height: 100%;
+  margin: 0 auto;
+  border-radius: 999px;
+  background: transparent;
+}
+.sidebar-resizer:hover::before,
+.sidebar-resizer:focus::before,
+body.sidebar-resizing .sidebar-resizer::before {
+  background: var(--border-strong);
+}
+.sidebar-resizer:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+.nav-list { display: grid; gap: 8px; }
+.nav-link {
+  display: grid;
+  gap: 4px;
+  padding: 9px 10px;
+  color: var(--text);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
+.nav-link:hover, .nav-link:focus { border-color: var(--accent); outline: none; }
+.nav-link strong { overflow-wrap: anywhere; word-break: break-word; }
+.nav-link span { color: var(--muted); font-size: 12px; }
+.nav-file {
+  margin-left: 12px;
+  border-left: 3px solid var(--accent-soft);
+}
+.nav-gitlink {
+  border-left-color: var(--warn);
+  background: #fffaf0;
+}
+.nav-group {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
+.nav-group > summary {
+  cursor: pointer;
+  padding: 9px 10px;
+  font-weight: 700;
+}
+.nav-group-body {
+  display: grid;
+  gap: 8px;
+  padding: 0 8px 8px;
+}
+.toolbar {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.toolbar input {
+  min-width: 260px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.muted { color: var(--muted); }
+.risk { margin: 8px 0; }
+.risk-high strong { color: var(--danger); }
+.risk-medium strong { color: var(--warn); }
+.risk-info strong { color: var(--ok); }
+.repo-section { margin: 0 0 18px; overflow: hidden; }
+.repo-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, #fff, #f8fafc);
+}
+.repo-header h2 { margin: 0; font-size: 19px; }
+.repo-meta { text-align: right; color: var(--muted); font-size: 13px; }
+.repo-meta span { display: block; }
+.repo-body { padding: 14px 16px 16px; }
+.details-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+table { width: 100%; border-collapse: collapse; }
+th, td { border-top: 1px solid var(--border); padding: 8px; text-align: left; vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.stat, .raw-json {
+  padding: 10px;
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.file-view, .gitlink-section, .patch-file, .conflict-card, .command-card { margin: 12px 0; overflow: hidden; }
+.file-view summary, .gitlink-section summary, .conflict-card summary, .command-card summary {
+  cursor: pointer;
+  padding: 10px 12px;
+  font-weight: 600;
+  background: var(--surface-soft);
+  border-bottom: 1px solid var(--border);
+}
+.patch-file, .gitlink-section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.patch-file-header {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  background: var(--surface-soft);
+  border-bottom: 1px solid var(--border);
+}
+.patch-file-title {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-weight: 600;
+}
+.patch-file-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+.file-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  padding: 12px;
+}
+.conflict-columns {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  padding: 12px;
+}
+.review-pane h4, .file-column h4, .conflict-column h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.tag {
+  display: inline-block;
+  min-width: 24px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #eef2f7;
+  color: #344054;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 700;
+}
+.warning {
+  padding: 10px 12px;
+  margin: 10px 0;
+  border: 1px solid #fed7aa;
+  border-radius: 8px;
+  background: #fff7ed;
+  color: #9a3412;
+}
+.rd-diff-file {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+}
+.rd-diff-toolbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  background: #f6f8fa;
+}
+.rd-diff-toolbar .segmented button[aria-pressed="true"] {
+  background: #1f6feb;
+  color: #fff;
+}
+.rd-context-switcher {
+  display: grid;
+  gap: 8px;
+}
+.rd-context-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 8px 8px 0;
+}
+.rd-diff-workbench[data-view="unified"] .rd-parallel-view { display: none; }
+.rd-diff-workbench[data-view="split"] .rd-inline-view { display: none; }
+.rd-text-view-root {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: auto;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.rd-text-view-root td,
+.rd-text-view-root th {
+  border: 0;
+  padding: 0;
+  vertical-align: top;
+}
+.rd-text-view-scroll {
+  max-height: 680px;
+  overflow: auto;
+}
+.rd-text-view-content {
+  min-width: max-content;
+}
+.rd-hunk-header {
+  background: #f0f5ff;
+  color: #315a9f;
+  font-weight: 600;
+}
+.rd-hunk-header-buttons {
+  width: 92px;
+  border-right: 1px solid #d8e2f2 !important;
+  text-align: center;
+}
+.rd-hunk-header-content {
+  padding: 3px 10px !important;
+  white-space: pre;
+}
+.rd-hunk-lines {
+  border-top: 1px solid #eef2f7;
+}
+.rd-line-number {
+  width: 46px;
+  min-width: 46px;
+  padding: 0 8px !important;
+  color: #6b7280;
+  background: #f8fafc;
+  border-right: 1px solid #e5e7eb !important;
+  text-align: right;
+  user-select: none;
+}
+.rd-line-number a,
+.rd-line-number span {
+  display: block;
+  color: inherit;
+  text-decoration: none;
+}
+.rd-line-number-empty {
+  background: #f3f4f6;
+}
+.rd-line-content {
+  min-width: 560px;
+  background: #fff;
+}
+.rd-line-content-old,
+.rd-line-content-new {
+  min-width: 360px;
+}
+.rd-line-text {
+  margin: 0;
+  padding: 1px 10px;
+  white-space: pre;
+  word-break: normal;
+}
+.wrap-enabled .rd-line-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.rd-line-number[data-change="added"] {
+  background: #ccf0d8;
+  color: #14532d;
+}
+.rd-line-content[data-change="added"] {
+  background: #e6ffed;
+  color: #14532d;
+}
+.rd-line-number[data-change="removed"] {
+  background: #ffd7d5;
+  color: #7f1d1d;
+}
+.rd-line-content[data-change="removed"] {
+  background: #ffebe9;
+  color: #7f1d1d;
+}
+.rd-line-number[data-change="meta"],
+.rd-line-content[data-change="meta"] {
+  background: #f1f5f9;
+  color: #475569;
+}
+.rd-parallel-view .rd-hunk-header-buttons {
+  width: 46px;
+}
+.rd-code-viewer {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+}
+.rd-code-viewer .rd-text-view-scroll {
+  max-height: 560px;
+}
+.rd-code-viewer .rd-line-number {
+  width: 56px;
+  min-width: 56px;
+}
+.rd-code-viewer .rd-line-content {
+  min-width: 420px;
+}
+.review-checklist {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px;
+}
+.review-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
+.rd-diff-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+.hidden { display: none !important; }
+@media (max-width: 900px) {
+  header, main { padding-left: 16px; padding-right: 16px; }
+  .review-bar { margin-left: -16px; margin-right: -16px; align-items: flex-start; flex-direction: column; }
+  .layout, .details-grid, .file-columns, .conflict-columns { grid-template-columns: 1fr; }
+  .sidebar { position: static; max-height: none; }
+  .sidebar-resizer { display: none; }
+  .repo-header { flex-direction: column; }
+  .repo-meta { text-align: left; }
+  .toolbar input { min-width: 100%; }
+}
+</style>
+</head>
+<body>
+  <header>
+    <h1>Patch Context Expansion Preview</h1>
+    <div class="report-line">Report: <a class="report-link" href="file:///C:/Users/Qs/Documents/MergeTool_for_Manual/review_preview/merge-report.json">C:\Users\Qs\Documents\MergeTool_for_Manual\review_preview\merge-report.json</a></div>
+    <div class="muted">Self-contained offline HTML. GitLab Rapid Diffs-style review workbench with no external CSS, JavaScript, CDN, or network resources.</div>
+  </header>
+  <main>
+    <div class="review-bar">
+      <strong>Rapid Diffs Review Workbench - 1 repos - 1 files - 0 submodule pointers - 0 conflicts</strong>
+      <div class="review-actions">
+        <button type="button" class="review-button js-wrap-toggle" aria-pressed="false">Wrap</button>
+        <button type="button" class="review-button" data-details-action="expand">Expand all</button>
+        <button type="button" class="review-button" data-details-action="collapse">Collapse all</button>
+      </div>
+    </div>
+    <section class="panel">
+      <h2>Overview</h2>
+      <div class="metrics"><div class="metric"><span>Status</span><strong>success</strong></div>
+<div class="metric"><span>Exit</span><strong>0</strong></div>
+<div class="metric"><span>Repos</span><strong>1</strong></div>
+<div class="metric"><span>Submodules</span><strong>0</strong></div>
+<div class="metric"><span>Recursive</span><strong>0</strong></div>
+<div class="metric"><span>Conflicts</span><strong>0</strong></div></div>
+      <p><strong>Source:</strong> <code>aaaaaaaaaaaa</code></p>
+      <p><strong>Target:</strong> <code>bbbbbbbbbbbb</code></p>
+      <p><strong>Result:</strong> <code>cccccccccccc</code></p>
+      <p><strong>Output dir:</strong> <code>review_preview</code></p>
+    </section>
+    <section class="panel">
+      <h2>Automatic Review Flags</h2>
+      <ul><li class="risk risk-info"><strong>No automatic risk flags</strong><br><span>The report has no conflicts, errors, restore failures, or publish failures.</span></li></ul>
+      
+    </section>
+    <div class="layout">
+      <aside class="panel sidebar">
+        <h2>Files</h2>
+        <div class="toolbar">
+          <input id="file-filter" type="search" placeholder="Filter path, repo, status, conflict">
+        </div>
+        <div class="nav-list"><a class="nav-link" data-filter-key="repo . source-repo (root) merge" href="#repo-1"><strong>source-repo (root)</strong><span>merge - 1 files - result</span></a>
+<a class="nav-link nav-file" data-filter-key="file . source-repo (root) src/context_demo.c m" href="#patch-1-1"><strong>src/context_demo.c</strong><span>M - patch - 13 lines</span></a></div>
+      </aside>
+      <div class="sidebar-resizer" role="separator" aria-label="Resize Files navigation" aria-orientation="vertical" tabindex="0"></div>
+      <div class="review-content">
+        <section class="panel">
+          <h2>Repositories</h2>
+          
+<section class="repo-section" id="repo-1" data-filter-key="repo . source-repo (root) merge src/context_demo.c  m">
+  <div class="repo-header">
+    <h2>source-repo (root)</h2>
+    <div class="repo-meta">
+      <span>strategy: merge</span>
+      <span>result: <code>result</code></span>
+      <span>patch source: file artifacts</span>
+    </div>
+  </div>
+  <div class="repo-body">
+    <div class="details-grid">
+      <div>
+        <p><strong>Repo path:</strong> <code>review_preview/source-repo</code></p>
+        <p><strong>Base:</strong> <code>base</code></p>
+        <p><strong>Ours:</strong> <code>ours</code></p>
+      </div>
+      <div>
+        <p><strong>Theirs:</strong> <code>theirs</code></p>
+        <p><strong>Result:</strong> <code>result</code></p>
+        <p><strong>Patch path:</strong> <code>N/A</code></p>
+      </div>
+    </div>
+    <h3>Diff Stat</h3>
+    <pre class="stat"> src/context_demo.c | 2 +-
+</pre>
+    <h3>Changed Files</h3>
+    <table><thead><tr><th>Status</th><th>Path</th><th>Old Path</th><th>Patch</th></tr></thead><tbody><tr><td><span class="tag">M</span></td><td><code>src/context_demo.c</code></td><td></td><td><a href="#patch-1-1"><code>patches/root/files/0001-context-demo.c.patch</code></a></td></tr></tbody></table>
+    <h3>Patch</h3>
+    <section class="patch-file" id="patch-1-1"><div class="patch-file-header"><div class="patch-file-title"><span class="tag">M</span><code>src/context_demo.c</code></div><div class="patch-file-meta">13 patch lines - 375 B - patches/root/files/0001-context-demo.c.patch / expanded: patches/root/files/0001-context-demo.c.expanded.patch</div></div><div class="rd-context-switcher" data-context="compact"><div class="rd-context-toolbar"><div class="segmented" role="group" aria-label="Diff context"><button type="button" class="js-context-toggle" data-context="compact">3 lines</button><button type="button" class="js-context-toggle" data-context="expanded">20 lines</button></div></div><div data-context-panel="compact"><div class="rd-diff-file rd-diff-workbench" data-view="unified" data-line-count="13"><div class="rd-diff-toolbar"><div class="segmented" role="group" aria-label="Diff view"><button type="button" class="js-view-toggle" data-view="unified">Unified</button><button type="button" class="js-view-toggle" data-view="split">Split</button></div><span class="rd-diff-meta">13 patch lines - 3 lines</span></div><div class="rd-inline-view" data-view-mode="unified" role="region" aria-label="Unified diff"><div class="rd-text-view-scroll"><table class="rd-text-view-root"><tbody class="rd-text-view-content"><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="meta"><td class="rd-line-number" data-change="meta" data-position="old"><span></span></td><td class="rd-line-number" data-change="meta" data-position="new"><span></span></td><td class="rd-line-content" data-change="meta"><pre class="rd-line-text">diff --git a/src/context_demo.c b/src/context_demo.c</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="meta"><td class="rd-line-number" data-change="meta" data-position="old"><span></span></td><td class="rd-line-number" data-change="meta" data-position="new"><span></span></td><td class="rd-line-content" data-change="meta"><pre class="rd-line-text">index 1111111..2222222 100644</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="meta"><td class="rd-line-number" data-change="meta" data-position="old"><span></span></td><td class="rd-line-number" data-change="meta" data-position="new"><span></span></td><td class="rd-line-content" data-change="meta"><pre class="rd-line-text">--- a/src/context_demo.c</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="meta"><td class="rd-line-number" data-change="meta" data-position="old"><span></span></td><td class="rd-line-number" data-change="meta" data-position="new"><span></span></td><td class="rd-line-content" data-change="meta"><pre class="rd-line-text">+++ b/src/context_demo.c</pre></td></tr><tr class="rd-hunk-header rd-hunk-header-inline" data-hunk-header="true"><td class="rd-hunk-header-buttons" colspan="2"></td><td class="rd-hunk-header-content"><pre class="rd-line-text">@@ -30,9 +30,9 @@ int compute_score(int value)</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>30</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>30</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    int limit = normalize_limit(value);</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>31</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>31</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    int total = 0;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>32</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>32</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    for (int i = 0; i &lt; limit; ++i) {</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="removed"><td class="rd-line-number" data-change="removed" data-position="old"><span>33</span></td><td class="rd-line-number" data-change="removed" data-position="new"><span></span></td><td class="rd-line-content" data-change="removed"><pre class="rd-line-text">        total += i * 2;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="added"><td class="rd-line-number" data-change="added" data-position="old"><span></span></td><td class="rd-line-number" data-change="added" data-position="new"><span>33</span></td><td class="rd-line-content" data-change="added"><pre class="rd-line-text">        total += i * 3;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>34</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>34</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    }</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>35</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>35</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    return finalize_score(total);</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>36</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>36</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">}</pre></td></tr></tbody></table></div></div><div class="rd-parallel-view" data-view-mode="split" role="region" aria-label="Side by side diff"><div class="rd-text-view-scroll"><table class="rd-text-view-root"><tbody class="rd-text-view-content"><tr class="rd-hunk-lines rd-hunk-header-parallel" data-change="meta"><td class="rd-hunk-header-buttons"></td><td class="rd-hunk-header-content" colspan="3"><pre class="rd-line-text">diff --git a/src/context_demo.c b/src/context_demo.c</pre></td></tr><tr class="rd-hunk-lines rd-hunk-header-parallel" data-change="meta"><td class="rd-hunk-header-buttons"></td><td class="rd-hunk-header-content" colspan="3"><pre class="rd-line-text">index 1111111..2222222 100644</pre></td></tr><tr class="rd-hunk-lines rd-hunk-header-parallel" data-change="meta"><td class="rd-hunk-header-buttons"></td><td class="rd-hunk-header-content" colspan="3"><pre class="rd-line-text">--- a/src/context_demo.c</pre></td></tr><tr class="rd-hunk-lines rd-hunk-header-parallel" data-change="meta"><td class="rd-hunk-header-buttons"></td><td class="rd-hunk-header-content" colspan="3"><pre class="rd-line-text">+++ b/src/context_demo.c</pre></td></tr><tr class="rd-hunk-header rd-hunk-header-parallel" data-change="context"><td class="rd-hunk-header-buttons"></td><td class="rd-hunk-header-content" colspan="3"><pre class="rd-line-text">@@ -30,9 +30,9 @@ int compute_score(int value)</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>30</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    int limit = normalize_limit(value);</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>30</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    int limit = normalize_limit(value);</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>31</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    int total = 0;</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>31</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    int total = 0;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>32</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    for (int i = 0; i &lt; limit; ++i) {</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>32</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    for (int i = 0; i &lt; limit; ++i) {</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="removed"><td class="rd-line-number" data-change="removed" data-position="old"><span>33</span></td><td class="rd-line-content rd-line-content-old" data-change="removed" data-position="old"><pre class="rd-line-text">        total += i * 2;</pre></td><td class="rd-line-number rd-line-number-empty" data-change="context" data-position="new"><span></span></td><td class="rd-line-content rd-line-content-new rd-line-number-empty" data-change="context" data-position="new"><pre class="rd-line-text"></pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="added"><td class="rd-line-number rd-line-number-empty" data-change="context" data-position="old"><span></span></td><td class="rd-line-content rd-line-content-old rd-line-number-empty" data-change="context" data-position="old"><pre class="rd-line-text"></pre></td><td class="rd-line-number" data-change="added" data-position="new"><span>33</span></td><td class="rd-line-content rd-line-content-new" data-change="added" data-position="new"><pre class="rd-line-text">        total += i * 3;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>34</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    }</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>34</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    }</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>35</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    return finalize_score(total);</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>35</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    return finalize_score(total);</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>36</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">}</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>36</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">}</pre></td></tr></tbody></table></div></div></div></div><div data-context-panel="expanded" class="hidden"><div class="rd-diff-file rd-diff-workbench" data-view="unified" data-line-count="48"><div class="rd-diff-toolbar"><div class="segmented" role="group" aria-label="Diff view"><button type="button" class="js-view-toggle" data-view="unified">Unified</button><button type="button" class="js-view-toggle" data-view="split">Split</button></div><span class="rd-diff-meta">48 patch lines - 20 lines</span></div><div class="rd-inline-view" data-view-mode="unified" role="region" aria-label="Unified diff"><div class="rd-text-view-scroll"><table class="rd-text-view-root"><tbody class="rd-text-view-content"><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="meta"><td class="rd-line-number" data-change="meta" data-position="old"><span></span></td><td class="rd-line-number" data-change="meta" data-position="new"><span></span></td><td class="rd-line-content" data-change="meta"><pre class="rd-line-text">diff --git a/src/context_demo.c b/src/context_demo.c</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="meta"><td class="rd-line-number" data-change="meta" data-position="old"><span></span></td><td class="rd-line-number" data-change="meta" data-position="new"><span></span></td><td class="rd-line-content" data-change="meta"><pre class="rd-line-text">index 1111111..2222222 100644</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="meta"><td class="rd-line-number" data-change="meta" data-position="old"><span></span></td><td class="rd-line-number" data-change="meta" data-position="new"><span></span></td><td class="rd-line-content" data-change="meta"><pre class="rd-line-text">--- a/src/context_demo.c</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="meta"><td class="rd-line-number" data-change="meta" data-position="old"><span></span></td><td class="rd-line-number" data-change="meta" data-position="new"><span></span></td><td class="rd-line-content" data-change="meta"><pre class="rd-line-text">+++ b/src/context_demo.c</pre></td></tr><tr class="rd-hunk-header rd-hunk-header-inline" data-hunk-header="true"><td class="rd-hunk-header-buttons" colspan="2"></td><td class="rd-hunk-header-content"><pre class="rd-line-text">@@ -1,43 +1,43 @@</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>1</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>1</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">#include &quot;context_demo.h&quot;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>2</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>2</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text"></pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>3</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>3</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">static int clamp_positive(int value)</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>4</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>4</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">{</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>5</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>5</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    if (value &lt; 0) {</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>6</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>6</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">        return 0;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>7</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>7</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    }</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>8</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>8</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    return value;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>9</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>9</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">}</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>10</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>10</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text"></pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>11</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>11</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">static int normalize_limit(int value)</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>12</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>12</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">{</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>13</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>13</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    int clamped = clamp_positive(value);</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>14</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>14</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    if (clamped &gt; 64) {</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>15</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>15</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">        return 64;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>16</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>16</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    }</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>17</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>17</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    return clamped;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>18</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>18</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">}</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>19</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>19</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text"></pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>20</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>20</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">static int finalize_score(int total)</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>21</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>21</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">{</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>22</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>22</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    if (total &gt; 1000) {</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>23</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>23</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">        return 1000;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>24</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>24</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    }</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>25</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>25</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    return total;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>26</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>26</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">}</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>27</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>27</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text"></pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>28</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>28</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">int compute_score(int value)</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>29</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>29</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">{</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>30</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>30</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    int limit = normalize_limit(value);</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>31</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>31</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    int total = 0;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>32</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>32</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    for (int i = 0; i &lt; limit; ++i) {</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="removed"><td class="rd-line-number" data-change="removed" data-position="old"><span>33</span></td><td class="rd-line-number" data-change="removed" data-position="new"><span></span></td><td class="rd-line-content" data-change="removed"><pre class="rd-line-text">        total += i * 2;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="added"><td class="rd-line-number" data-change="added" data-position="old"><span></span></td><td class="rd-line-number" data-change="added" data-position="new"><span>33</span></td><td class="rd-line-content" data-change="added"><pre class="rd-line-text">        total += i * 3;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>34</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>34</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    }</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>35</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>35</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    return finalize_score(total);</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>36</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>36</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">}</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>37</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>37</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text"></pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>38</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>38</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">int score_with_bonus(int value, int bonus)</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>39</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>39</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">{</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>40</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>40</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    int base = compute_score(value);</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>41</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>41</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">    return finalize_score(base + bonus);</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-inline" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>42</span></td><td class="rd-line-number" data-change="context" data-position="new"><span>42</span></td><td class="rd-line-content" data-change="context"><pre class="rd-line-text">}</pre></td></tr></tbody></table></div></div><div class="rd-parallel-view" data-view-mode="split" role="region" aria-label="Side by side diff"><div class="rd-text-view-scroll"><table class="rd-text-view-root"><tbody class="rd-text-view-content"><tr class="rd-hunk-lines rd-hunk-header-parallel" data-change="meta"><td class="rd-hunk-header-buttons"></td><td class="rd-hunk-header-content" colspan="3"><pre class="rd-line-text">diff --git a/src/context_demo.c b/src/context_demo.c</pre></td></tr><tr class="rd-hunk-lines rd-hunk-header-parallel" data-change="meta"><td class="rd-hunk-header-buttons"></td><td class="rd-hunk-header-content" colspan="3"><pre class="rd-line-text">index 1111111..2222222 100644</pre></td></tr><tr class="rd-hunk-lines rd-hunk-header-parallel" data-change="meta"><td class="rd-hunk-header-buttons"></td><td class="rd-hunk-header-content" colspan="3"><pre class="rd-line-text">--- a/src/context_demo.c</pre></td></tr><tr class="rd-hunk-lines rd-hunk-header-parallel" data-change="meta"><td class="rd-hunk-header-buttons"></td><td class="rd-hunk-header-content" colspan="3"><pre class="rd-line-text">+++ b/src/context_demo.c</pre></td></tr><tr class="rd-hunk-header rd-hunk-header-parallel" data-change="context"><td class="rd-hunk-header-buttons"></td><td class="rd-hunk-header-content" colspan="3"><pre class="rd-line-text">@@ -1,43 +1,43 @@</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>1</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">#include &quot;context_demo.h&quot;</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>1</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">#include &quot;context_demo.h&quot;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>2</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text"></pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>2</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text"></pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>3</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">static int clamp_positive(int value)</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>3</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">static int clamp_positive(int value)</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>4</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">{</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>4</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">{</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>5</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    if (value &lt; 0) {</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>5</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    if (value &lt; 0) {</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>6</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">        return 0;</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>6</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">        return 0;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>7</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    }</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>7</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    }</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>8</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    return value;</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>8</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    return value;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>9</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">}</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>9</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">}</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>10</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text"></pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>10</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text"></pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>11</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">static int normalize_limit(int value)</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>11</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">static int normalize_limit(int value)</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>12</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">{</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>12</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">{</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>13</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    int clamped = clamp_positive(value);</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>13</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    int clamped = clamp_positive(value);</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>14</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    if (clamped &gt; 64) {</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>14</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    if (clamped &gt; 64) {</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>15</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">        return 64;</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>15</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">        return 64;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>16</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    }</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>16</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    }</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>17</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    return clamped;</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>17</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    return clamped;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>18</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">}</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>18</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">}</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>19</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text"></pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>19</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text"></pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>20</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">static int finalize_score(int total)</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>20</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">static int finalize_score(int total)</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>21</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">{</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>21</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">{</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>22</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    if (total &gt; 1000) {</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>22</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    if (total &gt; 1000) {</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>23</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">        return 1000;</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>23</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">        return 1000;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>24</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    }</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>24</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    }</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>25</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    return total;</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>25</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    return total;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>26</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">}</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>26</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">}</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>27</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text"></pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>27</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text"></pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>28</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">int compute_score(int value)</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>28</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">int compute_score(int value)</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>29</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">{</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>29</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">{</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>30</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    int limit = normalize_limit(value);</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>30</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    int limit = normalize_limit(value);</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>31</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    int total = 0;</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>31</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    int total = 0;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>32</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    for (int i = 0; i &lt; limit; ++i) {</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>32</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    for (int i = 0; i &lt; limit; ++i) {</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="removed"><td class="rd-line-number" data-change="removed" data-position="old"><span>33</span></td><td class="rd-line-content rd-line-content-old" data-change="removed" data-position="old"><pre class="rd-line-text">        total += i * 2;</pre></td><td class="rd-line-number rd-line-number-empty" data-change="context" data-position="new"><span></span></td><td class="rd-line-content rd-line-content-new rd-line-number-empty" data-change="context" data-position="new"><pre class="rd-line-text"></pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="added"><td class="rd-line-number rd-line-number-empty" data-change="context" data-position="old"><span></span></td><td class="rd-line-content rd-line-content-old rd-line-number-empty" data-change="context" data-position="old"><pre class="rd-line-text"></pre></td><td class="rd-line-number" data-change="added" data-position="new"><span>33</span></td><td class="rd-line-content rd-line-content-new" data-change="added" data-position="new"><pre class="rd-line-text">        total += i * 3;</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>34</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    }</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>34</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    }</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>35</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    return finalize_score(total);</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>35</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    return finalize_score(total);</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>36</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">}</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>36</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">}</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>37</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text"></pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>37</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text"></pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>38</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">int score_with_bonus(int value, int bonus)</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>38</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">int score_with_bonus(int value, int bonus)</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>39</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">{</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>39</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">{</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>40</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    int base = compute_score(value);</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>40</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    int base = compute_score(value);</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>41</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">    return finalize_score(base + bonus);</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>41</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">    return finalize_score(base + bonus);</pre></td></tr><tr class="rd-hunk-lines rd-hunk-lines-parallel" data-change="context"><td class="rd-line-number" data-change="context" data-position="old"><span>42</span></td><td class="rd-line-content rd-line-content-old" data-change="context" data-position="old"><pre class="rd-line-text">}</pre></td><td class="rd-line-number" data-change="context" data-position="new"><span>42</span></td><td class="rd-line-content rd-line-content-new" data-change="context" data-position="new"><pre class="rd-line-text">}</pre></td></tr></tbody></table></div></div></div></div></div></section>
+    
+    <h3>Full File Views</h3>
+    <p class="muted">No full file content artifacts were available.</p>
+  </div>
+</section>
+
+        </section>
+        <section class="panel">
+          <h2>Conflicts And Errors</h2>
+          <p class="muted">No conflict entries.</p>
+          <h3>Errors</h3>
+          <div class="rd-code-viewer rd-lang-json raw-json" data-language="json" role="region" aria-label="Errors"><div class="rd-text-view-scroll"><table class="rd-text-view-root"><tbody class="rd-text-view-content"><tr class="rd-hunk-lines rd-code-lines"><td class="rd-line-number"><span>1</span></td><td class="rd-line-content"><pre class="rd-line-text">[]</pre></td></tr></tbody></table></div></div>
+          <h3>Restore</h3>
+          <div class="rd-code-viewer rd-lang-json raw-json" data-language="json" role="region" aria-label="Restore"><div class="rd-text-view-scroll"><table class="rd-text-view-root"><tbody class="rd-text-view-content"><tr class="rd-hunk-lines rd-code-lines"><td class="rd-line-number"><span>1</span></td><td class="rd-line-content"><pre class="rd-line-text">{}</pre></td></tr></tbody></table></div></div>
+          <h3>Publish</h3>
+          <div class="rd-code-viewer rd-lang-json raw-json" data-language="json" role="region" aria-label="Publish"><div class="rd-text-view-scroll"><table class="rd-text-view-root"><tbody class="rd-text-view-content"><tr class="rd-hunk-lines rd-code-lines"><td class="rd-line-number"><span>1</span></td><td class="rd-line-content"><pre class="rd-line-text">{}</pre></td></tr></tbody></table></div></div>
+        </section>
+        <details class="panel command-panel">
+          <summary>Commands <span class="muted">0 records, collapsed by default</span></summary>
+          <div class="command-panel-body"><p class="muted">No command records.</p></div>
+        </details>
+      </div>
+    </div>
+  </main>
+  <script>
+(function () {
+  function setDiffView(workbench, view) {
+    workbench.setAttribute('data-view', view);
+    workbench.querySelectorAll('.js-view-toggle').forEach(function (button) {
+      button.setAttribute('aria-pressed', String(button.getAttribute('data-view') === view));
+    });
+  }
+
+  function setPatchContext(switcher, context) {
+    switcher.setAttribute('data-context', context);
+    switcher.querySelectorAll('.js-context-toggle').forEach(function (button) {
+      button.setAttribute('aria-pressed', String(button.getAttribute('data-context') === context));
+    });
+    switcher.querySelectorAll('[data-context-panel]').forEach(function (panel) {
+      panel.classList.toggle('hidden', panel.getAttribute('data-context-panel') !== context);
+    });
+  }
+
+  function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+  }
+
+  function setupSidebarResize() {
+    const layout = document.querySelector('.layout');
+    const resizer = document.querySelector('.sidebar-resizer');
+    if (!layout || !resizer) {
+      return;
+    }
+    const storageKey = 'ci-review-sidebar-width';
+    const minWidth = 260;
+    function maxWidth() {
+      return Math.max(minWidth, Math.min(620, Math.floor(window.innerWidth * 0.55)));
+    }
+    function setWidth(value, persist) {
+      const width = clamp(Math.round(value), minWidth, maxWidth());
+      document.documentElement.style.setProperty('--sidebar-width', width + 'px');
+      resizer.setAttribute('aria-valuemin', String(minWidth));
+      resizer.setAttribute('aria-valuemax', String(maxWidth()));
+      resizer.setAttribute('aria-valuenow', String(width));
+      if (persist) {
+        try {
+          window.localStorage.setItem(storageKey, String(width));
+        } catch (_error) {
+          // Ignore storage failures in offline HTML contexts.
+        }
+      }
+    }
+    try {
+      const saved = Number(window.localStorage.getItem(storageKey));
+      if (Number.isFinite(saved) && saved > 0) {
+        setWidth(saved, false);
+      } else {
+        setWidth(340, false);
+      }
+    } catch (_error) {
+      setWidth(340, false);
+    }
+    window.addEventListener('resize', function () {
+      const current = Number(resizer.getAttribute('aria-valuenow')) || 340;
+      setWidth(current, false);
+    });
+    resizer.addEventListener('pointerdown', function (event) {
+      if (window.innerWidth <= 900) {
+        return;
+      }
+      event.preventDefault();
+      resizer.setPointerCapture(event.pointerId);
+      document.body.classList.add('sidebar-resizing');
+      function onMove(moveEvent) {
+        const bounds = layout.getBoundingClientRect();
+        setWidth(moveEvent.clientX - bounds.left, true);
+      }
+      function onUp(upEvent) {
+        document.body.classList.remove('sidebar-resizing');
+        resizer.releasePointerCapture(upEvent.pointerId);
+        resizer.removeEventListener('pointermove', onMove);
+        resizer.removeEventListener('pointerup', onUp);
+        resizer.removeEventListener('pointercancel', onUp);
+      }
+      resizer.addEventListener('pointermove', onMove);
+      resizer.addEventListener('pointerup', onUp);
+      resizer.addEventListener('pointercancel', onUp);
+    });
+    resizer.addEventListener('keydown', function (event) {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') {
+        return;
+      }
+      event.preventDefault();
+      const current = Number(resizer.getAttribute('aria-valuenow')) || 340;
+      setWidth(current + (event.key === 'ArrowRight' ? 24 : -24), true);
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    setupSidebarResize();
+
+    const filter = document.getElementById('file-filter');
+    if (filter) {
+      filter.addEventListener('input', function () {
+        const query = filter.value.trim().toLowerCase();
+        document.querySelectorAll('[data-filter-key]').forEach(function (node) {
+          const key = node.getAttribute('data-filter-key') || '';
+          node.classList.toggle('hidden', Boolean(query) && !key.includes(query));
+        });
+      });
+    }
+
+    document.querySelectorAll('.rd-diff-workbench').forEach(function (workbench) {
+      setDiffView(workbench, workbench.getAttribute('data-view') || 'unified');
+    });
+    document.querySelectorAll('.rd-context-switcher').forEach(function (switcher) {
+      setPatchContext(switcher, switcher.getAttribute('data-context') || 'compact');
+    });
+    document.querySelectorAll('.js-view-toggle').forEach(function (button) {
+      button.addEventListener('click', function () {
+        const workbench = button.closest('.rd-diff-workbench');
+        if (workbench) {
+          setDiffView(workbench, button.getAttribute('data-view') || 'unified');
+        }
+      });
+    });
+    document.querySelectorAll('.js-context-toggle').forEach(function (button) {
+      button.addEventListener('click', function () {
+        const switcher = button.closest('.rd-context-switcher');
+        if (switcher) {
+          setPatchContext(switcher, button.getAttribute('data-context') || 'compact');
+        }
+      });
+    });
+
+    const wrapButton = document.querySelector('.js-wrap-toggle');
+    if (wrapButton) {
+      wrapButton.addEventListener('click', function () {
+        const enabled = !document.body.classList.contains('wrap-enabled');
+        document.body.classList.toggle('wrap-enabled', enabled);
+        wrapButton.setAttribute('aria-pressed', String(enabled));
+      });
+    }
+
+    document.querySelectorAll('[data-details-action]').forEach(function (button) {
+      button.addEventListener('click', function () {
+        const open = button.getAttribute('data-details-action') === 'expand';
+        document.querySelectorAll('details.nav-group, details.file-view, details.gitlink-section, details.conflict-card, details.command-panel, details.command-card').forEach(function (details) {
+          details.open = open;
+        });
+      });
+    });
+
+    document.querySelectorAll('a[href^="#"]').forEach(function (link) {
+      link.addEventListener('click', function () {
+        const id = link.getAttribute('href').slice(1);
+        const target = document.getElementById(id);
+        const parentDetails = target ? target.closest('details') : null;
+        if (parentDetails) {
+          parentDetails.open = true;
+        }
+        if (target && target.tagName === 'DETAILS') {
+          target.open = true;
+        }
+      });
+    });
+  });
+})();
+</script>
+</body>
+</html>

@@ -20,6 +20,13 @@ from .policy import MergePolicy
 from .ports import GitExecutionPort
 
 
+def _path_preview(conflicts: tuple[Conflict, ...], limit: int = 20) -> list[str]:
+    paths = [conflict.path for conflict in conflicts]
+    if len(paths) <= limit:
+        return paths
+    return [*paths[:limit], f"... {len(paths) - limit} more"]
+
+
 class RecursiveGitlinkMergeEngine:
     """Bind planner, executor, and policy into a recursive gitlink resolver."""
 
@@ -53,6 +60,19 @@ class RecursiveGitlinkMergeEngine:
                 return result
 
             groups = self.logic.group_conflicts(conflicts)
+            self._event(
+                "repo.conflicts_classified",
+                repo,
+                "classified unresolved paths",
+                {
+                    "depth": depth,
+                    "total": len(conflicts),
+                    "gitlinks": len(groups.gitlinks),
+                    "non_gitlinks": len(groups.non_gitlinks),
+                    "gitlink_paths": _path_preview(groups.gitlinks),
+                    "non_gitlink_paths": _path_preview(groups.non_gitlinks),
+                },
+            )
 
             if groups.has_gitlinks:
                 for conflict in groups.gitlinks:
@@ -144,13 +164,31 @@ class RecursiveGitlinkMergeEngine:
             )
 
         ancestry = Ancestry()
-        if self.logic.needs_ancestry_lookup(spec):
+        needs_ancestry_lookup = self.logic.needs_ancestry_lookup(spec)
+        if needs_ancestry_lookup:
             ancestry = self.actions.ancestry(sub_repo, spec.ours_sha, spec.theirs_sha)
         decision = self.planner.choose_gitlink_resolution(
             base_sha=spec.base_sha,
             ours_sha=spec.ours_sha,
             theirs_sha=spec.theirs_sha,
             ancestry=self.logic.ancestry_for_decision(spec, ancestry),
+        )
+        self._event(
+            "gitlink.decision",
+            parent,
+            f"selected {decision.kind.value} for gitlink {path}",
+            {
+                "path": path,
+                "base": spec.base_sha,
+                "ours": spec.ours_sha,
+                "theirs": spec.theirs_sha,
+                "strategy": decision.kind.value,
+                "result": decision.result_sha,
+                "recursive_merge": decision.recursive_merge,
+                "needs_ancestry_lookup": needs_ancestry_lookup,
+                "ours_is_ancestor_of_theirs": ancestry.ours_is_ancestor_of_theirs,
+                "theirs_is_ancestor_of_ours": ancestry.theirs_is_ancestor_of_ours,
+            },
         )
 
         recursive_merge = decision.recursive_merge

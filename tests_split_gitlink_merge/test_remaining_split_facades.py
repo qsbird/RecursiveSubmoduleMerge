@@ -31,6 +31,7 @@ from merge_cleanup_core import steps as cleanup_steps
 from manual_merge_split import ManualWorkflowServices
 from manual_merge_split import common as manual_common
 from manual_merge_split import execution as manual_execution
+from manual_merge_split import messages as manual_messages
 from manual_merge_split import models as manual_models
 from manual_merge_split import runtime as manual_runtime
 from manual_merge_split.commands import ManualCommandService, process_repository, write_report
@@ -245,6 +246,7 @@ class FakeCiContext:
             timeout=1800,
             max_depth=16,
             diff_context_lines=3,
+            expanded_diff_context_lines=20,
             git="git",
             remote="origin",
             target="main",
@@ -587,6 +589,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             self.assertEqual(local_input.pop("submodule_fetch_scope"), "needed")
             self.assertEqual(local_input.pop("git_network_retries"), 2)
             self.assertEqual(local_input.pop("git_network_retry_delay"), 3.0)
+            self.assertEqual(local_input.pop("expanded_diff_context_lines"), 20)
             self.assertEqual(local_input, original_report.data["input"])
             local_batch = local_report.data["batch"].copy()
             original_batch = original_report.data["batch"].copy()
@@ -1340,7 +1343,12 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                 warnings,
             )
             self.assertTrue(Path(patches["repository"]["path"]).exists())
+            self.assertTrue(Path(patches["repository_expanded"]["path"]).exists())
+            self.assertEqual(patches["repository"]["context_lines"], 3)
+            self.assertEqual(patches["repository_expanded"]["context_lines"], 20)
             self.assertEqual(changed_files[0]["patch_relative_path"], "patches/root/files/0001-file.txt.patch")
+            self.assertEqual(changed_files[0]["expanded_patch_relative_path"], "patches/root/files/0001-file.txt.expanded.patch")
+            self.assertEqual(changed_files[0]["expanded_patch_context_lines"], 20)
 
             repository = ci_artifacts.collect_repository_details(
                 ctx,
@@ -1364,6 +1372,8 @@ class ExtractedImplementationParityTests(unittest.TestCase):
 
             class GitlinkDiffRunner(FakeCiRunner):
                 def run(self, repo_path: Path, args: list[str], *, allow_failure: bool = False) -> FakeCiCommandResult:
+                    if repo_path == repo.resolve(strict=False) and args[:1] == ["diff"] and "--name-status" in args:
+                        return FakeCiCommandResult(args, stdout="M\tlibs/sub\n")
                     if repo_path == repo.resolve(strict=False) and args == [
                         "diff",
                         "--raw",
@@ -1401,6 +1411,11 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             )
 
             self.assertEqual([item["path"] for item in ctx.report.repositories], [".", "libs/sub"])
+            root_repository = ctx.report.repositories[0]
+            self.assertEqual(root_repository["changed_files"][0]["path"], "libs/sub")
+            self.assertEqual(root_repository["changed_files"][0]["kind"], "gitlink")
+            self.assertEqual(root_repository["changed_files"][0]["old_sha"], "oldsub")
+            self.assertEqual(root_repository["changed_files"][0]["new_sha"], "newsub")
             submodule_repository = ctx.report.repositories[1]
             self.assertEqual(submodule_repository["base"], "oldsub")
             self.assertEqual(submodule_repository["ours"], "oldsub")
@@ -1417,6 +1432,8 @@ class ExtractedImplementationParityTests(unittest.TestCase):
 
             class GitlinkDiffRunner(FakeCiRunner):
                 def run(self, repo_path: Path, args: list[str], *, allow_failure: bool = False) -> FakeCiCommandResult:
+                    if repo_path == repo.resolve(strict=False) and args[:1] == ["diff"] and "--name-status" in args:
+                        return FakeCiCommandResult(args, stdout="M\tlibs/sub\n")
                     if repo_path == repo.resolve(strict=False) and args == [
                         "diff",
                         "--raw",
@@ -1814,6 +1831,39 @@ class ExtractedImplementationParityTests(unittest.TestCase):
         self.assertEqual((local_message.title, local_message.body), (original_message.title, original_message.body))
         self.assertEqual(message_builder.branch_for_depth(ctx, 2), self.ci_merge.branch_for_depth(ctx, 2))
 
+    def test_manual_commit_messages_include_ci_style_metadata(self) -> None:
+        root_message = manual_messages.build_root_commit_message(
+            repo_path=Path("repo"),
+            source_ref="origin/feature",
+            target_ref="origin/main",
+            source_sha="a" * 40,
+            target_sha="b" * 40,
+            work_branch="work",
+            resolved_submodules=["libs/core"],
+        )
+        self.assertEqual(root_message.title, "Manual merge: origin/feature into origin/main")
+        self.assertIn("Source SHA: " + "a" * 40, root_message.body)
+        self.assertIn("Target SHA: " + "b" * 40, root_message.body)
+        self.assertIn("Resolved submodules:\n    libs/core", root_message.body)
+
+        submodule_message = manual_messages.build_submodule_commit_message(
+            repo_path=Path("repo/libs/core"),
+            parent_repo=Path("repo"),
+            display_path="libs/core",
+            source_ref="c" * 40,
+            target_ref="d" * 40,
+            source_sha="c" * 40,
+            target_sha="d" * 40,
+            base_sha="e" * 40,
+            work_branch="work",
+        )
+        self.assertEqual(submodule_message.title, "Manual submodule merge: libs/core")
+        self.assertIn("Parent Repository: repo", submodule_message.body)
+        self.assertIn("Submodule Path: libs/core", submodule_message.body)
+        self.assertIn("Base SHA: " + "e" * 40, submodule_message.body)
+        self.assertIn("Ours SHA: " + "d" * 40, submodule_message.body)
+        self.assertIn("Theirs SHA: " + "c" * 40, submodule_message.body)
+
     def test_manual_low_coupling_helpers_match_original(self) -> None:
         self.assertEqual(manual_common.infer_clone_directory_name("git@example.com:org/repo.git"), self.manual_merge.infer_clone_directory_name("git@example.com:org/repo.git"))
         self.assertEqual(manual_common.normalize_status_relative_path("old/name -> new/name/"), self.manual_merge.normalize_status_relative_path("old/name -> new/name/"))
@@ -2209,13 +2259,16 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             repo = Path(temp_dir)
             calls: list[tuple[str, ...]] = []
             branch_created = False
+            merge_pending = False
 
             def run_git(_repo_path: Path, args: list[str], **_kwargs: object) -> FakeManualGitResult:
-                nonlocal branch_created
+                nonlocal branch_created, merge_pending
                 calls.append(tuple(args))
                 if args == ["rev-parse", "--show-toplevel"]:
                     return FakeManualGitResult(args, stdout=str(repo) + "\n")
                 if args == ["rev-parse", "-q", "--verify", "MERGE_HEAD"]:
+                    if merge_pending:
+                        return FakeManualGitResult(args, stdout="feature-commit\n")
                     return FakeManualGitResult(args, returncode=1)
                 if args == ["config", "--get", "user.name"]:
                     return FakeManualGitResult(args, stdout="User\n")
@@ -2224,7 +2277,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                 if args == ["status", "--porcelain", "--ignore-submodules=dirty"]:
                     return FakeManualGitResult(args)
                 if args == ["status", "--porcelain"]:
-                    return FakeManualGitResult(args)
+                    return FakeManualGitResult(args, stdout=(" M merged.txt\n" if merge_pending else ""))
                 if args == ["remote"]:
                     return FakeManualGitResult(args, stdout="origin\n")
                 if args == ["symbolic-ref", "--quiet", "--short", "HEAD"]:
@@ -2243,12 +2296,20 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                     )
                 if args == ["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"]:
                     return FakeManualGitResult(args, stdout="base-commit\n")
+                if args == ["rev-parse", "--verify", "HEAD^{commit}"]:
+                    return FakeManualGitResult(args, stdout="base-commit\n")
+                if args == ["rev-parse", "--verify", "refs/remotes/origin/feature^{commit}"]:
+                    return FakeManualGitResult(args, stdout="feature-commit\n")
                 if args == ["rev-parse", "HEAD"]:
                     return FakeManualGitResult(args, stdout="base-commit\n")
                 if args == ["checkout", "-B", "work", "refs/remotes/origin/main"]:
                     branch_created = True
                     return FakeManualGitResult(args)
-                if args == ["merge", "--no-ff", "refs/remotes/origin/feature"]:
+                if args == ["merge", "--no-ff", "--no-commit", "refs/remotes/origin/feature"]:
+                    merge_pending = True
+                    return FakeManualGitResult(args)
+                if args[:1] == ["commit"]:
+                    merge_pending = False
                     return FakeManualGitResult(args)
                 if args == ["diff", "--name-only", "--diff-filter=U"]:
                     return FakeManualGitResult(args)
@@ -2288,6 +2349,13 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertTrue(branch_created)
             self.assertIn(("checkout", "-B", "work", "refs/remotes/origin/main"), calls)
+            commit_calls = [args for args in calls if args[:1] == ("commit",)]
+            self.assertEqual(len(commit_calls), 1)
+            commit_args = commit_calls[0]
+            self.assertEqual(commit_args[:3], ("commit", "-m", "Manual merge: origin/feature into origin/main"))
+            self.assertIn("Source SHA: feature-commit", commit_args[-1])
+            self.assertIn("Target SHA: base-commit", commit_args[-1])
+            self.assertIn("Work Branch: work", commit_args[-1])
 
     def test_manual_merge_does_not_reject_dirty_submodule_after_risk_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2350,7 +2418,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                 if args == ["checkout", "-B", "work", "refs/remotes/origin/main"]:
                     branch_created = True
                     return FakeManualGitResult(args)
-                if args == ["merge", "--no-ff", "refs/remotes/origin/feature"]:
+                if args == ["merge", "--no-ff", "--no-commit", "refs/remotes/origin/feature"]:
                     return FakeManualGitResult(args)
                 return FakeManualGitResult(args)
 
@@ -2757,7 +2825,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                     return FakeManualGitResult(args, stdout="headsha\n")
                 if args == ["symbolic-ref", "--quiet", "--short", "HEAD"]:
                     return FakeManualGitResult(args, stdout="work\n")
-                if args == ["merge", "--no-ff", "refs/remotes/origin/feature"]:
+                if args == ["merge", "--no-ff", "--no-commit", "refs/remotes/origin/feature"]:
                     return FakeManualGitResult(args)
                 if args == ["diff", "--name-only", "--diff-filter=U"]:
                     return FakeManualGitResult(args)
@@ -2823,7 +2891,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                     return FakeManualGitResult(args)
                 if args == ["remote"]:
                     return FakeManualGitResult(args)
-                if args == ["merge", "--no-ff", "feature"]:
+                if args == ["merge", "--no-ff", "--no-commit", "feature"]:
                     return FakeManualGitResult(args)
                 if args == ["ls-files", "-u"]:
                     return FakeManualGitResult(
@@ -2888,7 +2956,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
 
             self.assertFalse(completed)
             self.assertEqual(context.report_entries[0].files, ["file.txt"])
-            self.assertIn(("merge", "--no-ff", "feature"), calls)
+            self.assertIn(("merge", "--no-ff", "--no-commit", "feature"), calls)
 
             report_path = repo / "merge_manual_todo.txt"
             write_report(report_path, context)
@@ -2973,7 +3041,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                             return FakeManualGitResult(args)
                         if args == ["remote"]:
                             return FakeManualGitResult(args)
-                        if args == ["merge", "--no-ff", "feature"]:
+                        if args == ["merge", "--no-ff", "--no-commit", "feature"]:
                             return FakeManualGitResult(args)
                         if args == ["ls-files", "-u"]:
                             return FakeManualGitResult(args, stdout=unmerged_index)
