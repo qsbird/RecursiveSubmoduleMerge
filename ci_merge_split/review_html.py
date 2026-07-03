@@ -33,6 +33,9 @@ from .review_common import (
 
 
 DEFAULT_DIFF_CONTEXT_LINES = 3
+MAX_PATCH_LINES = 1000       # skip rendering patches with more than this many lines
+MAX_FILE_VIEW_LINES = 2000   # max lines per side (ours / result) in full file views
+MAX_COMMAND_OUTPUT = 2000    # max chars for any single command stdout/stderr
 
 
 CSS = """
@@ -962,6 +965,18 @@ def collect_review_model(
             diff_context_lines,
         )
         warnings.extend(patch_warnings)
+
+        # If a patch exceeds MAX_PATCH_LINES, skip rendering the diff
+        # content entirely and only show a summary card with the original
+        # patch file path so reviewers can inspect it externally.
+        patch_skipped_large = False
+        patch_line_count = 0
+        if isinstance(patch_text, str) and patch_text:
+            patch_line_count = len(patch_text.splitlines())
+            if patch_line_count > MAX_PATCH_LINES:
+                patch_skipped_large = True
+                patch_text = ""
+
         repositories.append(
             {
                 "index": index,
@@ -978,6 +993,8 @@ def collect_review_model(
                 "patch_text": patch_text,
                 "patch_source": patch_source,
                 "patch_path": patch_path,
+                "patch_skipped_large": patch_skipped_large,
+                "patch_line_count": patch_line_count,
                 "full_file_views": collect_full_file_views(report, repo, report_dir),
             }
         )
@@ -1133,7 +1150,9 @@ def render_repo_section(repo: dict[str, Any]) -> str:
     <h3>Changed Files</h3>
     {render_changed_files(repo)}
     <h3>Patch</h3>
-    {render_patch_block(str(repo.get("patch_text") or ""))}
+    {render_patch_block(str(repo.get("patch_text") or "")) if not repo.get("patch_skipped_large") else
+     f'<div class="warning">Patch is too large ({repo.get("patch_line_count", 0)} lines, exceeds {MAX_PATCH_LINES} line limit) to render inline.<br/>'
+     f'Original patch file: <code>{esc(repo.get("patch_path") or "N/A")}</code></div>'}
     <h3>Full File Views</h3>
     {render_file_views(repo)}
   </div>

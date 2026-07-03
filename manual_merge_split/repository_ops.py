@@ -445,6 +445,135 @@ class ManualRepositoryOps:
                 ) from exc
         return snapshots
 
+    def manual_merge_todo_exists(self, repo_path: Path, report_file_name: str = "merge_manual_todo.txt") -> bool:
+        return (repo_path / report_file_name).exists()
+
+    def _is_path_tracked(self, repo_path: Path, relative_path: str) -> bool:
+        """Return True if the given path is tracked by git (exists in the index)."""
+        result = self.run_git(
+            repo_path,
+            ["ls-files", "--error-unmatch", "--", relative_path],
+            check=False,
+        )
+        return result.returncode == 0
+
+    def has_any_in_progress_state(self, repo_path: Path) -> bool:
+        """Return True if the repo has any in-progress operation or leftover report file."""
+        if self.merge_in_progress(repo_path):
+            return True
+        if self.get_unmerged_paths(repo_path):
+            return True
+        if self.working_tree_has_changes(repo_path):
+            return True
+        return False
+
+    def cleanup_repository_fallback(
+        self,
+        repo_path: Path,
+        result: CleanupResult,
+        *,
+        skip_submodule_update: bool = False,
+        ignored_root_untracked_paths: Iterable[str] = (),
+        preserved_dirty_paths_by_repo: dict[Path, set[str]] | None = None,
+        preserved_dirty_repos: set[Path] | None = None,
+        report_file_name: str = "merge_manual_todo.txt",
+    ) -> None:
+        """Attempt level-based fallback cleanup, reusing CI cleanup level logic.
+
+        This is a generic cleanup that can restore a repository from any
+        in-progress state (merge, rebase, cherry-pick, dirty working tree, etc.)
+        to a clean state suitable for new operations.  It directly reuses the
+        CI ``ci_prepare_cleanup_levels`` cascade so that fixes to the cleanup
+        steps are shared between both workflows.
+
+        The report file (``merge_manual_todo.txt`` by default) is handled
+        implicitly: if it is *untracked*, ``git clean -fd`` in the cleanup
+        levels will remove it; if it is *tracked*, ``git reset --hard HEAD``
+        will restore it to the committed version (which is the correct
+        behaviour — a tracked report file should be removed by a proper
+        commit, not by side-stepping the index).
+        """
+        from merge_cleanup_core.steps import ci_prepare_cleanup_levels
+
+        self.ensure_git_repo(repo_path)
+        resolved_repo_path = repo_path.resolve()
+        preserved_dirty_repos = preserved_dirty_repos or set()
+        ignored_dirty_paths = (
+            preserved_dirty_paths_by_repo.get(resolved_repo_path, set())
+            if preserved_dirty_paths_by_repo is not None
+            else set()
+        )
+
+        # First, try the standard cleanup
+        try:
+            self.cleanup_repository(
+                repo_path,
+                result,
+                skip_submodule_update=skip_submodule_update,
+                ignored_root_untracked_paths=ignored_root_untracked_paths,
+                preserved_dirty_paths_by_repo=preserved_dirty_paths_by_repo,
+                preserved_dirty_repos=preserved_dirty_repos,
+            )
+        except self._automation_error_class():
+            pass  # Will attempt fallback levels
+
+        # Check if standard cleanup succeeded
+        if not self.has_any_in_progress_state(repo_path):
+            if skip_submodule_update or resolved_repo_path in preserved_dirty_repos:
+                return
+
+        # Run CI fallback cleanup levels (shared with CI workflow)
+        allow_clean_x = False
+        levels = ci_prepare_cleanup_levels(allow_clean_x)
+        for level in levels:
+            for step in level.steps:
+                step_result = self.run_cleanup_step(repo_path, step, check=False)
+                if step_result.returncode != 0 and not step.allow_failure:
+                    result.failed_steps.append(f"[{level.name}] {self._format_git_failure(step_result)}")
+
+            # Recurse into submodules
+            for submodule_path in self.get_submodule_paths(repo_path):
+                child_repo = repo_path / submodule_path
+                if not child_repo.exists():
+                    continue
+                try:
+                    self.cleanup_repository_fallback(
+                        child_repo,
+                        result,
+                        skip_submodule_update=True,
+                        ignored_root_untracked_paths=(),
+                        preserved_dirty_paths_by_repo=preserved_dirty_paths_by_repo,
+                        preserved_dirty_repos=preserved_dirty_repos,
+                        report_file_name=report_file_name,
+                    )
+                except self._automation_error_class():
+                    pass
+
+            # Check if this level resolved the state (generic — no file-specific check)
+            if not self.has_any_in_progress_state(repo_path):
+                break
+
+        # Final submodule update at root level
+        if not skip_submodule_update:
+            update_result = self.run_cleanup_step(
+                repo_path,
+                cleanup_steps.submodule_update_step(),
+                check=False,
+                stream_output=self._verbose(),
+            )
+            if update_result.returncode != 0:
+                result.failed_steps.append(self._format_git_failure(update_result))
+
+        # After all levels, remove untracked report file if it still exists
+        # (tracked versions are handled by reset --hard above)
+        report_path = repo_path / report_file_name
+        if report_path.exists() and not self._is_path_tracked(repo_path, report_file_name):
+            try:
+                report_path.unlink()
+                result.removed_reports.append(report_path)
+            except OSError:
+                pass
+
     def rollback_to_snapshot(
         self,
         repo_path: Path,
@@ -459,7 +588,13 @@ class ManualRepositoryOps:
         report_contents = None
         if preserve_report and report_path is not None and report_path.exists():
             report_contents = report_path.read_text(encoding="utf-8")
-            report_path.unlink()
+            # Only unlink if the report file is NOT tracked by git.
+            # For tracked files, reset --hard in cleanup_repository will restore
+            # the committed version, and we overwrite with write_text afterwards.
+            # Unlinking a tracked file creates an unstaged deletion that makes
+            # the repo appear dirty to working_tree_has_changes.
+            if not self._is_path_tracked(repo_path, report_path.name):
+                report_path.unlink()
         self.cleanup_repository(
             repo_path,
             CleanupResult(),

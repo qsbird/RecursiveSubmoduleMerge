@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -10,6 +11,42 @@ from typing import Any, Iterable
 from . import common
 from .models import DirtyRepoAssessment, MergePreflightResult
 from .repository_ops import ManualRepositoryOps
+
+
+@dataclass(frozen=True)
+class ToolAvailabilityResult:
+    """External tool availability check result."""
+
+    tool_name: str
+    available: bool
+    resolved_path: str | None
+    error_message: str | None
+
+
+def check_tool_availability(tool_name: str) -> ToolAvailabilityResult:
+    """Check whether an external tool command is available on the system PATH.
+
+    Uses ``shutil.which`` to locate the tool.  Returns a
+    :class:`ToolAvailabilityResult` indicating whether the tool was found,
+    its absolute path (if found), and a human-readable error message (if not).
+    """
+    resolved = shutil.which(tool_name)
+    if resolved is not None:
+        return ToolAvailabilityResult(
+            tool_name=tool_name,
+            available=True,
+            resolved_path=resolved,
+            error_message=None,
+        )
+    return ToolAvailabilityResult(
+        tool_name=tool_name,
+        available=False,
+        resolved_path=None,
+        error_message=(
+            f"Conflict tool command '{tool_name}' was not found on the system PATH. "
+            "Please install the tool or change the conflict tool command in advanced options."
+        ),
+    )
 
 
 PREFLIGHT_FUNCTIONS: tuple[str, ...] = ()
@@ -330,3 +367,19 @@ class ManualPreflightService:
 
     def resolve_commit_variants_for_refs(self, repo_path: Path, refs: Iterable[str]) -> list[str]:
         return resolve_commit_variants_for_refs(repo_path, refs, ManualRepositoryOps(self.manual_module))
+
+    def check_conflict_tool(self, conflict_tool_command: str) -> ToolAvailabilityResult:
+        """Check whether the conflict tool command is available on the system.
+
+        Extracts the tool name from the command string (first token before
+        any flags) and checks it with :func:`check_tool_availability`.
+        """
+        tool_name = conflict_tool_command.strip().split()[0] if conflict_tool_command.strip() else ""
+        if not tool_name:
+            return ToolAvailabilityResult(
+                tool_name="",
+                available=False,
+                resolved_path=None,
+                error_message="Conflict tool command is empty.",
+            )
+        return check_tool_availability(tool_name)

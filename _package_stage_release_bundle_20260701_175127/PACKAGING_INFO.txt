@@ -1,0 +1,20 @@
+PACKAGING INFO
+================
+Timestamp: 20260701_175127
+Source: C:/Users/Qs/Documents/MergeTool_for_Manual
+Python: 3.14.0
+PyInstaller: 6.18.0
+
+Changes:
+- Phase 1: code command startup check
+- Phase 2: Multi-level cleanup fallback
+- Phase 3: Interactive publish dialog
+- Phase 4: Config persistence
+- Bugfix: safe.directory=*, core.longpaths=true, refs/heads/*
+- Bugfix: _safe_write for gbk terminal Unicode errors
+- New: manual_merge_split/publish_dialog.py
+- New: manual_merge_split/config_persistence.py
+
+Executables:
+- dist_manual_exe_20260701_174842/MergeToolManual.exe (GUI)
+- dist_manual_exe_20260701_174842/MergeToolManualCli.exe (CLI)

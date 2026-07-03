@@ -156,6 +156,46 @@ UI_TEXT: dict[str, dict[str, str]] = {
         ),
     },
     "button_start_publish": {LANGUAGE_EN: "Start publish", LANGUAGE_ZH: "开始发布"},
+    "message_tool_not_found_title": {
+        LANGUAGE_EN: "Conflict tool not found",
+        LANGUAGE_ZH: "冲突工具未找到",
+    },
+    "message_tool_not_found_body": {
+        LANGUAGE_EN: "The conflict tool command '{tool}' was not found on the system PATH.\n\nPlease install the tool or change the conflict tool command in advanced options.",
+        LANGUAGE_ZH: "冲突工具命令 '{tool}' 在系统 PATH 中未找到。\n\n请安装该工具或在高级选项中更改冲突工具命令。",
+    },
+    "status_publish_checking": {
+        LANGUAGE_EN: "Checking publish plan...",
+        LANGUAGE_ZH: "正在检查发布计划...",
+    },
+    "status_publish_check_failed": {
+        LANGUAGE_EN: "Publish check failed",
+        LANGUAGE_ZH: "发布检查失败",
+    },
+    "message_publish_check_failed_title": {
+        LANGUAGE_EN: "Publish check failed",
+        LANGUAGE_ZH: "发布检查失败",
+    },
+    "log_publish_check_start": {
+        LANGUAGE_EN: "Running publish check...\n",
+        LANGUAGE_ZH: "正在运行发布检查...\n",
+    },
+    "log_publish_check_complete": {
+        LANGUAGE_EN: "Publish check completed. {count} repositories to push.\n",
+        LANGUAGE_ZH: "发布检查完成。{count} 个仓库待推送。\n",
+    },
+    "log_publish_check_no_items": {
+        LANGUAGE_EN: "Publish check completed. All repositories are up to date.\n",
+        LANGUAGE_ZH: "发布检查完成。所有仓库已是最新。\n",
+    },
+    "log_publish_cancelled": {
+        LANGUAGE_EN: "Publish cancelled by user.\n",
+        LANGUAGE_ZH: "发布已被用户取消。\n",
+    },
+    "log_publish_executing": {
+        LANGUAGE_EN: "Executing publish for {count} selected repositories...\n",
+        LANGUAGE_ZH: "正在对 {count} 个选中仓库执行发布...\n",
+    },
     "button_cancel": {LANGUAGE_EN: "Cancel", LANGUAGE_ZH: "取消"},
     "button_continue": {LANGUAGE_EN: "Continue", LANGUAGE_ZH: "继续"},
     "button_reopen": {LANGUAGE_EN: "Reopen", LANGUAGE_ZH: "重新打开"},
@@ -283,6 +323,28 @@ UI_TEXT: dict[str, dict[str, str]] = {
         LANGUAGE_ZH: "发布检查已成功完成。\n",
     },
     "friendly_error": {LANGUAGE_EN: "Error: {message}\n", LANGUAGE_ZH: "错误：{message}\n"},
+    "backup_warning_title": {
+        LANGUAGE_EN: "Backup Reminder",
+        LANGUAGE_ZH: "备份提醒",
+    },
+    "backup_warning_message": {
+        LANGUAGE_EN: (
+            "Before using this merge tool, please ensure:\n\n"
+            "1. All local changes have been pushed to the remote repository.\n"
+            "2. A manual backup of the affected folders has been created.\n\n"
+            "Code loss caused by not backing up to a remote location\n"
+            "is unrecoverable. Please back up before proceeding.\n\n"
+            "Click OK to confirm you have backed up and wish to continue."
+        ),
+        LANGUAGE_ZH: (
+            "在使用本合并工具之前，请确保：\n\n"
+            "1. 所有本地修改已推送至远端仓库。\n"
+            "2. 已手动备份相关修改的文件夹。\n\n"
+            "因远端没有备份而造成的代码丢失\n"
+            "无法找回，请在使用前做好备份。\n\n"
+            "点击确定以确认您已备份并继续。"
+        ),
+    },
 }
 
 
@@ -735,6 +797,7 @@ class MergeGuiApp:
         self._continue_branch_placeholders_visible = False
         self._saved_base_remote_branch = ROOT_BASE_REMOTE_BRANCH
         self._saved_work_branch = WORK_BRANCH_DEFAULT
+        self._publish_params: dict[str, Any] = {}
         self.repo_presets = discover_repositories()
 
         if self.repo_presets:
@@ -754,6 +817,7 @@ class MergeGuiApp:
         self._apply_language()
         self._update_enabled_state()
         self._preview("merge")
+        self.root.after(500, self._show_backup_warning)
         self.root.after(100, self._drain_events)
 
     def _t(self, key: str, **kwargs: Any) -> str:
@@ -1468,6 +1532,7 @@ class MergeGuiApp:
 
     def _start(self, action: str) -> None:
         from tkinter import messagebox
+        from manual_merge_split.preflight import check_tool_availability
 
         if self.process is not None and self.process.poll() is None:
             messagebox.showwarning(
@@ -1481,6 +1546,20 @@ class MergeGuiApp:
                 self._t("message_clone_source_not_ready"),
             )
             return
+
+        # Check conflict tool availability before merge
+        if action == "merge":
+            tool_command = self.conflict_tool_command_var.get().strip() if hasattr(self, "conflict_tool_command_var") else ""
+            if tool_command:
+                tool_name = tool_command.split()[0]
+                tool_check = check_tool_availability(tool_name)
+                if not tool_check.available:
+                    messagebox.showwarning(
+                        self._t("message_tool_not_found_title"),
+                        self._t("message_tool_not_found_body", tool=tool_name),
+                    )
+                    return
+
         spec = self._preview(action)
         if spec is None:
             messagebox.showerror(self._t("message_invalid_input_title"), self.command_text.get("1.0", "end").strip())
@@ -1489,6 +1568,11 @@ class MergeGuiApp:
             self._t("message_cleanup_risk_title"),
             self._t("message_cleanup_risk_body"),
         ):
+            return
+
+        # Publish uses three-phase flow: check → dialog → execute
+        if action == "publish":
+            self._start_publish(spec)
             return
 
         command = launcher_command(spec.argv)
@@ -1568,6 +1652,108 @@ class MergeGuiApp:
         self.reader_thread = threading.Thread(target=self._read_process_output, args=(self.process,), daemon=True)
         self.reader_thread.start()
 
+    def _start_publish(self, spec: CommandSpec) -> None:
+        """Three-phase publish flow: check → user dialog → execute."""
+        from tkinter import messagebox
+        from manual_merge_split.publish import ManualPublishService, PublishResult
+
+        repo_path = Path(self.repo_var.get()).resolve()
+        remote = self.publish_remote_var.get().strip() or "origin"
+        push_target = self.publish_target_var.get().strip()
+        sync_local_branches = bool(self.publish_sync_local_branches_var.get())
+        allow_suffix_branch = bool(self.publish_allow_branch_suffix_var.get())
+        check_only = bool(self.publish_check_only_var.get())
+        language = self.language_var.get()
+
+        # Phase 1: Run publish check in background thread
+        self._append_log(self._t("log_publish_check_start"))
+        self._set_status("status_publish_checking")
+
+        def run_check() -> None:
+            try:
+                service = ManualPublishService()
+                result = service.run_publish_check(
+                    repo_path,
+                    remote=remote,
+                    push_target=push_target,
+                    sync_local_branches=sync_local_branches,
+                    allow_suffix_branch=allow_suffix_branch,
+                )
+                self.events.put(("publish_check_done", result))
+            except Exception as exc:
+                self.events.put(("publish_check_failed", str(exc)))
+
+        threading.Thread(target=run_check, daemon=True).start()
+
+        # Phase 2 & 3: Handle check result in _drain_events
+        # We store the publish parameters for use in the execute phase
+        self._publish_params = {
+            "remote": remote,
+            "push_target": push_target,
+            "sync_local_branches": sync_local_branches,
+            "allow_suffix_branch": allow_suffix_branch,
+            "check_only": check_only,
+        }
+
+    def _handle_publish_check_done(self, result: Any) -> None:
+        """Handle the result of publish check phase."""
+        from manual_merge_split.publish_dialog import PublishConfirmDialog
+
+        # Log the check results
+        pushable_count = sum(1 for item in result.items if not item.skipped)
+        if pushable_count == 0:
+            self._append_log(self._t("log_publish_check_no_items"))
+            self._set_status("status_completed")
+            return
+
+        self._append_log(self._t("log_publish_check_complete", count=pushable_count))
+
+        # If check-only mode, we're done
+        if self._publish_params.get("check_only"):
+            self._set_status("status_completed")
+            return
+
+        # Phase 2: Show confirmation dialog
+        language = self.language_var.get()
+        dialog = PublishConfirmDialog(self.root, result, language=language)
+        self.root.wait_window(dialog.top)
+
+        if not dialog.confirmed:
+            self._append_log(self._t("log_publish_cancelled"))
+            self._set_status("status_idle")
+            return
+
+        selected_paths = dialog.selected_display_paths()
+        if not selected_paths:
+            self._append_log(self._t("log_publish_cancelled"))
+            self._set_status("status_idle")
+            return
+
+        # Phase 3: Execute publish in background thread
+        self._append_log(self._t("log_publish_executing", count=len(selected_paths)))
+        self._set_status("status_running_action", action="publish")
+
+        params = self._publish_params
+        repo_path = Path(self.repo_var.get()).resolve()
+
+        def run_execute() -> None:
+            try:
+                from manual_merge_split.publish import ManualPublishService
+                service = ManualPublishService()
+                execute_result = service.run_publish_execute(
+                    result,
+                    remote=params["remote"],
+                    push_target=params["push_target"],
+                    sync_local_branches=params["sync_local_branches"],
+                    allow_suffix_branch=params["allow_suffix_branch"],
+                    selected_display_paths=selected_paths,
+                )
+                self.events.put(("publish_execute_done", execute_result))
+            except Exception as exc:
+                self.events.put(("publish_execute_failed", str(exc)))
+
+        threading.Thread(target=run_execute, daemon=True).start()
+
     def _read_process_output(self, process: subprocess.Popen[str]) -> None:
         assert process.stdout is not None
         try:
@@ -1616,6 +1802,27 @@ class MergeGuiApp:
                     elif "conflict tool timed out after" in line.lower():
                         self._set_confirmation_buttons("disabled")
                         self._set_status("status_conflict_timeout")
+                elif kind == "publish_check_done":
+                    self._handle_publish_check_done(payload)
+                elif kind == "publish_check_failed":
+                    from tkinter import messagebox
+                    self._append_log(self._t("friendly_error", message=str(payload)))
+                    self._set_status("status_publish_check_failed")
+                    messagebox.showerror(
+                        self._t("message_publish_check_failed_title"),
+                        str(payload),
+                    )
+                elif kind == "publish_execute_done":
+                    self._set_status("status_completed")
+                    self._append_log(
+                        "\nPublish completed.\n",
+                        friendly=self._t("friendly_publish_success"),
+                    )
+                elif kind == "publish_execute_failed":
+                    self._set_status("status_failed", exit_code=1)
+                    self._append_log(
+                        self._t("friendly_error", message=str(payload)),
+                    )
                 elif kind == "done":
                     exit_code = int(payload) if payload is not None else -1
                     completed_action = self.current_action
@@ -1666,6 +1873,15 @@ class MergeGuiApp:
             self.events.put(("log", output + "\n"))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _show_backup_warning(self) -> None:
+        """Display a mandatory backup-reminder dialog on startup."""
+        from tkinter import messagebox
+
+        messagebox.showinfo(
+            self._t("backup_warning_title"),
+            self._t("backup_warning_message"),
+        )
 
     def _show_report(self) -> None:
         from tkinter import messagebox

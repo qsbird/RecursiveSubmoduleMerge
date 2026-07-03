@@ -28,7 +28,9 @@ from .models import (
 )
 from .preflight import (
     ManualPreflightService,
+    ToolAvailabilityResult,
     build_preserved_dirty_path_map,
+    check_tool_availability,
     ensure_repo_ready,
     format_dirty_submodule_list,
 )
@@ -167,6 +169,20 @@ def refresh_submodules_after_root_checkout(
     ]
     if update_paths:
         ops.update_submodules(repo_path, paths=update_paths)
+
+
+def _safe_unlink_report(report_path: Path, repo_path: Path, ops: ManualRepositoryOps) -> bool:
+    """Remove report file only if it is NOT tracked by git.
+
+    Returns True if the file was removed, False if it was skipped
+    because it is tracked (and thus managed by git reset --hard instead).
+    """
+    if not report_path.exists():
+        return False
+    if ops._is_path_tracked(repo_path, report_path.name):
+        return False  # Tracked — let git manage it via reset --hard
+    report_path.unlink()
+    return True
 
 
 def process_repository(
@@ -419,10 +435,11 @@ def process_repository(
     return True
 
 
-def write_report(report_path: Path, context: MergeContext) -> None:
+def write_report(report_path: Path, context: MergeContext, *, ops: ManualRepositoryOps | None = None, repo_path: Path | None = None) -> None:
     if not context.report_entries:
         if report_path.exists():
-            report_path.unlink()
+            if ops is not None and repo_path is not None and not _safe_unlink_report(report_path, repo_path, ops):
+                pass  # Tracked file — let git manage it; do not create an unstaged deletion
         return
 
     lines = [
@@ -543,6 +560,15 @@ def run_merge(
         print("--work-branch cannot be used together with --continue-current-branch.", file=sys.stderr)
         return 1
 
+    # Check conflict tool availability before merge
+    tool_command = getattr(args, "conflict_tool_command", "") or ""
+    if tool_command.strip() and args.file_conflict_mode == "tool":
+        tool_name = tool_command.strip().split()[0]
+        tool_check = check_tool_availability(tool_name)
+        if not tool_check.available:
+            print(tool_check.error_message, file=sys.stderr)
+            return 1
+
     clone_values = [args.clone_branch, args.clone_url, args.clone_path]
     clone_enabled = any(value for value in clone_values)
     if clone_enabled and not all(value for value in clone_values):
@@ -607,8 +633,7 @@ def run_merge(
         preserved_dirty_repos = {
             entry.repo_path.resolve() for entry in preflight_result.allowed_dirty_submodules
         }
-        if report_path.exists():
-            report_path.unlink()
+        _safe_unlink_report(report_path, repo_path, ops)
 
         initial_context = replace(base_context, merge_branch=merge_branches[0])
         if base_remote_branch:
@@ -653,7 +678,7 @@ def run_merge(
                     print(f"Skipping branch '{merge_branch}' after rollback: {skip_reason}")
                     continue
 
-                write_report(report_path, branch_context)
+                write_report(report_path, branch_context, ops=ops, repo_path=repo_path)
                 batch_result.stopped_branch = merge_branch
                 should_rollback = branch_context.rollback_requested and can_auto_rollback_failed_branch(branch_context)
                 if should_rollback:
@@ -688,8 +713,7 @@ def run_merge(
             batch_result.completed_branches.append(merge_branch)
             checkpoint = ops.collect_repo_snapshot(repo_path)
 
-        if report_path.exists():
-            report_path.unlink()
+        _safe_unlink_report(report_path, repo_path, ops)
     except ops._automation_error_class() as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -727,18 +751,32 @@ def run_cleanup(args: Any, *, manual_module: ModuleType | None, ops: ManualRepos
         )
 
     repo_path = Path(args.repo).resolve()
-    report_path = repo_path / getattr(args, "report_file", REPORT_FILE_NAME)
+    report_file_name = getattr(args, "report_file", REPORT_FILE_NAME)
+    report_path = repo_path / report_file_name
     result = CleanupResult()
+    fallback_cleanup = bool(getattr(args, "fallback_cleanup", False))
+
+    # Detect if fallback is needed: any in-progress state (generic detection)
+    needs_fallback = fallback_cleanup or ops.has_any_in_progress_state(repo_path)
 
     try:
-        ops.cleanup_repository(
-            repo_path,
-            result,
-            skip_submodule_update=args.skip_submodule_update,
-            ignored_root_untracked_paths=(getattr(args, "report_file", REPORT_FILE_NAME),),
-        )
-        if report_path.exists():
-            report_path.unlink()
+        if needs_fallback:
+            print("Detected in-progress repository state; using fallback cleanup levels.", file=sys.stderr)
+            ops.cleanup_repository_fallback(
+                repo_path,
+                result,
+                skip_submodule_update=args.skip_submodule_update,
+                ignored_root_untracked_paths=(report_file_name,),
+                report_file_name=report_file_name,
+            )
+        else:
+            ops.cleanup_repository(
+                repo_path,
+                result,
+                skip_submodule_update=args.skip_submodule_update,
+                ignored_root_untracked_paths=(report_file_name,),
+            )
+        if _safe_unlink_report(report_path, repo_path, ops):
             result.removed_reports.append(report_path)
         if args.rebuild_work_branch:
             rebuild_work_branches(
@@ -763,6 +801,10 @@ def run_cleanup(args: Any, *, manual_module: ModuleType | None, ops: ManualRepos
         print(f"Rebuilt work branches: {len(result.rebuilt_branches)}")
     if result.removed_reports:
         print(f"Removed report: {report_path}")
+    if result.failed_steps:
+        print(f"Failed steps: {len(result.failed_steps)}")
+        for step_error in result.failed_steps:
+            print(f"  - {step_error}", file=sys.stderr)
     return 0
 
 

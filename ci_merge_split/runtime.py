@@ -270,6 +270,13 @@ class JsonReport:
 
     def add_command(self, command: CommandResult) -> None:
         entry = command.to_dict()
+        # Truncate massive stdout/stderr (e.g. git diff output) to avoid
+        # blowing up merge_report.json.
+        max_cmd_output = 2000
+        for field in ("stdout", "stderr"):
+            value = entry.get(field)
+            if isinstance(value, str) and len(value) > max_cmd_output:
+                entry[field] = value[:max_cmd_output] + "\n... <truncated>"
         self.data["commands"].append(entry)
         self.append_log(
             "\n"

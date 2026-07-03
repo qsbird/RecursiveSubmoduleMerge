@@ -391,17 +391,21 @@ def print_publish_item(item: PublishPlanItem) -> None:
         print(f"  note: {message}")
 
 
-def run_publish_workflow(
+def run_publish_check(
     repo_path: Path,
     *,
     remote: str,
     push_target: str,
-    check_only: bool,
     sync_local_branches: bool,
     allow_suffix_branch: bool,
     ops: ManualRepositoryOps,
 ) -> PublishResult:
-    result = PublishResult(check_only=check_only)
+    """Run the check phase of publish: collect plan, classify remote state, dry-run push.
+
+    Returns a :class:`PublishResult` with ``check_only=True`` and all plan
+    items populated with their remote state.  No actual push is performed.
+    """
+    result = PublishResult(check_only=True)
     ops.ensure_git_repo(repo_path)
     ensure_valid_push_target(repo_path, push_target, ops)
     if not ops.remote_exists(repo_path, remote):
@@ -434,17 +438,92 @@ def run_publish_workflow(
                 push_target,
                 ops,
                 allow_suffix_branch=allow_suffix_branch,
-                dry_run=check_only,
+                dry_run=True,
             )
 
     for item in result.items:
         run_push_check(item, remote, push_target, ops)
-        if not check_only and not item.skipped:
-            push_item(item, remote, push_target, ops)
         print_publish_item(item)
         result.warnings.extend(item.messages)
 
     return result
+
+
+def run_publish_execute(
+    check_result: PublishResult,
+    *,
+    remote: str,
+    push_target: str,
+    sync_local_branches: bool,
+    allow_suffix_branch: bool,
+    selected_display_paths: set[str] | None = None,
+    ops: ManualRepositoryOps,
+) -> PublishResult:
+    """Execute the actual push for items that passed the check phase.
+
+    If *selected_display_paths* is provided, only items whose
+    ``display_path`` is in the set will be pushed; all others are skipped.
+    """
+    result = PublishResult(check_only=False)
+    result.items = list(check_result.items)
+    result.warnings = list(check_result.warnings)
+
+    for item in result.items:
+        if selected_display_paths is not None and item.display_path not in selected_display_paths:
+            item.skipped = True
+            item.messages.append("Excluded by user selection.")
+            print_publish_item(item)
+            continue
+
+        if item.skipped:
+            print_publish_item(item)
+            continue
+
+        if sync_local_branches:
+            sync_local_branch_ref(
+                item,
+                push_target,
+                ops,
+                allow_suffix_branch=allow_suffix_branch,
+                dry_run=False,
+            )
+
+        push_item(item, remote, push_target, ops)
+        print_publish_item(item)
+        result.warnings.extend(item.messages)
+
+    return result
+
+
+def run_publish_workflow(
+    repo_path: Path,
+    *,
+    remote: str,
+    push_target: str,
+    check_only: bool,
+    sync_local_branches: bool,
+    allow_suffix_branch: bool,
+    ops: ManualRepositoryOps,
+) -> PublishResult:
+    check_result = run_publish_check(
+        repo_path,
+        remote=remote,
+        push_target=push_target,
+        sync_local_branches=sync_local_branches,
+        allow_suffix_branch=allow_suffix_branch,
+        ops=ops,
+    )
+    if check_only:
+        return check_result
+
+    return run_publish_execute(
+        check_result,
+        remote=remote,
+        push_target=push_target,
+        sync_local_branches=sync_local_branches,
+        allow_suffix_branch=allow_suffix_branch,
+        ops=ops,
+    )
 
 
 def run_publish(
@@ -484,6 +563,44 @@ class ManualPublishService:
 
     def run_publish(self, args: Any) -> int:
         return run_publish(args, manual_module=self.manual_module, ops=ManualRepositoryOps(self.manual_module))
+
+    def run_publish_check(
+        self,
+        repo_path: Path,
+        *,
+        remote: str,
+        push_target: str,
+        sync_local_branches: bool = True,
+        allow_suffix_branch: bool = True,
+    ) -> PublishResult:
+        return run_publish_check(
+            repo_path,
+            remote=remote,
+            push_target=push_target,
+            sync_local_branches=sync_local_branches,
+            allow_suffix_branch=allow_suffix_branch,
+            ops=ManualRepositoryOps(self.manual_module),
+        )
+
+    def run_publish_execute(
+        self,
+        check_result: PublishResult,
+        *,
+        remote: str,
+        push_target: str,
+        sync_local_branches: bool = True,
+        allow_suffix_branch: bool = True,
+        selected_display_paths: set[str] | None = None,
+    ) -> PublishResult:
+        return run_publish_execute(
+            check_result,
+            remote=remote,
+            push_target=push_target,
+            sync_local_branches=sync_local_branches,
+            allow_suffix_branch=allow_suffix_branch,
+            selected_display_paths=selected_display_paths,
+            ops=ManualRepositoryOps(self.manual_module),
+        )
 
     def run_publish_workflow(
         self,
