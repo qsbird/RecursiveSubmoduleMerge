@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import MISSING, asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -216,9 +216,11 @@ def _apply_values(args: Any, section: Any) -> None:
     config value.
     """
     section_defaults: dict[str, Any] = {}
-    for f in fields(section):
-        if f.default is not field and f.default_factory is not field:
-            section_defaults[f.name] = f.default if f.default is not field else f.default_factory()
+    for config_field in fields(section):
+        if config_field.default is not MISSING:
+            section_defaults[config_field.name] = config_field.default
+        elif config_field.default_factory is not MISSING:
+            section_defaults[config_field.name] = config_field.default_factory()
 
     for f in fields(section):
         if not hasattr(args, f.name):

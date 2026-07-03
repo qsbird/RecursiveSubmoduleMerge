@@ -114,7 +114,7 @@ class CiSubmoduleFetchScopeTests(unittest.TestCase):
             fetch_repos = [
                 call[0]
                 for call in runner.calls
-                if call[1] == ("fetch", "--no-recurse-submodules", "--all", "--prune")
+                if call[0] != repo and call[1] == ("fetch", "--no-recurse-submodules", "origin", "--prune")
             ]
             self.assertEqual(fetch_repos, [repo / "libs" / "changed"])
             self.assertNotIn(("submodule", "foreach", "--recursive", "git fetch --all --prune"), called_args)
@@ -134,7 +134,7 @@ class CiSubmoduleFetchScopeTests(unittest.TestCase):
             fetch_repos = [
                 call[0]
                 for call in runner.calls
-                if call[1] == ("fetch", "--no-recurse-submodules", "--all", "--prune")
+                if call[0] != repo and call[1] == ("fetch", "--no-recurse-submodules", "origin", "--prune")
             ]
             self.assertEqual(fetch_repos, [repo / "libs" / "one", repo / "libs" / "two"])
             self.assertNotIn(("submodule", "foreach", "--recursive", "git fetch --all --prune"), called_args)

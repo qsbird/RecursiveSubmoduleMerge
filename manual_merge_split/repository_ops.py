@@ -611,6 +611,58 @@ class ManualRepositoryOps:
                 ) from exc
         return snapshots
 
+    def manual_merge_todo_exists(self, repo_path: Path, report_file_name: str = "merge_manual_todo.txt") -> bool:
+        return (repo_path / report_file_name).exists()
+
+    def _is_path_tracked(self, repo_path: Path, relative_path: str) -> bool:
+        """Return True if the given path is tracked by git (exists in the index)."""
+        result = self.run_git(
+            repo_path,
+            ["ls-files", "--error-unmatch", "--", relative_path],
+            check=False,
+        )
+        return result.returncode == 0
+
+    def has_any_in_progress_state(self, repo_path: Path) -> bool:
+        """Return True if the repo has any in-progress operation or leftover report file."""
+        if self.merge_in_progress(repo_path):
+            return True
+        if self.get_unmerged_paths(repo_path):
+            return True
+        if self.working_tree_has_changes(repo_path):
+            return True
+        return False
+
+    def cleanup_repository_fallback(
+        self,
+        repo_path: Path,
+        result: CleanupResult,
+        *,
+        skip_submodule_update: bool = False,
+        allow_clean_x: bool = False,
+        ignored_root_untracked_paths: Iterable[str] = (),
+        preserved_dirty_paths_by_repo: dict[Path, set[str]] | None = None,
+        preserved_dirty_repos: set[Path] | None = None,
+        report_file_name: str = "merge_manual_todo.txt",
+    ) -> None:
+        """Compatibility wrapper around the unified four-level cleanup flow."""
+        self.cleanup_repository(
+            repo_path,
+            result,
+            skip_submodule_update=skip_submodule_update,
+            allow_clean_x=allow_clean_x,
+            ignored_root_untracked_paths=ignored_root_untracked_paths,
+            preserved_dirty_paths_by_repo=preserved_dirty_paths_by_repo,
+            preserved_dirty_repos=preserved_dirty_repos,
+        )
+        report_path = repo_path / report_file_name
+        if report_path.exists() and not self._is_path_tracked(repo_path, report_file_name):
+            try:
+                report_path.unlink()
+                result.removed_reports.append(report_path)
+            except OSError:
+                pass
+
     def rollback_to_snapshot(
         self,
         repo_path: Path,
@@ -625,7 +677,13 @@ class ManualRepositoryOps:
         report_contents = None
         if preserve_report and report_path is not None and report_path.exists():
             report_contents = report_path.read_text(encoding="utf-8")
-            report_path.unlink()
+            # Only unlink if the report file is NOT tracked by git.
+            # For tracked files, reset --hard in cleanup_repository will restore
+            # the committed version, and we overwrite with write_text afterwards.
+            # Unlinking a tracked file creates an unstaged deletion that makes
+            # the repo appear dirty to working_tree_has_changes.
+            if not self._is_path_tracked(repo_path, report_path.name):
+                report_path.unlink()
         self.cleanup_repository(
             repo_path,
             CleanupResult(),
@@ -724,6 +782,8 @@ class ManualRepositoryOps:
             )
             tried.append(level_name)
             if success:
+                if not skip_submodule_update and is_root:
+                    result.submodule_updates.append(repo_path)
                 return
 
         # all levels failed — build a detailed error message

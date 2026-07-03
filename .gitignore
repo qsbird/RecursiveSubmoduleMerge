@@ -5,3 +5,14 @@ __pycache__/
 
 ci_*_run*/
 manual_*_run*/
+# Local tooling state and generated release artifacts
+/.codegraph/
+/build/
+/dist/
+/build_manual_cli_exe_*/
+/build_manual_exe_*/
+/build_manual_specs_*/
+/dist_manual_exe_*/
+/_package_stage*/
+/MergeTool_manual_CI_bundle_*.zip
+/merge_tool_last_run.json

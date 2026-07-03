@@ -35,6 +35,7 @@ from .review_common import (
 
 DEFAULT_DIFF_CONTEXT_LINES = 3
 DEFAULT_EXPANDED_DIFF_CONTEXT_LINES = 20
+MAX_PATCH_LINES = 1000
 
 
 CSS = """
@@ -1532,6 +1533,18 @@ def collect_review_model(
                 expanded_diff_context_lines,
             )
         warnings.extend(patch_warnings)
+
+        # If a patch exceeds MAX_PATCH_LINES, skip rendering the diff
+        # content entirely and only show a summary card with the original
+        # patch file path so reviewers can inspect it externally.
+        patch_skipped_large = False
+        patch_line_count = 0
+        if isinstance(patch_text, str) and patch_text:
+            patch_line_count = len(patch_text.splitlines())
+            if patch_line_count > MAX_PATCH_LINES:
+                patch_skipped_large = True
+                patch_text = ""
+
         repositories.append(
             {
                 "index": index,
@@ -1554,6 +1567,8 @@ def collect_review_model(
                 "context_lines": patch_context_lines,
                 "expanded_context_lines": expanded_patch_context_lines,
                 "file_patch_views": file_patch_views,
+                "patch_skipped_large": patch_skipped_large,
+                "patch_line_count": patch_line_count,
                 "full_file_views": collect_full_file_views(report, repo, report_dir),
                 "gitlink_file_indices": gitlink_file_indices,
             }
@@ -1820,6 +1835,15 @@ def repo_filter_key(repo: dict[str, Any]) -> str:
 
 
 def render_repo_section(repo: dict[str, Any]) -> str:
+    if repo.get("patch_skipped_large"):
+        patch_view = (
+            f'<div class="warning">Patch is too large '
+            f'({repo.get("patch_line_count", 0)} lines, exceeds {MAX_PATCH_LINES} line limit) '
+            'to render inline.<br/>'
+            f'Original patch file: <code>{esc(repo.get("patch_path") or "N/A")}</code></div>'
+        )
+    else:
+        patch_view = render_patch_views(repo)
     return f"""
 <section class="repo-section" id="repo-{repo["index"]}" data-filter-key="{esc(repo_filter_key(repo))}">
   <div class="repo-header">
@@ -1848,7 +1872,7 @@ def render_repo_section(repo: dict[str, Any]) -> str:
     <h3>Changed Files</h3>
     {render_changed_files(repo)}
     <h3>Patch</h3>
-    {render_patch_views(repo)}
+    {patch_view}
     {render_gitlink_changes(repo)}
     <h3>Full File Views</h3>
     {render_file_views(repo)}

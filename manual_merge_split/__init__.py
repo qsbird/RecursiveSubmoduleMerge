@@ -26,12 +26,14 @@ from .models import (
     TextMergeNormalization,
     UnmergedConflict,
 )
-from .preflight import ManualPreflightService
+from .preflight import ManualPreflightService, ToolAvailabilityResult, check_tool_availability
 from .publish import (
     ManualPublishService,
     PublishPlanItem,
     PublishResult,
     run_publish,
+    run_publish_check,
+    run_publish_execute,
     run_publish_workflow,
 )
 from .repository_ops import ManualRepositoryOps
@@ -66,6 +68,7 @@ __all__ = [
     "RepoSnapshot",
     "SubmoduleConflictInfo",
     "TextMergeNormalization",
+    "ToolAvailabilityResult",
     "UnmergedConflict",
     "load_manual_merge_module",
     "build_parser",
@@ -75,7 +78,10 @@ __all__ = [
     "run_git",
     "run_git_binary",
     "run_publish",
+    "run_publish_check",
+    "run_publish_execute",
     "run_publish_workflow",
     "set_verbose",
     "verbose_print",
+    "check_tool_availability",
 ]

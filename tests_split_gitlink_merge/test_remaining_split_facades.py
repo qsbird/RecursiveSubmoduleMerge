@@ -484,8 +484,8 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             )
 
         nested = {"a": {"b": 0}, "x": 1}
-        self.assertEqual(report_value(nested, "a", "b"), self.ci_merge.report_value(nested, "a", "b"))
-        self.assertEqual(report_value(nested, "x", "missing"), self.ci_merge.report_value(nested, "x", "missing"))
+        self.assertEqual(report_value(nested, "a", "b"), 0)
+        self.assertIsNone(report_value(nested, "x", "missing"))
 
         ctx = types.SimpleNamespace(args=types.SimpleNamespace(publish_target="main", remote="origin"))
         report = {"input": {"target": "main"}, "publish": {"target": None}, "resolved": {"target_ref": "refs/heads/main"}}
@@ -495,16 +495,14 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             infer_publish_target_from_report(ctx, report)
         self.assertEqual(missing_target.exception.reason, "PUBLISH_TARGET_REQUIRED")
 
-    def test_ci_command_helpers_match_original(self) -> None:
+    def test_ci_command_helpers_are_local(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "repo"
             root.mkdir()
-            local_ctx = FakeCiContext(Path(temp_dir))
-            original_ctx = FakeCiContext(Path(temp_dir))
-            local_ctx.root_repo = root
-            original_ctx.root_repo = root
+            ctx = FakeCiContext(Path(temp_dir))
+            ctx.root_repo = root
 
-            kwargs = {
+            resolved_fields = {
                 "source_ref": "refs/remotes/origin/source",
                 "source_sha": "sourcesha",
                 "target_ref": "refs/remotes/origin/main",
@@ -512,39 +510,32 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                 "merge_base_sha": "basesha",
                 "result_sha": "resultsha",
             }
-            ci_commands.set_resolved_fields(local_ctx, **kwargs)
-            self.ci_merge.set_resolved_fields(original_ctx, **kwargs)
-            self.assertEqual(local_ctx.report.data["resolved"], original_ctx.report.data["resolved"])
+            ci_commands.set_resolved_fields(ctx, **resolved_fields)
+            for key, value in resolved_fields.items():
+                self.assertEqual(ctx.report.data["resolved"][key], value)
 
-            self.assertEqual(
-                ci_commands.batch_step_artifact_scope(local_ctx, "batch/step-01"),
-                self.ci_merge.batch_step_artifact_scope(original_ctx, "batch/step-01"),
-            )
-            local_ctx.report.data["commands"] = [{"cmd": ["git"]}, {"cmd": ["git"]}]
-            original_ctx.report.data["commands"] = [{"cmd": ["git"]}, {"cmd": ["git"]}]
-            self.assertEqual(ci_commands.command_range(local_ctx, 1), self.ci_merge.command_range(original_ctx, 1))
-            self.assertEqual(
-                ci_commands.manual_publish_info(local_ctx, "targetsha", "resultsha"),
-                self.ci_merge.manual_publish_info(original_ctx, "targetsha", "resultsha"),
-            )
-            self.assertEqual(
-                ci_commands.can_attempt_cleanup(local_ctx, root),
-                self.ci_merge.can_attempt_cleanup(original_ctx, root),
-            )
+            scope = ci_commands.batch_step_artifact_scope(ctx, "batch/step-01")
+            self.assertEqual(scope["prefix"], "batch/step-01")
+            self.assertEqual(scope["patch_dir"], str(ctx.report.output_dir / "patches" / "batch/step-01"))
+
+            ctx.report.data["commands"] = [{"cmd": ["git"]}, {"cmd": ["git"]}]
+            self.assertEqual(ci_commands.command_range(ctx, 1), {"start": 1, "end": 1, "count": 1})
+
+            publish_info = ci_commands.manual_publish_info(ctx, "targetsha", "resultsha")
+            self.assertEqual(publish_info["remote"], "origin")
+            self.assertEqual(publish_info["target"], "main")
+            self.assertTrue(publish_info["supported"])
+            self.assertIn("--force-with-lease=main:targetsha", publish_info["command"])
+            self.assertTrue(ci_commands.can_attempt_cleanup(ctx, root))
 
         passed = ci_models.PreflightResult(True, [], [], source_sha="source", target_sha="target")
         self.assertIsNone(ci_commands.ensure_preflight_shas(passed))
-        self.assertIsNone(self.ci_merge.ensure_preflight_shas(passed))
 
         failed = ci_models.PreflightResult(False, [], [{"name": "working_tree_clean"}])
-        with self.assertRaises(ci_models.CiMergeError) as local_error:
+        with self.assertRaises(ci_models.CiMergeError) as error:
             ci_commands.fail_preflight(failed)
-        with self.assertRaises(self.ci_merge.CiMergeError) as original_error:
-            self.ci_merge.fail_preflight(failed)
-        self.assertEqual(local_error.exception.exit_code, original_error.exception.exit_code)
-        self.assertEqual(local_error.exception.phase, original_error.exception.phase)
-        self.assertEqual(local_error.exception.reason, original_error.exception.reason)
-
+        self.assertEqual(error.exception.exit_code, ci_models.ExitCode.PREFLIGHT_FAILED)
+        self.assertEqual(error.exception.phase, ci_models.Phase.PREFLIGHT)
     def test_ci_runtime_args_and_report_match_original_shape(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo = Path(temp_dir) / "repo"
@@ -570,7 +561,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             ci_runtime.normalize_args(local_args, "job-42")
             self.ci_merge.normalize_args(original_args, "job-42")
 
-            self.assertEqual(local_args.sources, original_args.sources)
+            self.assertEqual(local_args.sources, [original_args.source])
             self.assertEqual(local_args.work_branch, original_args.work_branch)
             self.assertEqual(local_args.candidate_ref, original_args.candidate_ref)
             ci_runtime.validate_args(local_args)
@@ -590,18 +581,30 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             self.assertEqual(local_input.pop("git_network_retries"), 2)
             self.assertEqual(local_input.pop("git_network_retry_delay"), 3.0)
             self.assertEqual(local_input.pop("expanded_diff_context_lines"), 20)
+            self.assertEqual(local_input.pop("sources"), ["feature"])
+            self.assertFalse(local_input.pop("allow_partial_publish"))
+            self.assertIsNone(local_input.pop("from_report"))
+            self.assertFalse(local_input.pop("publish_only"))
             self.assertEqual(local_input, original_report.data["input"])
-            local_batch = local_report.data["batch"].copy()
-            original_batch = original_report.data["batch"].copy()
-            self.assertEqual(local_batch.pop("failure_mode"), "continue-success")
-            original_batch.pop("failure_mode", None)
-            self.assertEqual(local_batch, original_batch)
+            local_batch = local_report.data["batch"]
+            self.assertEqual(local_batch["failure_mode"], "continue-success")
+            self.assertFalse(local_batch["enabled"])
+            self.assertEqual(local_batch["source_count"], 1)
+            self.assertEqual(local_batch["steps"], [])
             local_publish = local_report.data["publish"].copy()
             self.assertFalse(local_publish.pop("allow_create_target"))
             self.assertFalse(local_publish.pop("target_created"))
             self.assertIsNone(local_publish.pop("target_publish_mode"))
+            self.assertEqual(
+                local_publish.pop("root"),
+                {"candidate_ref_pushed": False, "target_pushed": False, "success": None},
+            )
+            self.assertEqual(
+                local_publish.pop("submodules"),
+                {"attempted": False, "success": None, "count": 0, "items": []},
+            )
             self.assertEqual(local_publish, original_report.data["publish"])
-            self.assertEqual(set(local_report.data), set(original_report.data))
+            self.assertTrue(set(original_report.data).issubset(set(local_report.data)))
 
     def test_ci_runtime_publish_requires_explicit_publish_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2130,7 +2133,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
         self.assertTrue(prompt_yes_no("Prompt", True, input_func=lambda _prompt: ""))
         self.assertTrue(prompt_yes_no("Prompt", False, input_func=lambda _prompt: "yes"))
 
-        answers = iter(["", "cleanup", "n", "", "", ""])
+        answers = iter(["", "cleanup", "n", "", "", "", ""])
         captured: dict[str, object] = {}
 
         def fake_cleanup(args: object) -> int:
@@ -2185,7 +2188,9 @@ class ExtractedImplementationParityTests(unittest.TestCase):
         ]
         local_cleanup = manual_runtime.parse_args(cleanup_argv)
         original_cleanup = self.manual_merge.parse_args(cleanup_argv)
-        self.assertEqual(vars(local_cleanup), vars(original_cleanup))
+        local_cleanup_values = vars(local_cleanup).copy()
+        self.assertFalse(local_cleanup_values.pop("allow_clean_x"))
+        self.assertEqual(local_cleanup_values, vars(original_cleanup))
 
         calls: list[tuple[str, object]] = []
         command_service = types.SimpleNamespace(
