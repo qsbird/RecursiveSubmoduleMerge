@@ -790,37 +790,61 @@ def run_publish(
     allow_suffix = not bool(getattr(args, "no_branch_suffix", False))
 
     try:
-        # Phase 1 – discovery
-        candidates = discover_publish_candidates(repo_path, remote, push_target, resolved_ops)
-        if not candidates:
-            print("No repositories need pushing.")
-            return 0
-
-        # Phase 2 – confirmation (skip when --no-interactive or check-only)
-        if not no_interactive and not check_only and _sys.stdin.isatty():
-            confirmed = confirm_publish_plan_interactive(candidates)
-            if confirmed is None:
-                print("Publish cancelled by user.")
-                return 0
-            candidates = [c for c in confirmed if c.selected]
-        elif not no_interactive and check_only:
-            display_publish_plan(candidates)
-            candidates = [c for c in candidates if c.selected]
-        elif no_interactive:
-            # keep all discovered candidates
-            pass
-
-        if not candidates:
-            print("No repositories selected for push.")
-            return 0
-
-        # Phase 3 – execute
-        result = _run_publish_workflow_with_candidates(
-            candidates, remote, push_target, resolved_ops,
-            check_only=check_only,
+        # Phase 1: use the same recursive check path as the GUI. This
+        # initializes every nested submodule before building the gitlink plan,
+        # so deep repositories cannot disappear merely because their worktree
+        # was not initialized before publish started.
+        check_result = run_publish_check(
+            repo_path,
+            remote=remote,
+            push_target=push_target,
             sync_local_branches=sync_local,
             allow_suffix_branch=allow_suffix,
+            ops=resolved_ops,
         )
+        if check_only:
+            result = check_result
+        else:
+            selected_display_paths: set[str] | None = None
+            pushable_items = [item for item in check_result.items if not item.skipped]
+
+            # Phase 2: optional interactive selection over the checked plan.
+            if not no_interactive and _sys.stdin.isatty():
+                candidates = [
+                    PublishCandidate(
+                        repo_path=item.repo_path,
+                        display_path=item.display_path,
+                        commit_sha=item.desired_sha,
+                        remote_before_sha=item.remote_before_sha,
+                        remote_state=item.remote_state,
+                        depth=item.depth,
+                    )
+                    for item in pushable_items
+                ]
+                if not candidates:
+                    print("No repositories need pushing.")
+                    return 0
+                confirmed = confirm_publish_plan_interactive(candidates)
+                if confirmed is None:
+                    print("Publish cancelled by user.")
+                    return 0
+                selected_display_paths = {
+                    candidate.display_path for candidate in confirmed if candidate.selected
+                }
+                if not selected_display_paths:
+                    print("No repositories selected for push.")
+                    return 0
+
+            # Phase 3: execute exactly the plan that passed recursive check.
+            result = run_publish_execute(
+                check_result,
+                remote=remote,
+                push_target=push_target,
+                sync_local_branches=sync_local,
+                allow_suffix_branch=allow_suffix,
+                selected_display_paths=selected_display_paths,
+                ops=resolved_ops,
+            )
     except resolved_ops._automation_error_class() as exc:
         print(str(exc))
         return 1
