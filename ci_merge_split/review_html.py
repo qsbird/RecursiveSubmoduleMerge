@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .review_html_patch import PATCH_HUNK_RE, PatchRow, display_lines, parse_patch_rows, patch_line_class
 from .review_common import (
     CONFLICT_STAGE_LABELS,
     build_risk_items,
@@ -764,21 +765,6 @@ def repository_display_name(repo: dict[str, Any]) -> str:
     return f"{repo_name} (root)" if repo_name else "root repository"
 
 
-def patch_line_class(line: str) -> str:
-    if line == "" or line.startswith("\\ No newline"):
-        return "note"
-    if line.startswith("@@"):
-        return "hunk"
-    if line.startswith(("diff --git", "index ", "--- ", "+++ ", "Binary files ")):
-        return "meta"
-    if line.startswith("+"):
-        return "add"
-    if line.startswith("-"):
-        return "del"
-    return "ctx"
-
-
-PATCH_HUNK_RE = re.compile(r"@@ -(?P<old>\d+)(?:,\d+)? \+(?P<new>\d+)(?:,\d+)? @@")
 GITLINK_PATCH_RE = re.compile(
     r"(?m)^(?:index [0-9a-f]+\.\.[0-9a-f]+ 160000|[-+]Subproject commit [0-9a-f]+)"
 )
@@ -891,12 +877,6 @@ def html_token(value: str | None) -> str:
     return token.strip("-") or "text"
 
 
-def display_lines(text: str) -> list[str]:
-    if text == "":
-        return []
-    return text.splitlines()
-
-
 def rd_change_type(kind: str) -> str:
     if kind == "add":
         return "added"
@@ -938,60 +918,6 @@ def render_code_editor(
         f"{''.join(rendered_lines)}"
         "</tbody></table></div></div>"
     )
-
-
-def parse_patch_rows(text: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    old_line: int | None = None
-    new_line: int | None = None
-    for index, raw_line in enumerate(display_lines(text), start=1):
-        kind = patch_line_class(raw_line)
-        old_number: int | str = ""
-        new_number: int | str = ""
-        sign = ""
-        code = raw_line
-
-        if kind == "hunk":
-            match = PATCH_HUNK_RE.search(raw_line)
-            if match:
-                old_line = int(match.group("old"))
-                new_line = int(match.group("new"))
-        elif kind == "ctx":
-            if raw_line.startswith(" "):
-                code = raw_line[1:]
-                if old_line is not None:
-                    old_number = old_line
-                    old_line += 1
-                if new_line is not None:
-                    new_number = new_line
-                    new_line += 1
-            else:
-                kind = "meta"
-        elif kind == "del":
-            sign = "-"
-            code = raw_line[1:] if raw_line.startswith("-") else raw_line
-            if old_line is not None:
-                old_number = old_line
-                old_line += 1
-        elif kind == "add":
-            sign = "+"
-            code = raw_line[1:] if raw_line.startswith("+") else raw_line
-            if new_line is not None:
-                new_number = new_line
-                new_line += 1
-
-        rows.append(
-            {
-                "index": index,
-                "raw": raw_line,
-                "code": code,
-                "kind": kind,
-                "old_number": old_number,
-                "new_number": new_number,
-                "sign": sign,
-            }
-        )
-    return rows
 
 
 def render_patch_unified(rows: list[dict[str, Any]]) -> str:

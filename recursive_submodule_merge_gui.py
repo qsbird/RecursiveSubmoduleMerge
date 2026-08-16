@@ -16,9 +16,27 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
+from gui_command_builders import (
+    CloneSpec,
+    CommandSpec,
+    DEFAULT_CONFLICT_TOOL_COMMAND,
+    DEFAULT_CONFLICT_TOOL_TIMEOUT_SECONDS,
+    DEFAULT_FILE_CONFLICT_MODE,
+    GuiInputError,
+    REPORT_FILE_NAME,
+    ROOT_BASE_REMOTE_BRANCH,
+    build_cleanup_argv,
+    build_clone_spec,
+    build_command_spec,
+    build_merge_argv,
+    build_publish_argv,
+    clone_target_path,
+    parse_branch_tokens,
+    text_lines,
+)
 from manual_merge_split.repository_ops import (
     RISK_CONFIRMATION_EVENT_PREFIX,
     RISK_CONFIRMATION_PROTOCOL_ENV,
@@ -28,12 +46,7 @@ from manual_merge_split.window_icon import apply_window_icon
 from subprocess_window import hidden_subprocess_kwargs
 
 
-ROOT_BASE_REMOTE_BRANCH = "origin/main"
 WORK_BRANCH_DEFAULT = "validation-work"
-REPORT_FILE_NAME = "merge_manual_todo.txt"
-DEFAULT_FILE_CONFLICT_MODE = "tool"
-DEFAULT_CONFLICT_TOOL_COMMAND = 'code --wait "{file}"'
-DEFAULT_CONFLICT_TOOL_TIMEOUT_SECONDS = 1800
 CONFLICT_TOOL_CONFIRMATION_MESSAGE = "Manual confirmation required after conflict tool closes"
 CONTINUE_BASE_REMOTE_PLACEHOLDER = "HEAD"
 CONTINUE_WORK_BRANCH_PLACEHOLDER = "current branch"
@@ -100,9 +113,25 @@ UI_TEXT: dict[str, dict[str, str]] = {
         LANGUAGE_ZH: "工具超时时间（秒）",
     },
     "frame_merge_safeguards": {LANGUAGE_EN: "Merge safeguards", LANGUAGE_ZH: "合并保护"},
-    "option_allow_dirty_submodules": {
-        LANGUAGE_EN: "Allow unaffected dirty submodules",
-        LANGUAGE_ZH: "允许未受影响的脏子模块",
+    "hint_clean_worktree_required": {
+        LANGUAGE_EN: (
+            "Merge requires a clean working tree in the root repository and every submodule. "
+            "Use the Cleanup tab to discard local changes first; you are responsible for any data loss."
+        ),
+        LANGUAGE_ZH: (
+            "合并前根仓库和所有子模块的工作区必须干净。"
+            "如需丢弃本地修改，请先使用「清理」页；由此造成的数据丢失由你自行负责。"
+        ),
+    },
+    "hint_cleanup_responsibility": {
+        LANGUAGE_EN: (
+            "Cleanup is the supported way to make a dirty repository mergeable. "
+            "It can recursively reset and delete uncommitted work. Continue only if you accept that loss."
+        ),
+        LANGUAGE_ZH: (
+            "清理是让脏仓库可以合并的入口。"
+            "它会递归 reset 并删除未提交内容。只有在你接受该损失时才继续。"
+        ),
     },
     "option_cross_submodule_moves": {
         LANGUAGE_EN: "Enable cross-submodule moved file detection",
@@ -253,16 +282,14 @@ UI_TEXT: dict[str, dict[str, str]] = {
     },
     "message_cleanup_risk_body": {
         LANGUAGE_EN: (
-            "Cleanup may recursively run git reset --hard and discard tracked or staged local changes. "
-            "If rebuild work branch is enabled, an existing branch with the same name may also be moved. "
-            "The tool blocks known committed-work overwrite risks, but you should commit or stash important "
-            "work before continuing.\n\nContinue cleanup?"
+            "Cleanup may recursively abort in-progress Git operations and run git reset --hard plus git clean. "
+            "Uncommitted, staged, and untracked local changes in the root repository and submodules can be discarded. "
+            "You are responsible for that data loss. Commit or stash anything you still need.\n\nContinue cleanup?"
         ),
         LANGUAGE_ZH: (
-            "\u6e05\u7406\u53ef\u80fd\u9012\u5f52\u6267\u884c git reset --hard\uff0c\u4e22\u5f03\u5df2\u8ddf\u8e2a\u6216\u5df2\u6682\u5b58\u7684\u672c\u5730\u4fee\u6539\u3002"
-            "\u5982\u679c\u542f\u7528\u91cd\u5efa\u5de5\u4f5c\u5206\u652f\uff0c\u540c\u540d\u672c\u5730\u5206\u652f\u4e5f\u53ef\u80fd\u88ab\u79fb\u52a8\u3002"
-            "\u5de5\u5177\u4f1a\u963b\u6b62\u5df2\u77e5\u7684\u5df2\u63d0\u4ea4\u4ee3\u7801\u8986\u76d6\u98ce\u9669\uff0c"
-            "\u4f46\u7ee7\u7eed\u524d\u8bf7\u5148 commit \u6216 stash \u91cd\u8981\u5185\u5bb9\u3002\n\n\u662f\u5426\u7ee7\u7eed\u6e05\u7406\uff1f"
+            "清理可能递归中止进行中的 Git 操作，并执行 git reset --hard 和 git clean，"
+            "丢弃根仓库和子模块中未提交、已暂存和未跟踪的本地修改。"
+            "由此造成的数据丢失由你自行负责。请先 commit 或 stash 仍需保留的内容。\n\n是否继续清理？"
         ),
     },
     "message_clone_running_body": {
@@ -447,72 +474,11 @@ def format_friendly_output(content: str, language: str = LANGUAGE_EN) -> str:
     return "".join(format_friendly_output_line(line, language) for line in content.splitlines(keepends=True))
 
 
-class GuiInputError(ValueError):
-    """Raised when form values cannot be translated to CLI arguments."""
-
-
-@dataclass(frozen=True)
-class CommandSpec:
-    action: str
-    argv: list[str]
-
-
-@dataclass(frozen=True)
-class CloneSpec:
-    command: list[str]
-    target_path: Path
-
-
 @dataclass(frozen=True)
 class RiskConfirmationEvent:
     reason: str
     message: str
     details: dict[str, Any]
-
-
-def _string_value(values: dict[str, Any], key: str, default: str = "") -> str:
-    value = values.get(key, default)
-    if value is None:
-        return default
-    return str(value).strip()
-
-
-def _bool_value(values: dict[str, Any], key: str, default: bool = False) -> bool:
-    value = values.get(key, default)
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _int_value(values: dict[str, Any], key: str, default: int) -> int:
-    raw = _string_value(values, key, str(default))
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise GuiInputError(f"{key} must be an integer.") from exc
-    if value < 0:
-        raise GuiInputError(f"{key} cannot be negative.")
-    return value
-
-
-def parse_branch_tokens(raw_value: str) -> list[str]:
-    normalized = raw_value.replace("\r", "\n").replace(",", "\n")
-    tokens: list[str] = []
-    for line in normalized.splitlines():
-        for part in line.split():
-            stripped = part.strip()
-            if stripped:
-                tokens.append(stripped)
-    return tokens
-
-
-def text_lines(raw_value: str) -> list[str]:
-    normalized = raw_value.replace("\r", "\n")
-    return [line.strip() for line in normalized.splitlines() if line.strip()]
 
 
 def parse_risk_confirmation_event(line: str) -> RiskConfirmationEvent | None:
@@ -559,171 +525,6 @@ def format_risk_confirmation_details(details: dict[str, Any], *, max_items: int 
     return "\n".join(lines) if lines else "No additional details."
 
 
-def clone_target_path(destination: str | Path, directory_name: str) -> Path:
-    directory = str(directory_name).strip()
-    if not directory:
-        raise GuiInputError("Directory Name is required for clone.")
-    directory_path = Path(directory)
-    if directory_path.is_absolute() or len(directory_path.parts) != 1 or directory in {".", ".."}:
-        raise GuiInputError("Directory Name must be a single child directory name.")
-
-    raw_destination = str(destination).strip()
-    if not raw_destination:
-        raise GuiInputError("Destination is required for clone.")
-    destination_path = Path(raw_destination).expanduser()
-    if destination_path.exists() and not destination_path.is_dir():
-        raise GuiInputError(f"Destination is not a directory: {destination_path}")
-    return destination_path / directory
-
-
-def build_clone_spec(values: dict[str, Any]) -> CloneSpec:
-    clone_url = _string_value(values, "clone_url")
-    if not clone_url:
-        raise GuiInputError("Repository URL is required for clone.")
-    destination = _string_value(values, "clone_destination")
-    target = clone_target_path(destination, _string_value(values, "clone_directory_name"))
-    if target.exists():
-        if target.is_dir() and not any(target.iterdir()):
-            pass
-        else:
-            raise GuiInputError(f"Clone target already exists and is not empty: {target}")
-
-    command = ["git", "-c", "protocol.file.allow=always", "clone", "-v", "--progress"]
-    clone_branch = _string_value(values, "clone_branch")
-    if clone_branch:
-        command.extend(["--branch", clone_branch])
-    command.extend([clone_url, str(target)])
-    return CloneSpec(command=command, target_path=target)
-
-
-def build_merge_argv(values: dict[str, Any]) -> list[str]:
-    branches = parse_branch_tokens(_string_value(values, "merge_branches"))
-    if not branches:
-        raise GuiInputError("At least one merge branch is required.")
-
-    repo = _string_value(values, "repo", ".") or "."
-    argv = ["merge", *branches, "--repo", repo]
-
-    if _bool_value(values, "clone_enabled"):
-        clone_branch = _string_value(values, "clone_branch")
-        clone_url = _string_value(values, "clone_url")
-        clone_path = _string_value(values, "clone_path")
-        if not (clone_branch and clone_url and clone_path):
-            raise GuiInputError("Clone branch, URL, and target path are required when clone is enabled.")
-        argv.extend(
-            [
-                "--clone-branch",
-                clone_branch,
-                "--clone-url",
-                clone_url,
-                "--clone-path",
-                clone_path,
-            ]
-        )
-
-    if _bool_value(values, "continue_current_branch"):
-        argv.append("--continue-current-branch")
-    else:
-        base_remote_branch = _string_value(values, "base_remote_branch", ROOT_BASE_REMOTE_BRANCH)
-        if not base_remote_branch:
-            raise GuiInputError("Base remote branch is required unless continuing on the current branch.")
-        argv.extend(["--base-remote-branch", base_remote_branch])
-        work_branch = _string_value(values, "work_branch")
-        if work_branch:
-            argv.extend(["--work-branch", work_branch])
-
-    if _bool_value(values, "allow_dirty_submodules"):
-        argv.append("--allow-dirty-submodules")
-    if _bool_value(values, "no_prompt_dirty_submodules", True):
-        argv.append("--no-prompt-dirty-submodules")
-    if _bool_value(values, "enable_cross_submodule_moves"):
-        argv.append("--enable-cross-submodule-moves")
-
-    report_file = _string_value(values, "report_file", REPORT_FILE_NAME)
-    if report_file:
-        argv.extend(["--report-file", report_file])
-
-    for ignored_path in text_lines(_string_value(values, "ignore_root_untracked_paths")):
-        argv.extend(["--ignore-root-untracked-path", ignored_path])
-
-    file_conflict_mode = _string_value(values, "file_conflict_mode", DEFAULT_FILE_CONFLICT_MODE)
-    if file_conflict_mode != "tool":
-        raise GuiInputError("File conflict preserve mode has been removed; merge that branch manually.")
-    argv.extend(["--file-conflict-mode", "tool"])
-    argv.extend(
-        [
-            "--conflict-tool-command",
-            _string_value(values, "conflict_tool_command", DEFAULT_CONFLICT_TOOL_COMMAND),
-            "--conflict-tool-timeout-seconds",
-            str(_int_value(values, "conflict_tool_timeout_seconds", DEFAULT_CONFLICT_TOOL_TIMEOUT_SECONDS)),
-        ]
-    )
-
-    if _bool_value(values, "verbose"):
-        argv.append("--verbose")
-    return argv
-
-
-def build_cleanup_argv(values: dict[str, Any]) -> list[str]:
-    repo = _string_value(values, "repo", ".") or "."
-    argv = ["cleanup", "--repo", repo]
-
-    report_file = _string_value(values, "report_file", REPORT_FILE_NAME)
-    if report_file:
-        argv.extend(["--report-file", report_file])
-
-    if _bool_value(values, "skip_submodule_update"):
-        argv.append("--skip-submodule-update")
-
-    if _bool_value(values, "rebuild_work_branch"):
-        base_remote_branch = _string_value(values, "cleanup_base_remote_branch", ROOT_BASE_REMOTE_BRANCH)
-        if not base_remote_branch:
-            raise GuiInputError("Cleanup base remote branch is required when rebuilding the work branch.")
-        argv.extend(["--rebuild-work-branch", "--base-remote-branch", base_remote_branch])
-        work_branch = _string_value(values, "cleanup_work_branch")
-        if work_branch:
-            argv.extend(["--work-branch", work_branch])
-
-    if _bool_value(values, "verbose"):
-        argv.append("--verbose")
-    return argv
-
-
-def build_publish_argv(values: dict[str, Any]) -> list[str]:
-    repo = _string_value(values, "repo", ".") or "."
-    remote = _string_value(values, "publish_remote", "origin") or "origin"
-    push_target = _string_value(values, "publish_target")
-    if not push_target:
-        raise GuiInputError("Push target branch is required.")
-
-    argv = [
-        "publish",
-        "--repo",
-        repo,
-        "--remote",
-        remote,
-        "--push-target",
-        push_target,
-    ]
-    if _bool_value(values, "publish_check_only"):
-        argv.append("--check-only")
-    if not _bool_value(values, "publish_sync_local_branches", True):
-        argv.append("--no-sync-local-branches")
-    if not _bool_value(values, "publish_allow_branch_suffix", True):
-        argv.append("--no-branch-suffix")
-    if _bool_value(values, "verbose"):
-        argv.append("--verbose")
-    return argv
-
-
-def build_command_spec(action: str, values: dict[str, Any]) -> CommandSpec:
-    if action == "merge":
-        return CommandSpec(action=action, argv=build_merge_argv(values))
-    if action == "cleanup":
-        return CommandSpec(action=action, argv=build_cleanup_argv(values))
-    if action == "publish":
-        return CommandSpec(action=action, argv=build_publish_argv(values))
-    raise GuiInputError(f"Unsupported action: {action}")
 
 
 def script_path() -> Path:
@@ -752,7 +553,11 @@ def command_display(command: list[str]) -> str:
 
 
 def safe_directory_value(path: str | Path) -> str:
-    return Path(path).resolve(strict=False).as_posix()
+    raw_path = str(path).strip()
+    windows_path = PureWindowsPath(raw_path)
+    if windows_path.is_absolute():
+        return windows_path.as_posix()
+    return Path(raw_path).resolve(strict=False).as_posix()
 
 
 def add_git_config_env(env: dict[str, str], key: str, value: str) -> None:
@@ -862,7 +667,6 @@ class MergeGuiApp:
         self.work_branch_var = tk.StringVar(value=WORK_BRANCH_DEFAULT)
         self.conflict_tool_command_var = tk.StringVar(value=DEFAULT_CONFLICT_TOOL_COMMAND)
         self.conflict_tool_timeout_var = tk.StringVar(value=str(DEFAULT_CONFLICT_TOOL_TIMEOUT_SECONDS))
-        self.allow_dirty_var = tk.BooleanVar(value=False)
         self.enable_cross_submodule_moves_var = tk.BooleanVar(value=False)
         self.clone_url_var = tk.StringVar()
         self.clone_destination_var = tk.StringVar()
@@ -1211,6 +1015,10 @@ class MergeGuiApp:
 
         self.base_entry = self._entry_row(self.merge_tab, 3, 0, "label_base_remote_branch", self.base_remote_branch_var)
         self.work_entry = self._entry_row(self.merge_tab, 3, 1, "label_work_branch", self.work_branch_var)
+        self._localize(
+            ttk.Label(self.merge_tab, foreground="#6b7280", wraplength=640),
+            "hint_clean_worktree_required",
+        ).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 10))
 
         self.advanced_toggle_button = ttk.Button(
             self.merge_tab,
@@ -1244,21 +1052,16 @@ class MergeGuiApp:
         options.columnconfigure(0, weight=1)
         self._localize(ttk.Checkbutton(
             options,
-            variable=self.allow_dirty_var,
-        ), "option_allow_dirty_submodules").grid(row=0, column=0, sticky="w")
-        self._localize(ttk.Checkbutton(
-            options,
             variable=self.enable_cross_submodule_moves_var,
         ), "option_cross_submodule_moves").grid(
-            row=1,
+            row=0,
             column=0,
             sticky="w",
-            pady=(6, 0),
         )
         self._localize(
             ttk.Label(options, foreground="#6b7280", wraplength=560),
             "hint_cross_submodule_moves",
-        ).grid(row=2, column=0, sticky="ew", padx=(22, 0), pady=(2, 0))
+        ).grid(row=1, column=0, sticky="ew", padx=(22, 0), pady=(2, 0))
 
         self._localize(ttk.Label(self.advanced_frame), "label_ignored_root_untracked_paths").grid(
             row=6,
@@ -1270,7 +1073,7 @@ class MergeGuiApp:
         self.ignore_paths_text.grid(row=7, column=0, columnspan=2, sticky="nsew", pady=(4, 10))
 
         buttons = ttk.Frame(self.merge_tab)
-        buttons.grid(row=7, column=0, columnspan=2, sticky="e")
+        buttons.grid(row=8, column=0, columnspan=2, sticky="e")
         self._localize(ttk.Button(buttons, command=lambda: self._start("merge")), "button_start_merge").grid(
             row=0, column=0
         )
@@ -1280,8 +1083,13 @@ class MergeGuiApp:
         for column in range(2):
             self.cleanup_tab.columnconfigure(column, weight=1)
 
+        self._localize(
+            ttk.Label(self.cleanup_tab, foreground="#6b7280", wraplength=640),
+            "hint_cleanup_responsibility",
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+
         options = self._localize(ttk.LabelFrame(self.cleanup_tab, padding=8), "frame_cleanup_options")
-        options.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        options.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         self._localize(ttk.Checkbutton(
             options,
             variable=self.rebuild_work_branch_var,
@@ -1293,21 +1101,21 @@ class MergeGuiApp:
 
         self.cleanup_base_entry = self._entry_row(
             self.cleanup_tab,
-            1,
+            2,
             0,
             "label_base_remote_branch",
             self.cleanup_base_remote_branch_var,
         )
         self.cleanup_work_entry = self._entry_row(
             self.cleanup_tab,
-            1,
+            2,
             1,
             "label_work_branch",
             self.cleanup_work_branch_var,
         )
         self.report_entry = self._entry_row(
             self.cleanup_tab,
-            3,
+            4,
             0,
             "label_report_file",
             self.report_file_var,
@@ -1315,7 +1123,7 @@ class MergeGuiApp:
         )
 
         buttons = ttk.Frame(self.cleanup_tab)
-        buttons.grid(row=5, column=0, columnspan=2, sticky="e")
+        buttons.grid(row=6, column=0, columnspan=2, sticky="e")
         self._localize(ttk.Button(buttons, command=lambda: self._start("cleanup")), "button_start_cleanup").grid(
             row=0, column=0
         )
@@ -1552,7 +1360,6 @@ class MergeGuiApp:
 
     def _merge_values(self) -> dict[str, Any]:
         values = self._common_values()
-        allow_dirty_submodules = bool(self.allow_dirty_var.get())
         values.update(
             {
                 "merge_branches": self.merge_branches_text.get("1.0", "end").strip(),
@@ -1562,8 +1369,6 @@ class MergeGuiApp:
                 "file_conflict_mode": DEFAULT_FILE_CONFLICT_MODE,
                 "conflict_tool_command": self.conflict_tool_command_var.get(),
                 "conflict_tool_timeout_seconds": self.conflict_tool_timeout_var.get(),
-                "allow_dirty_submodules": allow_dirty_submodules,
-                "no_prompt_dirty_submodules": not allow_dirty_submodules,
                 "enable_cross_submodule_moves": self.enable_cross_submodule_moves_var.get(),
                 "clone_enabled": False,
                 "ignore_root_untracked_paths": self.ignore_paths_text.get("1.0", "end").strip(),
@@ -2062,7 +1867,6 @@ class MergeGuiApp:
             self.merge_branches_text.insert("1.0", "\n".join(mc.merge_branches))
         if mc.continue_current_branch:
             self.branch_mode_var.set("continue")
-        self.allow_dirty_var.set(mc.allow_dirty_submodules)
         self.enable_cross_submodule_moves_var.set(mc.enable_cross_submodule_moves)
         if mc.conflict_tool_command:
             self.conflict_tool_command_var.set(mc.conflict_tool_command)

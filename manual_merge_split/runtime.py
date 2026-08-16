@@ -108,17 +108,14 @@ def add_merge_arguments(parser: argparse.ArgumentParser) -> None:
         "--allow-dirty-submodules",
         action="store_true",
         help=(
-            "Allow submodules with local changes to stay dirty when merge preflight can prove "
-            "the requested merge refs do not touch their gitlinks."
+            "Deprecated and ignored. Manual merge always refuses uncommitted changes; "
+            "run cleanup first if you want to discard them."
         ),
     )
     parser.add_argument(
         "--no-prompt-dirty-submodules",
         action="store_true",
-        help=(
-            "Fail instead of prompting when unaffected dirty submodules are detected. "
-            "Useful for GUI and automation callers."
-        ),
+        help="Deprecated and ignored. Manual merge always refuses uncommitted changes.",
     )
     parser.add_argument(
         "--report-file",
@@ -217,6 +214,14 @@ def add_cleanup_arguments(parser: argparse.ArgumentParser) -> None:
         "--allow-clean-x",
         action="store_true",
         help="Allow git clean -x (remove ignored files) during cleanup for stubborn states.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "Confirm that cleanup may discard uncommitted local changes. "
+            "Required for non-interactive runs. You are responsible for that data loss."
+        ),
     )
     parser.add_argument(
         "--verbose",

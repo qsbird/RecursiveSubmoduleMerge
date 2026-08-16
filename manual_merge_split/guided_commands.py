@@ -113,12 +113,6 @@ def run_guided(
             base_remote_branch=base_remote_branch,
             continue_current_branch=continue_current_branch,
             work_branch=work_branch,
-            allow_dirty_submodules=prompt_yes_no(
-                "Allow unaffected dirty submodules to remain dirty when preflight can prove they are untouched",
-                mc.allow_dirty_submodules,
-                input_func=input_func,
-            ),
-            no_prompt_dirty_submodules=False,
             ignore_root_untracked_path=[],
             report_file=prompt_with_default("Conflict report filename", REPORT_FILE_NAME, input_func=input_func),
             file_conflict_mode="tool",
@@ -135,6 +129,8 @@ def run_guided(
                 )
             ),
             verbose=prompt_yes_no("Enable verbose command output", mc.verbose, input_func=input_func),
+            enable_cross_submodule_moves=False,
+            no_confirm_after_conflict_tool=False,
         )
         if merge_args.clone_branch:
             merge_args.clone_url = prompt_optional("Clone git URL", input_func=input_func)
@@ -162,7 +158,16 @@ def run_guided(
         work_branch=work_branch,
         allow_clean_x=prompt_yes_no("Allow git clean -x (remove ignored files) during cleanup", cc.allow_clean_x, input_func=input_func),
         verbose=prompt_yes_no("Enable verbose command output", getattr(args, "verbose", False), input_func=input_func),
+        yes=False,
     )
+    if not prompt_yes_no(
+        "Cleanup discards uncommitted local changes. Continue? You are responsible for any data loss",
+        False,
+        input_func=input_func,
+    ):
+        print("Cleanup aborted.", file=sys.stderr)
+        return 1
+    cleanup_args.yes = True
     return run_cleanup(cleanup_args)
 
 

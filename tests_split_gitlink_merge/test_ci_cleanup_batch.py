@@ -21,6 +21,10 @@ from tests_split_gitlink_merge.test_remaining_split_facades import (
 )
 
 
+def same_path(left: Path, right: Path) -> bool:
+    return Path(os.path.realpath(os.fspath(left))) == Path(os.path.realpath(os.fspath(right)))
+
+
 def run_git(repo: Path, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         ["git", *args],
@@ -256,7 +260,7 @@ class CiCleanupFallbackChainTests(unittest.TestCase):
                             ["submodule", "update", "--init", "--recursive", "--force"],
                         ):
                             return FakeCiCommandResult(args)
-                    if repo_path == repo or repo_path == repo / "libs" / "child":
+                    if same_path(repo_path, repo) or same_path(repo_path, repo / "libs" / "child"):
                         if args in (
                             ["reset", "--hard"],
                             ["submodule", "sync", "--recursive"],

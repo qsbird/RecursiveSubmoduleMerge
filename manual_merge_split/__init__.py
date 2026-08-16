@@ -5,7 +5,6 @@ from .cross_submodule_moves import CrossSubmoduleMoveService
 from .execution import format_git_failure, run_git, run_git_binary, set_verbose, verbose_print
 from .file_conflicts import ManualFileConflictService
 from .guided_commands import ManualGuidedCommandService
-from .legacy import load_manual_merge_module
 from .models import (
     CleanupResult,
     ConflictEntry,
@@ -70,7 +69,6 @@ __all__ = [
     "TextMergeNormalization",
     "ToolAvailabilityResult",
     "UnmergedConflict",
-    "load_manual_merge_module",
     "build_parser",
     "format_git_failure",
     "main",

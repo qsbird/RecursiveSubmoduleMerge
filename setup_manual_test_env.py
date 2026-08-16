@@ -7,24 +7,49 @@
 
 使用方法：
     python setup_manual_test_env.py
+    python setup_manual_test_env.py --workspace /tmp/mergetool/manual-test-workspace
+    MERGETOOL_MANUAL_TEST_WORKSPACE=/tmp/mergetool/manual-test-workspace python setup_manual_test_env.py
 
-会在 D:\Git\MergeTool_for_CICD\external_builds 下创建 manual_test_workspace 目录，
+默认会在系统临时目录下创建明确的 `mergetool_manual_test_workspace` 工作区，
 包含一个带子模块的测试仓库和远端仓库。
 
 测试完成后可用以下命令清理：
-    rmdir /s /q D:\Git\MergeTool_for_CICD\external_builds\manual_test_workspace
+    rm -rf /tmp/mergetool_manual_test_workspace
 """
 
 from __future__ import annotations
 
+import argparse
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
-WORKSPACE_ROOT = Path(r"D:\Git\MergeTool_for_CICD\external_builds\manual_test_workspace")
+WORKSPACE_ENV_VAR = "MERGETOOL_MANUAL_TEST_WORKSPACE"
+DEFAULT_WORKSPACE_ROOT = Path(tempfile.gettempdir()) / "mergetool_manual_test_workspace"
+WORKSPACE_ROOT = DEFAULT_WORKSPACE_ROOT
 REMOTE_ROOT = WORKSPACE_ROOT / "remotes"
 LOCAL_ROOT = WORKSPACE_ROOT / "local"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="创建手动合并工具的本地测试工作区。")
+    parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=None,
+        help=f"工作区根目录；默认读取 ${WORKSPACE_ENV_VAR}，否则使用 {DEFAULT_WORKSPACE_ROOT}",
+    )
+    return parser.parse_args()
+
+
+def configure_workspace(workspace_root: Path) -> None:
+    global WORKSPACE_ROOT, REMOTE_ROOT, LOCAL_ROOT
+    WORKSPACE_ROOT = workspace_root.expanduser().resolve()
+    REMOTE_ROOT = WORKSPACE_ROOT / "remotes"
+    LOCAL_ROOT = WORKSPACE_ROOT / "local"
 
 
 def run(cmd: list[str], cwd: str | Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -150,9 +175,14 @@ def setup_todo_interrupt_state(repo_path: Path) -> None:
 
 
 def main() -> int:
+    args = parse_args()
+    configured_workspace = args.workspace or Path(os.environ.get(WORKSPACE_ENV_VAR, str(DEFAULT_WORKSPACE_ROOT)))
+    configure_workspace(configured_workspace)
+
     print("=" * 60)
     print("手动合并工具 — 测试环境设置")
     print("=" * 60)
+    print(f"工作区：{WORKSPACE_ROOT}")
 
     # Create workspace directories
     REMOTE_ROOT.mkdir(parents=True, exist_ok=True)

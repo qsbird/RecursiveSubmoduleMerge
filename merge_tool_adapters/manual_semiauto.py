@@ -6,12 +6,15 @@ import ctypes
 import platform
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from split_gitlink_merge import (
     Conflict,
     GitActionExecutor,
     GitlinkMergeError,
+    GitlinkMergeContext,
     MergeEvent,
+    MergeCommitMessage,
     MergePolicy,
     RecursiveGitlinkMergeEngine,
     SubprocessGitBackend,
@@ -30,6 +33,70 @@ class ManualMergeSummary:
     root_commit_sha: str | None = None
     final_submodule_update: bool = False
     events: list[str] | None = None
+
+
+class ManualWorkflowGitlinkPolicy(MergePolicy):
+    """Manual workflow hooks for using the split gitlink engine inside commands.py."""
+
+    def __init__(
+        self,
+        *,
+        tracked_repo: Path,
+        prepare_submodule_branch: Callable[[Path, str], None],
+        build_submodule_commit_message: Callable[[GitlinkMergeContext], MergeCommitMessage],
+        handle_file_conflicts: Callable[[GitExecutionPort, Path, list[Conflict], int], None],
+        fetch_missing_commits: bool = False,
+    ) -> None:
+        super().__init__(
+            fetch_missing_commits=fetch_missing_commits,
+            init_missing_submodules=True,
+            update_submodules_before_recursive_merge=True,
+        )
+        self.tracked_repo = tracked_repo.resolve(strict=False)
+        self._prepare_submodule_branch = prepare_submodule_branch
+        self._build_submodule_commit_message = build_submodule_commit_message
+        self._handle_file_conflicts = handle_file_conflicts
+        self.events: list[str] = []
+        self.resolved_paths: list[str] = []
+
+    def on_event(self, event: MergeEvent) -> None:
+        self.events.append(f"[{event.repo_path}] {event.message}")
+        if event.name != "gitlink.resolved":
+            return
+        path = str(event.data.get("path", "")).strip()
+        result_sha = str(event.data.get("result", "")).strip()
+        if path and result_sha:
+            # The common engine checks out the resolved gitlink commit detached
+            # before staging it in the parent.  The manual workflow promises a
+            # reusable work branch in every touched submodule, so restore that
+            # branch after the engine has finalized the resolution.
+            self._prepare_submodule_branch(event.repo_path / path, result_sha)
+        if event.repo_path == self.tracked_repo and path and path not in self.resolved_paths:
+            self.resolved_paths.append(path)
+
+    def prepare_recursive_merge(
+        self,
+        actions: GitExecutionPort,
+        context: GitlinkMergeContext,
+    ) -> None:
+        self._prepare_submodule_branch(context.submodule_repo, context.ours_sha)
+        if self.update_submodules_before_recursive_merge:
+            actions.update_submodules(context.submodule_repo, check=False)
+
+    def build_submodule_commit_message(
+        self,
+        context: GitlinkMergeContext,
+    ) -> MergeCommitMessage:
+        return self._build_submodule_commit_message(context)
+
+    def handle_file_conflicts(
+        self,
+        actions: GitExecutionPort,
+        repo_path: Path,
+        conflicts: list[Conflict],
+        depth: int,
+    ) -> None:
+        self._handle_file_conflicts(actions, repo_path, conflicts, depth)
 
 
 class ManualMergePolicy(MergePolicy):

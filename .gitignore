@@ -16,3 +16,4 @@ manual_*_run*/
 /_package_stage*/
 /MergeTool_manual_CI_bundle_*.zip
 /merge_tool_last_run.json
+.omx/

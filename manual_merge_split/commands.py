@@ -8,6 +8,17 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterable
 
+from merge_tool_adapters.manual_semiauto import ManualWorkflowGitlinkPolicy
+from split_gitlink_merge import (
+    Conflict,
+    GitActionExecutor,
+    GitCommandResult as CoreGitCommandResult,
+    GitExecutionPort,
+    GitlinkMergeContext,
+    MergeCommitMessage,
+)
+from split_gitlink_merge import GitlinkMergeError, NonGitlinkConflictError, RecursiveGitlinkMergeEngine
+
 from . import common
 from . import execution
 from . import messages as manual_messages
@@ -21,7 +32,6 @@ from .models import (
     CleanupResult,
     ConflictEntry,
     CrossSubmoduleMove,
-    DirtyRepoAssessment,
     MergeBatchResult,
     MergeContext,
     REPORT_FILE_NAME,
@@ -29,15 +39,118 @@ from .models import (
 )
 from .preflight import (
     ManualPreflightService,
-    build_preserved_dirty_path_map,
     ensure_repo_ready,
-    format_dirty_submodule_list,
 )
 from .publish import ManualPublishService
 from .repository_ops import ManualRepositoryOps
 
 
 COMMAND_FUNCTIONS: tuple[str, ...] = ()
+
+
+def _stringify_process_output(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+class _ManualOpsGitBackend:
+    def __init__(self, ops: ManualRepositoryOps) -> None:
+        self.ops = ops
+
+    def run(self, repo_path: Path, args: list[str], *, check: bool = True) -> CoreGitCommandResult:
+        result = self.ops.run_git(repo_path, args, check=check)
+        normalized = CoreGitCommandResult(
+            args=["git", *args],
+            cwd=Path(getattr(result, "cwd", repo_path)).resolve(strict=False),
+            returncode=int(getattr(result, "returncode", 0)),
+            stdout=_stringify_process_output(getattr(result, "stdout", "")),
+            stderr=_stringify_process_output(getattr(result, "stderr", "")),
+        )
+        if check and normalized.returncode != 0:
+            raise GitlinkMergeError(self.ops._format_git_failure(result))
+        return normalized
+
+
+def _resolve_gitlink_conflicts_with_common_core(
+    repo_path: Path,
+    ops: ManualRepositoryOps,
+    *,
+    context: MergeContext,
+    display_path: str,
+    target_ref: str,
+    file_conflicts_service: ManualFileConflictService,
+) -> tuple[list[str], bool]:
+    repo = repo_path.resolve(strict=False)
+
+    def prepare_submodule_branch(child_repo: Path, start_point: str) -> None:
+        ops.create_submodule_branch(
+            child_repo,
+            context.work_branch,
+            start_point=start_point,
+        )
+
+    def build_submodule_commit_message(recursive_context: GitlinkMergeContext) -> MergeCommitMessage:
+        relative_submodule_path = recursive_context.submodule_repo.relative_to(repo).as_posix()
+        manual_message = manual_messages.build_submodule_commit_message(
+            repo_path=recursive_context.submodule_repo,
+            parent_repo=recursive_context.parent_repo,
+            display_path=manual_messages.join_display_path(display_path, relative_submodule_path),
+            source_ref=context.merge_branch,
+            target_ref=target_ref,
+            source_sha=recursive_context.theirs_sha,
+            target_sha=recursive_context.ours_sha,
+            base_sha=recursive_context.base_sha,
+            work_branch=context.work_branch,
+        )
+        return MergeCommitMessage(title=manual_message.title, body=manual_message.body)
+
+    def handle_file_conflicts(
+        actions: GitExecutionPort,
+        conflict_repo: Path,
+        conflicts: list[Conflict],
+        depth: int,
+    ) -> None:
+        del actions, depth
+        conflict_paths = [conflict.path for conflict in conflicts]
+        unresolved, reason, rollback_requested = file_conflicts_service.resolve_file_conflicts(
+            conflict_repo,
+            conflict_paths,
+            context,
+        )
+        context.rollback_requested = context.rollback_requested or rollback_requested
+        file_conflicts_service.record_file_conflicts(
+            conflict_repo,
+            unresolved,
+            context,
+            reason=reason,
+        )
+        if unresolved:
+            unresolved_paths = set(unresolved)
+            raise NonGitlinkConflictError(
+                conflict_repo,
+                [conflict for conflict in conflicts if conflict.path in unresolved_paths],
+            )
+
+    policy = ManualWorkflowGitlinkPolicy(
+        tracked_repo=repo,
+        prepare_submodule_branch=prepare_submodule_branch,
+        build_submodule_commit_message=build_submodule_commit_message,
+        handle_file_conflicts=handle_file_conflicts,
+    )
+    engine = RecursiveGitlinkMergeEngine(
+        GitActionExecutor(_ManualOpsGitBackend(ops)),
+        policy=policy,
+    )
+    try:
+        engine.resolve_active_conflicts(repo)
+    except NonGitlinkConflictError:
+        return list(policy.resolved_paths), False
+    except GitlinkMergeError as exc:
+        raise ops._automation_error(str(exc)) from exc
+    return list(policy.resolved_paths), True
 
 
 def set_verbose(manual_module: ModuleType | None, enabled: bool) -> None:
@@ -80,27 +193,6 @@ def get_head_submodule_commit(repo_path: Path, relative_path: str, ops: ManualRe
         if mode == "160000" and object_type == "commit":
             return commit_sha
     return None
-
-
-def prompt_yes_no(prompt: str, default: bool) -> bool:
-    suffix = "Y/n" if default else "y/N"
-    answer = input(f"{prompt} [{suffix}]: ").strip().lower()
-    if not answer:
-        return default
-    return answer in {"y", "yes"}
-
-
-def prompt_to_continue_with_dirty_submodules(entries: list[DirtyRepoAssessment]) -> bool:
-    print("Detected dirty submodules that preflight believes are not touched by the planned merge:")
-    print(format_dirty_submodule_list(entries))
-    return prompt_yes_no("Continue the merge without cleaning those submodules", False)
-
-
-def print_dirty_submodule_warning(entries: list[DirtyRepoAssessment]) -> None:
-    if not entries:
-        return
-    print("Continuing with preserved dirty submodules:")
-    print(format_dirty_submodule_list(entries))
 
 
 def summarize_conflict_entries(entries: Iterable[ConflictEntry]) -> str:
@@ -243,6 +335,28 @@ def process_repository(
         record_incomplete_stage_conflicts(repo_path, incomplete_stage_conflicts, context)
         return False
 
+    resolved_by_common_core: list[str] = []
+    if (
+        submodule_conflicts
+        and not context.enable_cross_submodule_moves
+        and not moved_away_paths
+        and not moved_here_moves
+    ):
+        resolved_by_common_core, common_core_completed = _resolve_gitlink_conflicts_with_common_core(
+            repo_path,
+            ops,
+            context=context,
+            display_path=display_path,
+            target_ref=target_ref,
+            file_conflicts_service=file_conflicts_service,
+        )
+        if not common_core_completed:
+            return False
+        submodule_conflicts, file_conflicts, incomplete_stage_conflicts = ops.split_conflicts_by_stage(repo_path)
+        if incomplete_stage_conflicts:
+            record_incomplete_stage_conflicts(repo_path, incomplete_stage_conflicts, context)
+            return False
+
     moved_away_resolved = file_conflicts_service.resolve_moved_away_file_conflicts(
         repo_path,
         file_conflicts,
@@ -283,7 +397,7 @@ def process_repository(
             *moved_here_by_submodule.keys(),
         ]
     )
-    resolved_child_submodules: list[str] = []
+    resolved_child_submodules: list[str] = [manual_messages.join_display_path(display_path, path) for path in resolved_by_common_core]
     for submodule_path in submodules_to_process:
         child_repo = repo_path / submodule_path
         child_info = submodule_move_info_by_path.get(submodule_path)
@@ -640,49 +754,19 @@ def run_merge(
     try:
         base_context = make_merge_context(args, repo_path, ops)
         base_ref = "HEAD" if args.continue_current_branch else args.base_remote_branch.strip()
-        preflight_result = preflight_service.preflight_repository(
+        preflight_service.preflight_repository(
             repo_path,
             base_ref,
             merge_branches,
             ignored_root_untracked_paths=ignored_root_untracked_paths,
         )
-        dirty_submodules_requiring_allowance = [
-            entry for entry in preflight_result.allowed_dirty_submodules if not entry.risk_confirmed
-        ]
-        if dirty_submodules_requiring_allowance:
-            if args.allow_dirty_submodules:
-                print_dirty_submodule_warning(preflight_result.allowed_dirty_submodules)
-            elif args.no_prompt_dirty_submodules:
-                print(
-                    "Merge preflight found dirty submodules that appear unaffected. "
-                    "Re-run with --allow-dirty-submodules to continue:\n"
-                    + format_dirty_submodule_list(dirty_submodules_requiring_allowance),
-                    file=sys.stderr,
-                )
-                return 1
-            elif sys.stdin.isatty():
-                if not prompt_to_continue_with_dirty_submodules(dirty_submodules_requiring_allowance):
-                    print("Merge aborted because dirty submodules were left in place.", file=sys.stderr)
-                    return 1
-                print_dirty_submodule_warning(preflight_result.allowed_dirty_submodules)
-            else:
-                print(
-                    "Merge preflight found dirty submodules that appear unaffected, but this run is "
-                    "non-interactive. Re-run with --allow-dirty-submodules to continue:\n"
-                    + format_dirty_submodule_list(dirty_submodules_requiring_allowance),
-                    file=sys.stderr,
-                )
-                return 1
-        elif preflight_result.allowed_dirty_submodules:
-            print_dirty_submodule_warning(preflight_result.allowed_dirty_submodules)
-
-        preserved_dirty_paths_by_repo = build_preserved_dirty_path_map(
-            repo_path,
-            preflight_result.allowed_dirty_submodules,
-        )
-        preserved_dirty_repos = {
-            entry.repo_path.resolve() for entry in preflight_result.allowed_dirty_submodules
-        }
+        if getattr(args, "allow_dirty_submodules", False):
+            print(
+                "Ignoring --allow-dirty-submodules; manual merge no longer starts with uncommitted changes.",
+                file=sys.stderr,
+            )
+        preserved_dirty_paths_by_repo: dict[Path, set[str]] = {}
+        preserved_dirty_repos: set[Path] = set()
         _safe_unlink_report(report_path, repo_path, ops)
 
         initial_context = replace(base_context, merge_branch=merge_branches[0])
@@ -789,8 +873,9 @@ def run_cleanup(args: Any, *, manual_module: ModuleType | None, ops: ManualRepos
         return 1
 
     print(
-        "WARNING: cleanup may recursively abort merges and run git reset --hard HEAD, "
-        "discarding tracked or staged local changes in the root repository and submodules.",
+        "WARNING: cleanup is destructive and is your responsibility. "
+        "It may recursively abort merges/rebases and run git reset --hard HEAD plus git clean, "
+        "discarding uncommitted, staged, and untracked local changes in the root repository and submodules.",
         file=sys.stderr,
     )
     if args.rebuild_work_branch:
@@ -799,6 +884,18 @@ def run_cleanup(args: Any, *, manual_module: ModuleType | None, ops: ManualRepos
             "the tool will block if that would hide local committed work.",
             file=sys.stderr,
         )
+    if not getattr(args, "yes", False):
+        if sys.stdin.isatty():
+            answer = input("Continue cleanup and accept possible data loss? [y/N]: ").strip().lower()
+            if answer not in {"y", "yes"}:
+                print("Cleanup aborted.", file=sys.stderr)
+                return 1
+        else:
+            print(
+                "Non-interactive cleanup requires --yes to confirm you accept possible data loss.",
+                file=sys.stderr,
+            )
+            return 1
 
     repo_path = Path(args.repo).resolve()
     report_file_name = getattr(args, "report_file", REPORT_FILE_NAME)

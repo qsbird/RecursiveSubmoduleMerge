@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import types
 import unittest
 import tempfile
@@ -12,6 +13,8 @@ from unittest import mock
 from pathlib import Path
 
 import subprocess_window
+import ci_merge_split
+import manual_merge_split
 from ci_merge_split import CiWorkflowServices
 from ci_merge_split import artifacts as ci_artifacts
 from ci_merge_split import common as ci_common
@@ -21,7 +24,7 @@ from ci_merge_split import models as ci_models
 from ci_merge_split import recovery as ci_recovery
 from ci_merge_split import repository_ops as ci_repository_ops
 from ci_merge_split import runtime as ci_runtime
-from ci_merge_split.legacy import load_ci_merge_module
+from ci_merge_split.legacy import CI_LEGACY_PROJECT_ENVVAR, load_ci_merge_module, resolve_ci_project_path
 from ci_merge_split.publish import classify_publish_failure, infer_publish_target_from_report, publish_result, report_value, run_publish_only_workflow, target_requires_explicit_publish_target
 from ci_merge_split.publish import PUBLISH_FUNCTIONS
 from ci_merge_split.report_artifacts import REPORT_ARTIFACT_FUNCTIONS
@@ -38,7 +41,7 @@ from manual_merge_split.commands import ManualCommandService, process_repository
 from manual_merge_split.cross_submodule_moves import CROSS_SUBMODULE_MOVE_FUNCTIONS, apply_cross_submodule_moved_files, collect_cross_submodule_moves, describe_cross_submodule_move, merge_cross_submodule_file_contents
 from manual_merge_split.file_conflicts import FILE_CONFLICT_FUNCTIONS, prepare_conflict_tool_command, record_file_conflicts, render_conflict_tool_command, resolve_file_conflicts, resolve_moved_away_file_conflicts, resolve_single_file_conflict, vscode_command_candidates
 from manual_merge_split.guided_commands import GUIDED_COMMAND_FUNCTIONS, prompt_optional, prompt_with_default, prompt_yes_no, run_guided
-from manual_merge_split.legacy import load_manual_merge_module
+from manual_merge_split.legacy import MANUAL_LEGACY_PROJECT_ENVVAR, load_manual_merge_module, resolve_manual_project_path
 from manual_merge_split.preflight import PREFLIGHT_FUNCTIONS, build_preserved_dirty_path_map, format_dirty_submodule_list
 from manual_merge_split.repository_ops import REPOSITORY_OP_FUNCTIONS
 
@@ -315,6 +318,57 @@ class FakePublishRunner(FakeCiRunner):
 
 
 class RemainingSplitFacadeTests(unittest.TestCase):
+    def test_root_packages_do_not_export_legacy_loaders(self) -> None:
+        self.assertNotIn("load_ci_merge_module", ci_merge_split.__all__)
+        self.assertNotIn("load_manual_merge_module", manual_merge_split.__all__)
+        with self.assertRaises(AttributeError):
+            getattr(ci_merge_split, "load_ci_merge_module")
+        with self.assertRaises(AttributeError):
+            getattr(manual_merge_split, "load_manual_merge_module")
+
+    def test_legacy_loaders_require_explicit_opt_in(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(CI_LEGACY_PROJECT_ENVVAR, None)
+            os.environ.pop(MANUAL_LEGACY_PROJECT_ENVVAR, None)
+            self.assertIsNone(resolve_ci_project_path())
+            self.assertIsNone(resolve_manual_project_path())
+            with self.assertRaisesRegex(RuntimeError, CI_LEGACY_PROJECT_ENVVAR):
+                load_ci_merge_module()
+            with self.assertRaisesRegex(RuntimeError, MANUAL_LEGACY_PROJECT_ENVVAR):
+                load_manual_merge_module()
+
+    def test_legacy_loaders_accept_explicit_path_or_env(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ci_project = root / "ci-project"
+            ci_project.mkdir()
+            (ci_project / "ci_merge.py").write_text("VALUE = 'ci'\n", encoding="utf-8")
+            manual_project = root / "manual-project"
+            manual_project.mkdir()
+            (manual_project / "recursive_submodule_merge.py").write_text("VALUE = 'manual'\n", encoding="utf-8")
+
+            original_sys_path = list(sys.path)
+            stale_modules = {
+                "ci_merge": sys.modules.pop("ci_merge", None),
+                "recursive_submodule_merge": sys.modules.pop("recursive_submodule_merge", None),
+            }
+            try:
+                explicit_ci = load_ci_merge_module(ci_project)
+                self.assertEqual(explicit_ci.VALUE, "ci")
+
+                sys.modules.pop("recursive_submodule_merge", None)
+                with mock.patch.dict(os.environ, {MANUAL_LEGACY_PROJECT_ENVVAR: str(manual_project)}, clear=False):
+                    env_manual = load_manual_merge_module()
+                self.assertEqual(env_manual.VALUE, "manual")
+            finally:
+                sys.path[:] = original_sys_path
+                for name in ("ci_merge", "recursive_submodule_merge"):
+                    sys.modules.pop(name, None)
+                for name, module in stale_modules.items():
+                    if module is not None:
+                        sys.modules[name] = module
+                importlib.invalidate_caches()
+
     def test_ci_workflow_services_group_original_ci_responsibilities(self) -> None:
         names = set(REPORT_ARTIFACT_FUNCTIONS + REPOSITORY_GUARD_FUNCTIONS + SNAPSHOT_RESTORE_FUNCTIONS + PUBLISH_FUNCTIONS)
         module, calls = fake_module(names)
@@ -443,12 +497,93 @@ class RemainingSplitFacadeTests(unittest.TestCase):
             self.assertIn("startupinfo", kwargs)
             self.assertIn("creationflags", kwargs)
 
+    def test_manual_preflight_refuses_dirty_root_without_confirmation(self) -> None:
+        from manual_merge_split.preflight import ManualPreflightService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            confirmations: list[dict[str, object]] = []
+
+            def run_git(_repo_path: Path, args: list[str], **_kwargs: object) -> FakeManualGitResult:
+                if args == ["rev-parse", "--show-toplevel"]:
+                    return FakeManualGitResult(args, stdout=str(repo) + "\n")
+                if args == ["rev-parse", "-q", "--verify", "MERGE_HEAD"]:
+                    return FakeManualGitResult(args, returncode=1)
+                if args == ["config", "--get", "user.name"]:
+                    return FakeManualGitResult(args, stdout="User\n")
+                if args == ["config", "--get", "user.email"]:
+                    return FakeManualGitResult(args, stdout="user@example.com\n")
+                if args == ["status", "--porcelain", "--ignore-submodules=dirty"]:
+                    return FakeManualGitResult(args, stdout=" M local.txt\n")
+                return FakeManualGitResult(args)
+
+            module = types.SimpleNamespace(
+                run_git=run_git,
+                confirm_risky_operation=lambda **kwargs: confirmations.append(dict(kwargs)) or True,
+                run_git_binary=lambda _repo_path, args, **_kwargs: FakeManualBinaryResult(args, b""),
+                MergeAutomationError=manual_models.MergeAutomationError,
+                VERBOSE=False,
+            )
+
+            with self.assertRaises(manual_models.MergeAutomationError) as raised:
+                ManualPreflightService(module).preflight_repository(  # type: ignore[arg-type]
+                    repo, "origin/main", ["origin/feature"]
+                )
+            self.assertIn("uncommitted changes", str(raised.exception))
+            self.assertIn("cleanup", str(raised.exception).lower())
+            self.assertEqual(confirmations, [])
+
+    def test_manual_cleanup_requires_yes_when_non_interactive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            service = ManualCommandService()
+            with mock.patch("manual_merge_split.commands.sys.stdin") as stdin:
+                stdin.isatty.return_value = False
+                result = service.run_cleanup(
+                    types.SimpleNamespace(
+                        repo=str(repo),
+                        report_file="merge_manual_todo.txt",
+                        skip_submodule_update=True,
+                        rebuild_work_branch=False,
+                        base_remote_branch="origin/main",
+                        work_branch=None,
+                        verbose=False,
+                        yes=False,
+                    )
+                )
+            self.assertEqual(result, 1)
+
 
 class ExtractedImplementationParityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.ci_merge = load_ci_merge_module()
-        cls.manual_merge = load_manual_merge_module()
+        ci_project = resolve_ci_project_path()
+        if ci_project is None:
+            raise unittest.SkipTest(f"set {CI_LEGACY_PROJECT_ENVVAR} to opt into external ci_merge parity checks")
+        if not ci_project.exists():
+            raise unittest.SkipTest(f"external ci_merge project is not available in this environment: {ci_project}")
+        manual_project = resolve_manual_project_path()
+        if manual_project is None:
+            raise unittest.SkipTest(f"set {MANUAL_LEGACY_PROJECT_ENVVAR} to opt into external manual parity checks")
+        if not manual_project.exists():
+            raise unittest.SkipTest(
+                "external recursive_submodule_merge project is not available in this environment: "
+                f"{manual_project}"
+            )
+        try:
+            cls.ci_merge = load_ci_merge_module()
+        except ModuleNotFoundError as exc:
+            if exc.name == "ci_merge":
+                raise unittest.SkipTest("external ci_merge module is not available in this environment") from exc
+            raise
+        try:
+            cls.manual_merge = load_manual_merge_module()
+        except ModuleNotFoundError as exc:
+            if exc.name == "recursive_submodule_merge":
+                raise unittest.SkipTest(
+                    "external recursive_submodule_merge module is not available in this environment"
+                ) from exc
+            raise
 
     def test_ci_report_low_coupling_helpers_match_original(self) -> None:
         commit_log = "abc\tAlice\ta@example.com\t2026-05-30\tSubject\nbroken line\n"
@@ -2010,7 +2145,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             self.assertNotIn(("fetch", "--all", "--prune"), calls)
             self.assertNotIn(("fetch", "--no-recurse-submodules", "--all", "--prune"), calls)
 
-    def test_manual_preflight_dirty_root_continues_after_risk_confirmation(self) -> None:
+    def test_manual_preflight_dirty_root_refuses_without_confirmation(self) -> None:
         from manual_merge_split.preflight import ManualPreflightService
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2049,17 +2184,18 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             )
             service = ManualPreflightService(module)  # type: ignore[arg-type]
 
-            result = service.preflight_repository(repo, "origin/main", ["origin/feature"])
+            with self.assertRaises(manual_models.MergeAutomationError) as raised:
+                service.preflight_repository(repo, "origin/main", ["origin/feature"])
 
-            self.assertEqual(result.allowed_dirty_submodules, [])
-            self.assertEqual(confirmations[0]["reason"], "ROOT_UNCOMMITTED_CHANGES_BEFORE_PREFLIGHT")
-            self.assertEqual(confirmations[0]["details"]["status"], [" M local.txt", "?? scratch.txt"])  # type: ignore[index]
-            self.assertIn(
+            self.assertIn("uncommitted changes", str(raised.exception))
+            self.assertIn("Cleanup tab", str(raised.exception))
+            self.assertEqual(confirmations, [])
+            self.assertNotIn(
                 ("fetch", "--no-recurse-submodules", "origin", "+refs/heads/feature:refs/remotes/origin/feature"),
                 calls,
             )
 
-    def test_manual_preflight_dirty_touched_submodule_continues_after_risk_confirmation(self) -> None:
+    def test_manual_preflight_dirty_submodule_is_refused(self) -> None:
         from manual_merge_split.preflight import ManualPreflightService
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2068,11 +2204,9 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             sub_repo.mkdir()
             (repo / ".gitmodules").write_text("[submodule \"sub\"]\n\tpath = sub\n", encoding="utf-8")
             (sub_repo / ".git").mkdir()
-            calls: list[tuple[Path, tuple[str, ...]]] = []
             confirmations: list[dict[str, object]] = []
 
             def run_git(repo_path: Path, args: list[str], **_kwargs: object) -> FakeManualGitResult:
-                calls.append((repo_path, tuple(args)))
                 if args == ["rev-parse", "--show-toplevel"]:
                     return FakeManualGitResult(args, stdout=str(repo_path) + "\n")
                 if args == ["rev-parse", "-q", "--verify", "MERGE_HEAD"]:
@@ -2093,10 +2227,6 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                     return FakeManualGitResult(args, stdout="base-commit\n")
                 if args == ["rev-parse", "--verify", "refs/remotes/origin/feature^{commit}"]:
                     return FakeManualGitResult(args, stdout="feature-commit\n")
-                if args == ["ls-tree", "base-commit", "--", "sub"]:
-                    return FakeManualGitResult(args, stdout="160000 commit sub-base\tsub\n")
-                if args == ["ls-tree", "feature-commit", "--", "sub"]:
-                    return FakeManualGitResult(args, stdout="160000 commit sub-feature\tsub\n")
                 return FakeManualGitResult(args)
 
             def confirm_risky_operation(**kwargs: object) -> bool:
@@ -2112,19 +2242,12 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             )
             service = ManualPreflightService(module)  # type: ignore[arg-type]
 
-            result = service.preflight_repository(repo, "origin/main", ["origin/feature"])
+            with self.assertRaises(manual_models.MergeAutomationError) as raised:
+                service.preflight_repository(repo, "origin/main", ["origin/feature"])
 
-            self.assertEqual([entry.lineage for entry in result.allowed_dirty_submodules], [("sub",)])
-            self.assertTrue(result.allowed_dirty_submodules[0].risk_confirmed)
-            self.assertEqual(confirmations[0]["reason"], "DIRTY_SUBMODULE_TOUCHED_BY_MERGE")
-            self.assertIn("sub", confirmations[0]["details"]["submodules"][0])  # type: ignore[index]
-            self.assertIn(
-                (
-                    repo,
-                    ("fetch", "--no-recurse-submodules", "origin", "+refs/heads/feature:refs/remotes/origin/feature"),
-                ),
-                calls,
-            )
+            self.assertIn("submodules have uncommitted changes", str(raised.exception))
+            self.assertIn("sub", str(raised.exception))
+            self.assertEqual(confirmations, [])
 
     def test_manual_guided_prompts_and_cleanup_path_are_local(self) -> None:
         self.assertEqual(prompt_with_default("Prompt", "default", input_func=lambda _prompt: ""), "default")
@@ -2133,7 +2256,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
         self.assertTrue(prompt_yes_no("Prompt", True, input_func=lambda _prompt: ""))
         self.assertTrue(prompt_yes_no("Prompt", False, input_func=lambda _prompt: "yes"))
 
-        answers = iter(["", "cleanup", "n", "", "", "", ""])
+        answers = iter(["", "cleanup", "n", "", "", "", "", "y"])
         captured: dict[str, object] = {}
 
         def fake_cleanup(args: object) -> int:
@@ -2190,6 +2313,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
         original_cleanup = self.manual_merge.parse_args(cleanup_argv)
         local_cleanup_values = vars(local_cleanup).copy()
         self.assertFalse(local_cleanup_values.pop("allow_clean_x"))
+        self.assertFalse(local_cleanup_values.pop("yes"))
         self.assertEqual(local_cleanup_values, vars(original_cleanup))
 
         calls: list[tuple[str, object]] = []
@@ -2252,6 +2376,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                     base_remote_branch="origin/main",
                     work_branch=None,
                     verbose=False,
+                    yes=True,
                 )
             )
 
@@ -2362,7 +2487,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
             self.assertIn("Target SHA: base-commit", commit_args[-1])
             self.assertIn("Work Branch: work", commit_args[-1])
 
-    def test_manual_merge_does_not_reject_dirty_submodule_after_risk_confirmation(self) -> None:
+    def test_manual_merge_rejects_dirty_submodule(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo = Path(temp_dir)
             sub_repo = repo / "sub"
@@ -2463,9 +2588,9 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(result, 0)
-            self.assertEqual(confirmations[0]["reason"], "DIRTY_SUBMODULE_TOUCHED_BY_MERGE")
-            self.assertTrue(branch_created)
+            self.assertEqual(result, 1)
+            self.assertEqual(confirmations, [])
+            self.assertFalse(branch_created)
 
     def test_manual_cleanup_rebuild_creates_missing_work_branch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2519,6 +2644,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                     base_remote_branch="origin/main",
                     work_branch="work",
                     verbose=False,
+                    yes=True,
                 )
             )
 
@@ -2789,6 +2915,7 @@ class ExtractedImplementationParityTests(unittest.TestCase):
                     base_remote_branch="origin/main",
                     work_branch="work",
                     verbose=False,
+                    yes=True,
                 )
             )
 

@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .commands import CiCommandService
-    from .legacy import load_ci_merge_module
     from .message_builder import CommitMessage
     from .messages import CiMessageService
     from .models import (
@@ -63,7 +62,6 @@ _EXPORTS = {
     "RefResolution": "models",
     "export_review_record": "review",
     "generate_html_file": "review_html",
-    "load_ci_merge_module": "legacy",
 }
 
 
@@ -101,5 +99,4 @@ __all__ = [
     "RefResolution",
     "export_review_record",
     "generate_html_file",
-    "load_ci_merge_module",
 ]

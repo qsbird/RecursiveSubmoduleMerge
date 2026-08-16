@@ -15,6 +15,16 @@ import recursive_submodule_merge_gui as desktop_gui
 
 
 class DesktopGuiCommandBuilderTests(unittest.TestCase):
+    def test_parse_branch_tokens_supports_commas_newlines_and_spaces(self) -> None:
+        tokens = desktop_gui.parse_branch_tokens(" feature,origin/main\nrefs/changes/1  refs/changes/2 ")
+
+        self.assertEqual(tokens, ["feature", "origin/main", "refs/changes/1", "refs/changes/2"])
+
+    def test_text_lines_discards_blank_lines_and_trims_whitespace(self) -> None:
+        lines = desktop_gui.text_lines(" scratch.txt \n\n logs \r\n")
+
+        self.assertEqual(lines, ["scratch.txt", "logs"])
+
     def test_build_merge_argv_matches_manual_cli_parser(self) -> None:
         argv = desktop_gui.build_merge_argv(
             {
@@ -22,8 +32,6 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
                 "merge_branches": "feature\norigin/hotfix",
                 "base_remote_branch": "origin/main",
                 "work_branch": "validation-work",
-                "allow_dirty_submodules": True,
-                "no_prompt_dirty_submodules": True,
                 "enable_cross_submodule_moves": True,
                 "report_file": "merge_manual_todo.txt",
                 "ignore_root_untracked_paths": "scratch.txt\nlogs",
@@ -41,8 +49,6 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
         self.assertEqual(parsed.repo, r"C:\work\repo")
         self.assertEqual(parsed.base_remote_branch, "origin/main")
         self.assertEqual(parsed.work_branch, "validation-work")
-        self.assertTrue(parsed.allow_dirty_submodules)
-        self.assertTrue(parsed.no_prompt_dirty_submodules)
         self.assertTrue(parsed.enable_cross_submodule_moves)
         self.assertEqual(parsed.ignore_root_untracked_path, ["scratch.txt", "logs"])
         self.assertEqual(parsed.file_conflict_mode, "tool")
@@ -56,7 +62,6 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
                 "repo": "repo",
                 "merge_branches": "refs/changes/1",
                 "continue_current_branch": True,
-                "no_prompt_dirty_submodules": True,
             }
         )
 
@@ -69,7 +74,7 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
         self.assertEqual(parsed.file_conflict_mode, "tool")
         self.assertFalse(parsed.enable_cross_submodule_moves)
 
-    def test_build_merge_argv_defaults_to_non_prompting_dirty_submodule_guard(self) -> None:
+    def test_build_merge_argv_does_not_allow_dirty_worktrees(self) -> None:
         argv = desktop_gui.build_merge_argv(
             {
                 "repo": "repo",
@@ -78,7 +83,7 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
         )
 
         self.assertNotIn("--allow-dirty-submodules", argv)
-        self.assertIn("--no-prompt-dirty-submodules", argv)
+        self.assertNotIn("--no-prompt-dirty-submodules", argv)
 
     def test_friendly_output_summarizes_confirmation_and_timeout(self) -> None:
         content = (
@@ -136,7 +141,6 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
                     "merge_branches": "refs/changes/1",
                     "continue_current_branch": True,
                     "file_conflict_mode": "preserve",
-                    "no_prompt_dirty_submodules": True,
                 }
             )
 
@@ -194,6 +198,16 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
                 }
             )
 
+    def test_build_clone_spec_rejects_forward_slash_nested_directory_name(self) -> None:
+        with self.assertRaises(desktop_gui.GuiInputError):
+            desktop_gui.build_clone_spec(
+                {
+                    "clone_url": "https://example.com/demo.git",
+                    "clone_destination": r"C:\work",
+                    "clone_directory_name": "nested/demo",
+                }
+            )
+
     def test_build_cleanup_argv_matches_manual_cli_parser(self) -> None:
         argv = desktop_gui.build_cleanup_argv(
             {
@@ -215,6 +229,7 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
         self.assertEqual(parsed.base_remote_branch, "origin/main")
         self.assertEqual(parsed.work_branch, "validation-work")
         self.assertTrue(parsed.verbose)
+        self.assertTrue(parsed.yes)
 
     def test_build_publish_argv_matches_manual_cli_parser(self) -> None:
         argv = desktop_gui.build_publish_argv(
@@ -248,6 +263,20 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
                     "publish_target": "",
                 }
             )
+
+    def test_build_command_spec_preserves_public_command_spec_type(self) -> None:
+        spec = desktop_gui.build_command_spec(
+            "publish",
+            {
+                "repo": "repo",
+                "publish_remote": "origin",
+                "publish_target": "validation-work",
+            },
+        )
+
+        self.assertIsInstance(spec, desktop_gui.CommandSpec)
+        self.assertEqual(spec.action, "publish")
+        self.assertEqual(spec.argv[:2], ["publish", "--repo"])
 
     def test_publish_target_defaults_to_blank_for_manual_confirmation(self) -> None:
         self.assertEqual(desktop_gui.DEFAULT_PUBLISH_TARGET_BRANCH, "")
@@ -311,6 +340,24 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
 
         self.assertNotIn("\\", safe_value)
         self.assertIn("manual_local_execution_validation_run_20260530_141247/repo", safe_value)
+
+    def test_safe_directory_value_preserves_windows_drive_path_with_forward_slashes(self) -> None:
+        safe_value = desktop_gui.safe_directory_value("C:/work/repo")
+
+        self.assertEqual(safe_value, "C:/work/repo")
+
+    def test_safe_directory_value_preserves_unc_path(self) -> None:
+        safe_value = desktop_gui.safe_directory_value("//server/share/repo")
+
+        self.assertEqual(safe_value, "//server/share/repo")
+
+    def test_safe_directory_value_still_absolutizes_posix_relative_path(self) -> None:
+        safe_value = desktop_gui.safe_directory_value("relative/repo")
+
+        self.assertEqual(
+            safe_value,
+            (Path.cwd() / "relative" / "repo").resolve(strict=False).as_posix(),
+        )
 
     def test_git_safe_directory_env_appends_process_local_config(self) -> None:
         with mock.patch.dict(
@@ -382,7 +429,7 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
         self.assertIn("main", output)
         self.assertEqual(run.call_args.kwargs["creationflags"], 1)
 
-    def test_window_icon_is_applied_from_embedded_png(self) -> None:
+    def test_window_icon_is_applied_from_high_res_asset(self) -> None:
         class FakeRoot:
             def __init__(self) -> None:
                 self.icon_calls: list[tuple[object, ...]] = []
@@ -397,13 +444,14 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
             return kwargs
 
         root = FakeRoot()
+        icon_path = Path(__file__).resolve().parents[1] / "assets" / "manual_icon_mac.png"
 
-        self.assertTrue(apply_window_icon(root, photo_image_factory=fake_photo_image))
+        self.assertTrue(apply_window_icon(root, photo_image_factory=fake_photo_image, icon_path=icon_path))
         self.assertEqual(len(root.icon_calls), 1)
         self.assertEqual(root.icon_calls[0][0], True)
         self.assertIs(root.icon_calls[0][1], images[0])
         self.assertIs(root._merge_tool_window_icon, images[0])
-        self.assertIn("data", images[0])
+        self.assertEqual(images[0].get("file"), str(icon_path))
 
     def test_discover_repositories_finds_validation_repo_shape(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
