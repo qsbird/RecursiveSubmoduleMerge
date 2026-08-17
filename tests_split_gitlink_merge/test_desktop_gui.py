@@ -29,10 +29,9 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
         argv = desktop_gui.build_merge_argv(
             {
                 "repo": r"C:\work\repo",
-                "merge_branches": "feature\norigin/hotfix",
+                "merge_branch": "feature",
                 "base_remote_branch": "origin/main",
                 "work_branch": "validation-work",
-                "enable_cross_submodule_moves": True,
                 "report_file": "merge_manual_todo.txt",
                 "ignore_root_untracked_paths": "scratch.txt\nlogs",
                 "file_conflict_mode": "tool",
@@ -45,45 +44,54 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
         parsed = manual_runtime.parse_args(argv)
 
         self.assertEqual(parsed.command, "merge")
-        self.assertEqual(parsed.merge_branches, ["feature", "origin/hotfix"])
+        self.assertEqual(parsed.merge_branches, ["feature"])
         self.assertEqual(parsed.repo, r"C:\work\repo")
         self.assertEqual(parsed.base_remote_branch, "origin/main")
         self.assertEqual(parsed.work_branch, "validation-work")
-        self.assertTrue(parsed.enable_cross_submodule_moves)
         self.assertEqual(parsed.ignore_root_untracked_path, ["scratch.txt", "logs"])
         self.assertEqual(parsed.file_conflict_mode, "tool")
         self.assertEqual(parsed.conflict_tool_timeout_seconds, 0)
         self.assertFalse(parsed.no_confirm_after_conflict_tool)
         self.assertTrue(parsed.verbose)
 
-    def test_build_merge_argv_supports_continue_current_branch(self) -> None:
+    def test_build_merge_argv_supports_use_current_branch(self) -> None:
         argv = desktop_gui.build_merge_argv(
             {
                 "repo": "repo",
-                "merge_branches": "refs/changes/1",
-                "continue_current_branch": True,
+                "merge_branch": "refs/changes/1",
+                "use_current_branch": True,
             }
         )
 
-        self.assertIn("--continue-current-branch", argv)
+        self.assertIn("--use-current-branch", argv)
         self.assertNotIn("--base-remote-branch", argv)
         self.assertNotIn("--work-branch", argv)
         self.assertIn("--conflict-tool-command", argv)
-        self.assertNotIn("--enable-cross-submodule-moves", argv)
         parsed = manual_runtime.parse_args(argv)
         self.assertEqual(parsed.file_conflict_mode, "tool")
-        self.assertFalse(parsed.enable_cross_submodule_moves)
+        self.assertTrue(parsed.continue_current_branch)
 
     def test_build_merge_argv_does_not_allow_dirty_worktrees(self) -> None:
         argv = desktop_gui.build_merge_argv(
             {
                 "repo": "repo",
-                "merge_branches": "feature",
+                "merge_branch": "feature",
             }
         )
 
         self.assertNotIn("--allow-dirty-submodules", argv)
         self.assertNotIn("--no-prompt-dirty-submodules", argv)
+
+    def test_build_merge_argv_rejects_multiple_merge_branches(self) -> None:
+        with self.assertRaises(desktop_gui.GuiInputError) as raised:
+            desktop_gui.build_merge_argv(
+                {
+                    "repo": "repo",
+                    "merge_branch": "feature\norigin/hotfix",
+                }
+            )
+
+        self.assertIn("Exactly one merge branch", str(raised.exception))
 
     def test_friendly_output_summarizes_confirmation_and_timeout(self) -> None:
         content = (
@@ -138,8 +146,8 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
             desktop_gui.build_merge_argv(
                 {
                     "repo": "repo",
-                    "merge_branches": "refs/changes/1",
-                    "continue_current_branch": True,
+                    "merge_branch": "refs/changes/1",
+                    "use_current_branch": True,
                     "file_conflict_mode": "preserve",
                 }
             )
@@ -151,7 +159,7 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
             desktop_gui.build_merge_argv(
                 {
                     "repo": "repo",
-                    "merge_branches": "feature",
+                    "merge_branch": "feature",
                     "clone_enabled": True,
                     "clone_branch": "main",
                     "clone_url": "",
@@ -277,6 +285,15 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
         self.assertIsInstance(spec, desktop_gui.CommandSpec)
         self.assertEqual(spec.action, "publish")
         self.assertEqual(spec.argv[:2], ["publish", "--repo"])
+
+    def test_build_command_spec_supports_manual_session_commands(self) -> None:
+        status_spec = desktop_gui.build_command_spec("status", {"repo": "repo", "verbose": True})
+        resume_spec = desktop_gui.build_command_spec("resume", {"repo": "repo", "verbose": True})
+        abort_spec = desktop_gui.build_command_spec("abort", {"repo": "repo", "verbose": True})
+
+        self.assertEqual(status_spec.argv, ["status", "--repo", "repo", "--verbose"])
+        self.assertEqual(resume_spec.argv, ["resume", "--repo", "repo", "--verbose"])
+        self.assertEqual(abort_spec.argv, ["abort", "--repo", "repo", "--yes", "--verbose"])
 
     def test_publish_target_defaults_to_blank_for_manual_confirmation(self) -> None:
         self.assertEqual(desktop_gui.DEFAULT_PUBLISH_TARGET_BRANCH, "")
@@ -444,7 +461,7 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
             return kwargs
 
         root = FakeRoot()
-        icon_path = Path(__file__).resolve().parents[1] / "assets" / "manual_icon_mac.png"
+        icon_path = Path(__file__).resolve().parents[1] / "assets" / "manual_icon_dung_beetle_256.png"
 
         self.assertTrue(apply_window_icon(root, photo_image_factory=fake_photo_image, icon_path=icon_path))
         self.assertEqual(len(root.icon_calls), 1)
@@ -478,7 +495,8 @@ class DesktopGuiCommandBuilderTests(unittest.TestCase):
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("{merge,cleanup,publish,guided}", completed.stdout)
+        for token in ("merge", "status", "resume", "abort", "cleanup", "publish", "guided"):
+            self.assertIn(token, completed.stdout)
 
 
 if __name__ == "__main__":

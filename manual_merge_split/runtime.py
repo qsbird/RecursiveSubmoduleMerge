@@ -18,6 +18,9 @@ from .models import (
 )
 
 
+SESSION_COMMANDS = {"status", "resume", "abort"}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Recursively merge repositories with nested git submodules."
@@ -29,6 +32,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the recursive merge workflow.",
     )
     add_merge_arguments(merge_parser)
+
+    status_parser = subparsers.add_parser(
+        "status",
+        help="Show the active manual merge session status.",
+    )
+    add_session_repo_argument(status_parser)
+
+    resume_parser = subparsers.add_parser(
+        "resume",
+        help="Resume the active manual merge session.",
+    )
+    add_session_repo_argument(resume_parser)
+
+    abort_parser = subparsers.add_parser(
+        "abort",
+        help="Abort the active manual merge session without broad cleanup.",
+    )
+    add_session_repo_argument(abort_parser)
+    abort_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Allow abort to restore repositories even after new commits were created during the paused session.",
+    )
 
     cleanup_parser = subparsers.add_parser(
         "cleanup",
@@ -61,9 +87,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def add_merge_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "merge_branches",
-        nargs="+",
-        help="One or more branches or refs to merge in order.",
+        "merge_branch",
+        help="Branch or ref to merge.",
     )
     parser.add_argument(
         "--repo",
@@ -95,9 +120,16 @@ def add_merge_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     branch_mode.add_argument(
-        "--continue-current-branch",
+        "--use-current-branch",
+        dest="use_current_branch",
         action="store_true",
         help="Merge on the currently checked-out root branch instead of creating/resetting a work branch.",
+    )
+    branch_mode.add_argument(
+        "--continue-current-branch",
+        dest="use_current_branch",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--work-branch",
@@ -165,12 +197,17 @@ def add_merge_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--enable-cross-submodule-moves",
+        "--verbose",
         action="store_true",
-        help=(
-            "Enable experimental detection and merging of files moved across submodule boundaries. "
-            "Disabled by default."
-        ),
+        help="Print executed commands and key progress information.",
+    )
+
+
+def add_session_repo_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--repo",
+        default=".",
+        help="Root repository path. Defaults to the current directory.",
     )
     parser.add_argument(
         "--verbose",
@@ -279,8 +316,22 @@ def add_publish_arguments(parser: argparse.ArgumentParser) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
-    normalized = common.normalize_argv(list(sys.argv[1:] if argv is None else argv))
-    return parser.parse_args(normalized)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] in {"merge", "cleanup", "publish", "guided", *SESSION_COMMANDS, "-h", "--help"}:
+        normalized = raw_argv
+    else:
+        normalized = common.normalize_argv(raw_argv)
+    args = parser.parse_args(normalized)
+    setattr(args, "_used_deprecated_continue_current_branch", "--continue-current-branch" in normalized)
+    _normalize_merge_args(args)
+    return args
+
+
+def _normalize_merge_args(args: argparse.Namespace) -> None:
+    if args.command != "merge":
+        return
+    args.merge_branches = [args.merge_branch]
+    args.continue_current_branch = bool(getattr(args, "use_current_branch", False))
 
 
 def _check_code_at_startup(args: argparse.Namespace) -> None:
@@ -313,17 +364,23 @@ def main(
 ) -> int:
     from .config_persistence import apply_config_to_args, save_config_from_args
 
-    args = parse_args(argv)
+    args = apply_config_to_args(parse_args(argv))
+    _normalize_merge_args(args)
+    if getattr(args, "_used_deprecated_continue_current_branch", False):
+        print(
+            "--continue-current-branch is deprecated; use --use-current-branch. "
+            "Use the resume subcommand to continue a paused merge session.",
+            file=sys.stderr,
+        )
     _check_code_at_startup(args)
-
-    # Apply saved configuration defaults for fields the user didn't override
-    args = apply_config_to_args(args)
 
     commands = command_service or ManualCommandService()
     exit_code = 0
 
     if args.command == "cleanup":
         exit_code = commands.run_cleanup(args)
+    elif args.command in SESSION_COMMANDS:
+        exit_code = _run_optional_session_command(commands, args)
     elif args.command == "publish":
         exit_code = commands.run_publish(args)
     elif args.command == "guided":
@@ -340,7 +397,19 @@ def main(
         exit_code = commands.run_merge(args)
 
     # Persist successful runs so the next invocation can pre-fill defaults
-    if exit_code == 0:
+    if exit_code == 0 and args.command in {"merge", "cleanup", "publish"}:
         save_config_from_args(args, args.command)
 
     return exit_code
+
+
+def _run_optional_session_command(commands: ManualCommandService, args: argparse.Namespace) -> int:
+    handler = getattr(commands, f"run_{args.command}", None)
+    if handler is None:
+        print(
+            f"Manual merge '{args.command}' is not available in this build yet; "
+            "the session backend has not been wired in this entry point.",
+            file=sys.stderr,
+        )
+        return 1
+    return int(handler(args))

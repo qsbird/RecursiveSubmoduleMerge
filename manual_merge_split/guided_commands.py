@@ -73,26 +73,27 @@ def run_guided(
 
     if action == "merge":
         mc = saved_config.merge
-        default_branches_raw = ", ".join(mc.merge_branches) if mc.merge_branches else ""
+        default_branch = mc.merge_branch
         merge_branches = common.parse_branch_tokens(
             input_func(
-                f"Merge branches in order (branch name or origin/branch; comma or line separated)"
-                f"{' [' + default_branches_raw + ']' if default_branches_raw else ''}: "
+                f"Merge branch (branch name or origin/branch)"
+                f"{' [' + default_branch + ']' if default_branch else ''}: "
             ).strip()
-            or default_branches_raw
+            or default_branch
         )
-        if not merge_branches:
-            print("At least one merge branch is required.", file=sys.stderr)
+        if len(merge_branches) != 1:
+            print("Exactly one merge branch is required.", file=sys.stderr)
             return 1
+        merge_branch = merge_branches[0]
 
-        continue_current_branch = prompt_yes_no(
-            "Continue merging on the current root branch instead of creating/resetting a work branch",
-            mc.continue_current_branch,
+        use_current_branch = prompt_yes_no(
+            "Merge on the current root branch instead of creating/resetting a work branch",
+            mc.use_current_branch,
             input_func=input_func,
         )
         base_remote_branch = ROOT_BASE_REMOTE_BRANCH
         work_branch = None
-        if not continue_current_branch:
+        if not use_current_branch:
             base_remote_branch = prompt_with_default(
                 "Root base remote branch",
                 mc.base_remote_branch,
@@ -105,13 +106,15 @@ def run_guided(
             )
         merge_args = argparse.Namespace(
             command="merge",
-            merge_branches=merge_branches,
+            merge_branch=merge_branch,
+            merge_branches=[merge_branch],
             repo=str(repo),
             clone_branch=prompt_optional("Clone branch before merge (leave empty to skip clone)", input_func=input_func),
             clone_url=None,
             clone_path=None,
             base_remote_branch=base_remote_branch,
-            continue_current_branch=continue_current_branch,
+            use_current_branch=use_current_branch,
+            continue_current_branch=use_current_branch,
             work_branch=work_branch,
             ignore_root_untracked_path=[],
             report_file=prompt_with_default("Conflict report filename", REPORT_FILE_NAME, input_func=input_func),
@@ -129,8 +132,8 @@ def run_guided(
                 )
             ),
             verbose=prompt_yes_no("Enable verbose command output", mc.verbose, input_func=input_func),
-            enable_cross_submodule_moves=False,
             no_confirm_after_conflict_tool=False,
+            _used_deprecated_continue_current_branch=False,
         )
         if merge_args.clone_branch:
             merge_args.clone_url = prompt_optional("Clone git URL", input_func=input_func)

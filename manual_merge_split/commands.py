@@ -43,6 +43,7 @@ from .preflight import (
 )
 from .publish import ManualPublishService
 from .repository_ops import ManualRepositoryOps
+from .session_workflow import ManualMergeSessionService
 
 
 COMMAND_FUNCTIONS: tuple[str, ...] = ()
@@ -685,7 +686,7 @@ def rebuild_work_branches(
 
 
 def resolve_merge_work_branch(args: Any, repo_path: Path, ops: ManualRepositoryOps) -> str:
-    if args.continue_current_branch:
+    if getattr(args, "use_current_branch", False):
         current_branch = ops.current_branch_name(repo_path)
         if current_branch is None:
             raise ops._automation_error(
@@ -697,19 +698,17 @@ def resolve_merge_work_branch(args: Any, repo_path: Path, ops: ManualRepositoryO
 
 def make_merge_context(args: Any, repo_path: Path, ops: ManualRepositoryOps) -> MergeContext:
     timeout_seconds = args.conflict_tool_timeout_seconds
-    normalized_merge_branches = [common.normalize_user_merge_ref(branch) for branch in args.merge_branches]
     if args.file_conflict_mode != "tool":
         raise ops._automation_error(
             "File conflict preserve mode has been removed; merge this branch manually instead."
         )
     return MergeContext(
         work_branch=resolve_merge_work_branch(args, repo_path, ops),
-        merge_branch=normalized_merge_branches[0],
+        merge_branch=common.normalize_user_merge_ref(args.merge_branch),
         file_conflict_mode=args.file_conflict_mode,
         conflict_tool_command=args.conflict_tool_command,
         conflict_tool_timeout_seconds=None if timeout_seconds <= 0 else timeout_seconds,
         confirm_after_conflict_tool=not getattr(args, "no_confirm_after_conflict_tool", False),
-        enable_cross_submodule_moves=bool(getattr(args, "enable_cross_submodule_moves", False)),
     )
 
 
@@ -723,147 +722,49 @@ def run_merge(
     cross_submodule_moves_service: CrossSubmoduleMoveService,
 ) -> int:
     set_verbose(manual_module, getattr(args, "verbose", False))
-    if args.continue_current_branch and args.work_branch:
-        print("--work-branch cannot be used together with --continue-current-branch.", file=sys.stderr)
-        return 1
+    session_service = ManualMergeSessionService(
+        ops=ops,
+        preflight_service=preflight_service,
+        file_conflicts_service=file_conflicts_service,
+    )
+    return session_service.start_merge(args)
 
 
-    clone_values = [args.clone_branch, args.clone_url, args.clone_path]
-    clone_enabled = any(value for value in clone_values)
-    if clone_enabled and not all(value for value in clone_values):
-        print("Clone before merge requires --clone-branch, --clone-url, and --clone-path together.", file=sys.stderr)
-        return 1
-    if not args.continue_current_branch and not (args.base_remote_branch or "").strip():
-        print("--base-remote-branch cannot be empty. Use --continue-current-branch to merge on the current root branch.", file=sys.stderr)
-        return 1
+def run_status(args: Any, *, manual_module: ModuleType | None, ops: ManualRepositoryOps) -> int:
+    set_verbose(manual_module, getattr(args, "verbose", False))
+    session_service = ManualMergeSessionService(
+        ops=ops,
+        preflight_service=ManualPreflightService(manual_module),
+        file_conflicts_service=ManualFileConflictService(manual_module),
+    )
+    return session_service.status(args)
 
-    repo_path = Path(args.repo).resolve()
-    if clone_enabled:
-        try:
-            repo_path = clone_repository(args.clone_branch, args.clone_url, Path(args.clone_path), ops)
-        except ops._automation_error_class() as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
 
-    base_remote_branch = None if args.continue_current_branch else args.base_remote_branch.strip()
-    merge_branches = [common.normalize_user_merge_ref(branch) for branch in args.merge_branches]
-    report_path = repo_path / args.report_file
-    ignored_root_untracked_paths = tuple(args.ignore_root_untracked_path or ())
-    batch_result = MergeBatchResult()
+def run_resume(
+    args: Any,
+    *,
+    manual_module: ModuleType | None,
+    ops: ManualRepositoryOps,
+    preflight_service: ManualPreflightService,
+    file_conflicts_service: ManualFileConflictService,
+) -> int:
+    set_verbose(manual_module, getattr(args, "verbose", False))
+    session_service = ManualMergeSessionService(
+        ops=ops,
+        preflight_service=preflight_service,
+        file_conflicts_service=file_conflicts_service,
+    )
+    return session_service.resume(args)
 
-    try:
-        base_context = make_merge_context(args, repo_path, ops)
-        base_ref = "HEAD" if args.continue_current_branch else args.base_remote_branch.strip()
-        preflight_service.preflight_repository(
-            repo_path,
-            base_ref,
-            merge_branches,
-            ignored_root_untracked_paths=ignored_root_untracked_paths,
-        )
-        if getattr(args, "allow_dirty_submodules", False):
-            print(
-                "Ignoring --allow-dirty-submodules; manual merge no longer starts with uncommitted changes.",
-                file=sys.stderr,
-            )
-        preserved_dirty_paths_by_repo: dict[Path, set[str]] = {}
-        preserved_dirty_repos: set[Path] = set()
-        _safe_unlink_report(report_path, repo_path, ops)
 
-        initial_context = replace(base_context, merge_branch=merge_branches[0])
-        if base_remote_branch:
-            ops.create_root_branch(repo_path, base_remote_branch, initial_context.work_branch)
-            refresh_submodules_after_root_checkout(repo_path, ops, preserved_dirty_paths_by_repo)
-        checkpoint = ops.collect_repo_snapshot(repo_path)
-
-        for index, merge_branch in enumerate(merge_branches):
-            branch_context = replace(
-                base_context,
-                merge_branch=merge_branch,
-                report_entries=[],
-                rollback_requested=False,
-            )
-            completed = process_repository(
-                repo_path,
-                branch_context,
-                root_base_remote_branch=base_remote_branch,
-                is_root=True,
-                prepare_branch=(index == 0 and base_remote_branch is not None),
-                preserved_dirty_paths_by_repo=preserved_dirty_paths_by_repo,
-                ignored_root_untracked_paths=ignored_root_untracked_paths,
-                ops=ops,
-                file_conflicts_service=file_conflicts_service,
-                cross_submodule_moves_service=cross_submodule_moves_service,
-            )
-
-            if branch_context.report_entries or not completed:
-                if can_skip_failed_branch(branch_context, completed):
-                    ops.rollback_to_snapshot(
-                        repo_path,
-                        checkpoint,
-                        report_path=None,
-                        preserve_report=False,
-                        ignored_root_untracked_paths=ignored_root_untracked_paths,
-                        preserved_dirty_paths_by_repo=preserved_dirty_paths_by_repo,
-                        preserved_dirty_repos=preserved_dirty_repos,
-                    )
-                    skip_reason = summarize_conflict_entries(branch_context.report_entries)
-                    batch_result.skipped_branches.append(merge_branch)
-                    batch_result.skipped_branch_reasons[merge_branch] = skip_reason
-                    print(f"Skipping branch '{merge_branch}' after rollback: {skip_reason}")
-                    continue
-
-                write_report(report_path, branch_context, ops=ops, repo_path=repo_path)
-                batch_result.stopped_branch = merge_branch
-                should_rollback = branch_context.rollback_requested and can_auto_rollback_failed_branch(branch_context)
-                if should_rollback:
-                    ops.rollback_to_snapshot(
-                        repo_path,
-                        checkpoint,
-                        report_path=report_path,
-                        preserve_report=True,
-                        ignored_root_untracked_paths=ignored_root_untracked_paths,
-                        preserved_dirty_paths_by_repo=preserved_dirty_paths_by_repo,
-                        preserved_dirty_repos=preserved_dirty_repos,
-                    )
-                    if batch_result.completed_branches:
-                        batch_result.rolled_back_to_branch = batch_result.completed_branches[-1]
-                    else:
-                        batch_result.rolled_back_to_checkpoint = True
-                print(f"Merge stopped on branch '{merge_branch}'. See: {report_path}")
-                if batch_result.rolled_back_to_branch:
-                    print(
-                        "Repository rolled back to the result after branch "
-                        f"'{batch_result.rolled_back_to_branch}'."
-                    )
-                elif batch_result.rolled_back_to_checkpoint:
-                    print("Repository rolled back to the pre-merge checkpoint.")
-                else:
-                    print(
-                        "Repository was left unchanged after the failed merge branch to preserve local edits. "
-                        "Resolve or clean up manually before retrying."
-                    )
-                return 2
-
-            batch_result.completed_branches.append(merge_branch)
-            checkpoint = ops.collect_repo_snapshot(repo_path)
-
-        _safe_unlink_report(report_path, repo_path, ops)
-    except ops._automation_error_class() as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    if batch_result.skipped_branches and not batch_result.completed_branches:
-        print("No branches were merged successfully. Skipped branches: " + ", ".join(batch_result.skipped_branches))
-        return 2
-    if batch_result.skipped_branches:
-        print("Recursive batch merge completed with skipped branches: " + ", ".join(batch_result.completed_branches))
-        print("Skipped branches: " + ", ".join(batch_result.skipped_branches))
-        return 0
-    if len(batch_result.completed_branches) == 1:
-        print("Recursive merge completed successfully.")
-    else:
-        print("Recursive batch merge completed successfully: " + ", ".join(batch_result.completed_branches))
-    return 0
+def run_abort(args: Any, *, manual_module: ModuleType | None, ops: ManualRepositoryOps) -> int:
+    set_verbose(manual_module, getattr(args, "verbose", False))
+    session_service = ManualMergeSessionService(
+        ops=ops,
+        preflight_service=ManualPreflightService(manual_module),
+        file_conflicts_service=ManualFileConflictService(manual_module),
+    )
+    return session_service.abort(args)
 
 
 def run_cleanup(args: Any, *, manual_module: ModuleType | None, ops: ManualRepositoryOps) -> int:
@@ -999,6 +900,21 @@ class ManualCommandService:
             file_conflicts_service=self.file_conflicts,
             cross_submodule_moves_service=self.cross_submodule_moves,
         )
+
+    def run_status(self, args: Any) -> int:
+        return run_status(args, manual_module=self.manual_module, ops=self.ops)
+
+    def run_resume(self, args: Any) -> int:
+        return run_resume(
+            args,
+            manual_module=self.manual_module,
+            ops=self.ops,
+            preflight_service=self.preflight,
+            file_conflicts_service=self.file_conflicts,
+        )
+
+    def run_abort(self, args: Any) -> int:
+        return run_abort(args, manual_module=self.manual_module, ops=self.ops)
 
     def run_cleanup(self, args: Any) -> int:
         return run_cleanup(args, manual_module=self.manual_module, ops=self.ops)

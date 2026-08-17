@@ -13,9 +13,18 @@ from typing import Any, Iterable
 from merge_cleanup_core import steps as cleanup_steps
 
 from . import common
+from .conflict_classifier import classify_conflict_records
 from . import execution
 from .messages import ManualCommitMessage
-from .models import KNOWN_MISSING_REVISION_MARKERS, CleanupResult, MergeAutomationError, RepoSnapshot, UnmergedConflict
+from .models import (
+    KNOWN_MISSING_REVISION_MARKERS,
+    ClassifiedManualConflict,
+    CleanupResult,
+    ManualConflictRecord,
+    MergeAutomationError,
+    RepoSnapshot,
+    UnmergedConflict,
+)
 
 
 REPOSITORY_OP_FUNCTIONS: tuple[str, ...] = ()
@@ -272,6 +281,15 @@ class ManualRepositoryOps:
         result = self.run_git(repo_path, ["rev-parse", "-q", "--verify", "MERGE_HEAD"], check=False)
         return result.returncode == 0
 
+    def read_merge_head(self, repo_path: Path) -> str | None:
+        result = self.run_git(repo_path, ["rev-parse", "-q", "--verify", "MERGE_HEAD"], check=False)
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+
+    def current_head(self, repo_path: Path) -> str:
+        return self.resolve_commit(repo_path, "HEAD")
+
     def _filter_status_lines(
         self,
         status_output: str,
@@ -353,6 +371,20 @@ class ManualRepositoryOps:
         result = self.run_git(repo_path, ["diff", "--name-only", "--diff-filter=U"])
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
+    def get_unmerged_status_codes(self, repo_path: Path) -> dict[str, str]:
+        result = self.run_git(repo_path, ["status", "--porcelain"], check=False)
+        if result.returncode != 0:
+            return {}
+        status_by_path: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            code = line[:2]
+            path = line[3:].strip()
+            if "U" in code or code in {"AA", "DD", "AU", "UA", "DU", "UD"}:
+                status_by_path[path] = code
+        return status_by_path
+
     def is_submodule_path(self, repo_path: Path, relative_path: str) -> bool:
         result = self.run_git(repo_path, ["ls-files", "--stage", "--", relative_path], check=False)
         return "160000" in result.stdout
@@ -387,6 +419,50 @@ class ManualRepositoryOps:
             )
             for path in modes_by_path
         ]
+
+    def collect_conflict_records(self, repo_path: Path) -> list[ManualConflictRecord]:
+        result = self.run_git(repo_path, ["ls-files", "-u"], check=False)
+        if result.returncode != 0 or not result.stdout:
+            return []
+        records: list[ManualConflictRecord] = []
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split(maxsplit=3)
+            if len(parts) != 4:
+                records.append(ManualConflictRecord(path="<unparseable>", mode="", sha="", stage=0))
+                continue
+            mode, sha, stage_token, path = parts
+            try:
+                stage = int(stage_token)
+            except ValueError:
+                stage = 0
+            records.append(ManualConflictRecord(path=path, mode=mode, sha=sha, stage=stage))
+        return records
+
+    def classify_unmerged_conflicts(self, repo_path: Path) -> dict[str, ClassifiedManualConflict]:
+        return classify_conflict_records(
+            repo_path.resolve(strict=False),
+            self.get_unmerged_paths(repo_path),
+            self.collect_conflict_records(repo_path),
+            status_by_path=self.get_unmerged_status_codes(repo_path),
+            is_binary_path=self.is_binary_conflict_path,
+        )
+
+    def is_binary_conflict_path(
+        self,
+        repo_path: Path,
+        relative_path: str,
+        records: tuple[ManualConflictRecord, ...],
+    ) -> bool:
+        for record in records:
+            if record.stage not in {2, 3}:
+                continue
+            result = self.run_git(repo_path, ["show", f":{record.stage}:{relative_path}"], check=False)
+            if result.returncode == 0 and "\x00" in result.stdout:
+                return True
+        return False
 
     def split_conflicts_by_stage(self, repo_path: Path) -> tuple[list[str], list[str], list[UnmergedConflict]]:
         submodule_conflicts: list[str] = []
@@ -501,7 +577,12 @@ class ManualRepositoryOps:
 
     def create_root_branch(self, repo_path: Path, base_remote_branch: str, work_branch: str) -> None:
         self.fetch_ref_if_remote(repo_path, base_remote_branch)
-        start_point = common.remote_tracking_ref(base_remote_branch)
+        remote_name, _, remote_branch = base_remote_branch.partition("/")
+        start_point = (
+            common.remote_tracking_ref(base_remote_branch)
+            if remote_branch and self.remote_exists(repo_path, remote_name)
+            else base_remote_branch
+        )
         self.ensure_branch_reset_is_safe(
             repo_path,
             work_branch,
@@ -535,7 +616,11 @@ class ManualRepositoryOps:
 
     def merge_branch(self, repo_path: Path, merge_ref: str) -> str:
         self.fetch_ref_if_remote(repo_path, merge_ref)
-        merge_target = common.remote_tracking_ref(merge_ref)
+        remote_name, _, remote_branch = merge_ref.partition("/")
+        if remote_branch and self.remote_exists(repo_path, remote_name):
+            merge_target = common.remote_tracking_ref(merge_ref)
+        else:
+            merge_target = merge_ref
         result = self.run_git(repo_path, ["merge", "--no-ff", "--no-commit", merge_target], check=False)
         if result.returncode == 0:
             return merge_target
@@ -587,6 +672,36 @@ class ManualRepositoryOps:
 
     def stage_path(self, repo_path: Path, relative_path: str) -> None:
         self.run_git(repo_path, ["add", "--", relative_path])
+
+    def abort_merge(self, repo_path: Path) -> bool:
+        result = self.run_git(repo_path, ["merge", "--abort"], check=False)
+        return result.returncode == 0
+
+    def reset_hard(self, repo_path: Path, revision: str) -> None:
+        self.run_git(repo_path, ["reset", "--hard", revision])
+
+    def checkout_branch(self, repo_path: Path, branch_name: str) -> None:
+        self.run_git(repo_path, ["checkout", branch_name])
+
+    def checkout_detached(self, repo_path: Path, revision: str) -> None:
+        self.run_git(repo_path, ["checkout", "--detach", revision])
+
+    def is_ancestor(self, repo_path: Path, ancestor: str, descendant: str) -> bool:
+        result = self.run_git(repo_path, ["merge-base", "--is-ancestor", ancestor, descendant], check=False)
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        raise self._automation_error(self._format_git_failure(result))
+
+    def git_path(self, repo_path: Path, relative_path: str) -> Path:
+        result = self.run_git(repo_path, ["rev-parse", "--git-path", relative_path], check=False)
+        if result.returncode != 0:
+            raise self._automation_error(self._format_git_failure(result))
+        resolved = Path(result.stdout.strip())
+        if resolved.is_absolute():
+            return resolved
+        return (repo_path.resolve(strict=False) / resolved).resolve(strict=False)
 
     def collect_repo_snapshot(self, repo_path: Path) -> list[Any]:
         self.ensure_git_repo(repo_path)

@@ -86,18 +86,18 @@ UI_TEXT: dict[str, dict[str, str]] = {
     "tab_merge": {LANGUAGE_EN: "Merge", LANGUAGE_ZH: "合并"},
     "tab_cleanup": {LANGUAGE_EN: "Cleanup", LANGUAGE_ZH: "清理"},
     "tab_publish": {LANGUAGE_EN: "Publish", LANGUAGE_ZH: "发布"},
-    "label_merge_branches": {
-        LANGUAGE_EN: "Merge branches, one per line or separated by commas",
-        LANGUAGE_ZH: "待合并分支，每行一个或用逗号分隔",
+    "label_merge_branch": {
+        LANGUAGE_EN: "Merge branch or ref",
+        LANGUAGE_ZH: "待合并分支或引用",
     },
     "frame_root_branch_mode": {LANGUAGE_EN: "Root branch mode", LANGUAGE_ZH: "根仓库分支模式"},
     "mode_reset_work_branch": {
         LANGUAGE_EN: "Create or reset work branch",
         LANGUAGE_ZH: "创建或重置工作分支",
     },
-    "mode_continue_current_branch": {
-        LANGUAGE_EN: "Continue current branch",
-        LANGUAGE_ZH: "继续当前分支",
+    "mode_use_current_branch": {
+        LANGUAGE_EN: "Use current branch",
+        LANGUAGE_ZH: "使用当前分支",
     },
     "label_base_remote_branch": {LANGUAGE_EN: "Base remote branch", LANGUAGE_ZH: "基准远端分支"},
     "label_work_branch": {LANGUAGE_EN: "Work branch", LANGUAGE_ZH: "工作分支"},
@@ -112,7 +112,6 @@ UI_TEXT: dict[str, dict[str, str]] = {
         LANGUAGE_EN: "Tool timeout seconds",
         LANGUAGE_ZH: "工具超时时间（秒）",
     },
-    "frame_merge_safeguards": {LANGUAGE_EN: "Merge safeguards", LANGUAGE_ZH: "合并保护"},
     "hint_clean_worktree_required": {
         LANGUAGE_EN: (
             "Merge requires a clean working tree in the root repository and every submodule. "
@@ -133,14 +132,6 @@ UI_TEXT: dict[str, dict[str, str]] = {
             "它会递归 reset 并删除未提交内容。只有在你接受该损失时才继续。"
         ),
     },
-    "option_cross_submodule_moves": {
-        LANGUAGE_EN: "Enable cross-submodule moved file detection",
-        LANGUAGE_ZH: "启用跨子模块移动文件检测",
-    },
-    "hint_cross_submodule_moves": {
-        LANGUAGE_EN: "Experimental: may reduce merge stability and execution efficiency.",
-        LANGUAGE_ZH: "实验性功能：可能影响合并稳定性和执行效率。",
-    },
     "label_branch": {LANGUAGE_EN: "Branch", LANGUAGE_ZH: "分支"},
     "label_url": {LANGUAGE_EN: "URL", LANGUAGE_ZH: "URL"},
     "label_target_path": {LANGUAGE_EN: "Target path", LANGUAGE_ZH: "目标路径"},
@@ -151,6 +142,14 @@ UI_TEXT: dict[str, dict[str, str]] = {
     "button_show_command_preview": {LANGUAGE_EN: "Show command preview", LANGUAGE_ZH: "显示命令预览"},
     "button_hide_command_preview": {LANGUAGE_EN: "Hide command preview", LANGUAGE_ZH: "隐藏命令预览"},
     "button_refresh_command_preview": {LANGUAGE_EN: "Refresh", LANGUAGE_ZH: "刷新"},
+    "button_merge_status": {LANGUAGE_EN: "Session status", LANGUAGE_ZH: "会话状态"},
+    "button_resume_merge": {LANGUAGE_EN: "Resume merge", LANGUAGE_ZH: "继续合并"},
+    "button_abort_merge": {LANGUAGE_EN: "Abort merge", LANGUAGE_ZH: "终止合并"},
+    "message_abort_risk_title": {LANGUAGE_EN: "Abort manual merge?", LANGUAGE_ZH: "终止手动合并？"},
+    "message_abort_risk_body": {
+        LANGUAGE_EN: "Abort restores repositories involved in this merge session and discards manual conflict edits. Untracked files are not deleted. Continue?",
+        LANGUAGE_ZH: "终止操作会恢复本次会话涉及的仓库，并丢弃尚未提交的冲突处理内容；未跟踪文件不会被删除。是否继续？",
+    },
     "button_start_merge": {LANGUAGE_EN: "Start merge", LANGUAGE_ZH: "开始合并"},
     "frame_cleanup_options": {LANGUAGE_EN: "Cleanup options", LANGUAGE_ZH: "清理选项"},
     "option_rebuild_work_branch": {
@@ -264,6 +263,9 @@ UI_TEXT: dict[str, dict[str, str]] = {
         LANGUAGE_ZH: "失败，退出码 {exit_code}",
     },
     "action_merge": {LANGUAGE_EN: "merge", LANGUAGE_ZH: "合并"},
+    "action_status": {LANGUAGE_EN: "session status", LANGUAGE_ZH: "会话状态"},
+    "action_resume": {LANGUAGE_EN: "resume", LANGUAGE_ZH: "继续"},
+    "action_abort": {LANGUAGE_EN: "abort", LANGUAGE_ZH: "终止"},
     "action_cleanup": {LANGUAGE_EN: "cleanup", LANGUAGE_ZH: "清理"},
     "action_publish": {LANGUAGE_EN: "publish", LANGUAGE_ZH: "发布"},
     "message_command_running_title": {LANGUAGE_EN: "Command running", LANGUAGE_ZH: "命令正在运行"},
@@ -665,9 +667,9 @@ class MergeGuiApp:
         self.branch_mode_var = tk.StringVar(value="reset")
         self.base_remote_branch_var = tk.StringVar(value=ROOT_BASE_REMOTE_BRANCH)
         self.work_branch_var = tk.StringVar(value=WORK_BRANCH_DEFAULT)
+        self.merge_branch_var = tk.StringVar(value="origin/feature")
         self.conflict_tool_command_var = tk.StringVar(value=DEFAULT_CONFLICT_TOOL_COMMAND)
         self.conflict_tool_timeout_var = tk.StringVar(value=str(DEFAULT_CONFLICT_TOOL_TIMEOUT_SECONDS))
-        self.enable_cross_submodule_moves_var = tk.BooleanVar(value=False)
         self.clone_url_var = tk.StringVar()
         self.clone_destination_var = tk.StringVar()
         self.clone_directory_var = tk.StringVar()
@@ -750,6 +752,12 @@ class MergeGuiApp:
     def _action_label(self, action: str) -> str:
         if action == "merge":
             return self._t("action_merge")
+        if action == "status":
+            return self._t("action_status")
+        if action == "resume":
+            return self._t("action_resume")
+        if action == "abort":
+            return self._t("action_abort")
         if action == "cleanup":
             return self._t("action_cleanup")
         if action == "publish":
@@ -991,12 +999,11 @@ class MergeGuiApp:
         for column in range(2):
             self.merge_tab.columnconfigure(column, weight=1)
 
-        self._localize(ttk.Label(self.merge_tab), "label_merge_branches").grid(
+        self._localize(ttk.Label(self.merge_tab), "label_merge_branch").grid(
             row=0, column=0, columnspan=2, sticky="w"
         )
-        self.merge_branches_text = self.tk.Text(self.merge_tab, height=5, wrap="word")
-        self.merge_branches_text.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(4, 10))
-        self.merge_branches_text.insert("1.0", "origin/feature")
+        self.merge_branch_entry = ttk.Entry(self.merge_tab, textvariable=self.merge_branch_var)
+        self.merge_branch_entry.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 10))
 
         mode_frame = self._localize(ttk.LabelFrame(self.merge_tab, padding=8), "frame_root_branch_mode")
         mode_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 10))
@@ -1011,7 +1018,7 @@ class MergeGuiApp:
             value="continue",
             variable=self.branch_mode_var,
             command=self._update_enabled_state,
-        ), "mode_continue_current_branch").grid(row=0, column=1, sticky="w", padx=(18, 0))
+        ), "mode_use_current_branch").grid(row=0, column=1, sticky="w", padx=(18, 0))
 
         self.base_entry = self._entry_row(self.merge_tab, 3, 0, "label_base_remote_branch", self.base_remote_branch_var)
         self.work_entry = self._entry_row(self.merge_tab, 3, 1, "label_work_branch", self.work_branch_var)
@@ -1047,35 +1054,28 @@ class MergeGuiApp:
             columnspan=1,
         )
 
-        options = self._localize(ttk.LabelFrame(self.advanced_frame, padding=8), "frame_merge_safeguards")
-        options.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 10))
-        options.columnconfigure(0, weight=1)
-        self._localize(ttk.Checkbutton(
-            options,
-            variable=self.enable_cross_submodule_moves_var,
-        ), "option_cross_submodule_moves").grid(
-            row=0,
-            column=0,
-            sticky="w",
-        )
-        self._localize(
-            ttk.Label(options, foreground="#6b7280", wraplength=560),
-            "hint_cross_submodule_moves",
-        ).grid(row=1, column=0, sticky="ew", padx=(22, 0), pady=(2, 0))
-
         self._localize(ttk.Label(self.advanced_frame), "label_ignored_root_untracked_paths").grid(
-            row=6,
+            row=4,
             column=0,
             columnspan=2,
             sticky="w",
         )
         self.ignore_paths_text = self.tk.Text(self.advanced_frame, height=4, wrap="word")
-        self.ignore_paths_text.grid(row=7, column=0, columnspan=2, sticky="nsew", pady=(4, 10))
+        self.ignore_paths_text.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(4, 10))
 
         buttons = ttk.Frame(self.merge_tab)
         buttons.grid(row=8, column=0, columnspan=2, sticky="e")
+        self._localize(ttk.Button(buttons, command=lambda: self._start("status")), "button_merge_status").grid(
+            row=0, column=0, padx=(0, 8)
+        )
+        self._localize(ttk.Button(buttons, command=lambda: self._start("resume")), "button_resume_merge").grid(
+            row=0, column=1, padx=(0, 8)
+        )
+        self._localize(ttk.Button(buttons, command=lambda: self._start("abort")), "button_abort_merge").grid(
+            row=0, column=2, padx=(0, 8)
+        )
         self._localize(ttk.Button(buttons, command=lambda: self._start("merge")), "button_start_merge").grid(
-            row=0, column=0
+            row=0, column=3
         )
 
     def _build_cleanup_tab(self) -> None:
@@ -1362,14 +1362,13 @@ class MergeGuiApp:
         values = self._common_values()
         values.update(
             {
-                "merge_branches": self.merge_branches_text.get("1.0", "end").strip(),
-                "continue_current_branch": self.branch_mode_var.get() == "continue",
+                "merge_branch": self.merge_branch_var.get(),
+                "use_current_branch": self.branch_mode_var.get() == "continue",
                 "base_remote_branch": self.base_remote_branch_var.get(),
                 "work_branch": self.work_branch_var.get(),
                 "file_conflict_mode": DEFAULT_FILE_CONFLICT_MODE,
                 "conflict_tool_command": self.conflict_tool_command_var.get(),
                 "conflict_tool_timeout_seconds": self.conflict_tool_timeout_var.get(),
-                "enable_cross_submodule_moves": self.enable_cross_submodule_moves_var.get(),
                 "clone_enabled": False,
                 "ignore_root_untracked_paths": self.ignore_paths_text.get("1.0", "end").strip(),
             }
@@ -1404,6 +1403,8 @@ class MergeGuiApp:
     def _values_for_action(self, action: str) -> dict[str, Any]:
         if action == "merge":
             return self._merge_values()
+        if action in {"status", "resume", "abort"}:
+            return self._common_values()
         if action == "cleanup":
             return self._cleanup_values()
         if action == "publish":
@@ -1464,6 +1465,11 @@ class MergeGuiApp:
         if action == "cleanup" and not messagebox.askyesno(
             self._t("message_cleanup_risk_title"),
             self._t("message_cleanup_risk_body"),
+        ):
+            return
+        if action == "abort" and not messagebox.askyesno(
+            self._t("message_abort_risk_title"),
+            self._t("message_abort_risk_body"),
         ):
             return
 
@@ -1862,12 +1868,10 @@ class MergeGuiApp:
             self.base_remote_branch_var.set(mc.base_remote_branch)
         if mc.work_branch:
             self.work_branch_var.set(mc.work_branch)
-        if mc.merge_branches:
-            self.merge_branches_text.delete("1.0", "end")
-            self.merge_branches_text.insert("1.0", "\n".join(mc.merge_branches))
-        if mc.continue_current_branch:
+        if mc.merge_branch:
+            self.merge_branch_var.set(mc.merge_branch)
+        if mc.use_current_branch:
             self.branch_mode_var.set("continue")
-        self.enable_cross_submodule_moves_var.set(mc.enable_cross_submodule_moves)
         if mc.conflict_tool_command:
             self.conflict_tool_command_var.set(mc.conflict_tool_command)
         if mc.conflict_tool_timeout_seconds:

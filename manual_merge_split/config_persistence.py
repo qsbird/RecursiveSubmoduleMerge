@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 CONFIG_FILE_NAME = "merge_tool_last_run.json"
+CONFIG_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -26,12 +27,11 @@ class MergeConfig:
     repo: str = "."
     base_remote_branch: str = "origin/main"
     work_branch: str | None = None
-    merge_branches: list[str] = field(default_factory=list)
-    continue_current_branch: bool = False
+    merge_branch: str = ""
+    use_current_branch: bool = False
     allow_dirty_submodules: bool = False
     conflict_tool_command: str = 'code --wait "{file}"'
     conflict_tool_timeout_seconds: int = 600
-    enable_cross_submodule_moves: bool = False
     verbose: bool = False
 
 
@@ -55,7 +55,7 @@ class CleanupConfig:
 
 @dataclass
 class LastRunConfig:
-    version: int = 1
+    version: int = CONFIG_SCHEMA_VERSION
     last_command: str = ""
     last_run_at: str = ""
     merge: MergeConfig = field(default_factory=MergeConfig)
@@ -118,11 +118,23 @@ def _deserialize(raw: dict[str, Any]) -> LastRunConfig:
                 kwargs[f.name] = data[f.name]
         return section_cls(**kwargs)
 
+    def _deserialize_merge(data: dict[str, Any]) -> MergeConfig:
+        migrated = dict(data)
+        merge_branch = str(migrated.get("merge_branch", "") or "").strip()
+        if not merge_branch:
+            legacy_branches = [str(value).strip() for value in migrated.get("merge_branches", []) if str(value).strip()]
+            if len(legacy_branches) == 1:
+                merge_branch = legacy_branches[0]
+        if "continue_current_branch" in migrated and "use_current_branch" not in migrated:
+            migrated["use_current_branch"] = migrated.get("continue_current_branch")
+        migrated["merge_branch"] = merge_branch
+        return _populate(MergeConfig, migrated)
+
     return LastRunConfig(
-        version=raw.get("version", 1),
+        version=CONFIG_SCHEMA_VERSION,
         last_command=raw.get("last_command", ""),
         last_run_at=raw.get("last_run_at", ""),
-        merge=_populate(MergeConfig, raw.get("merge", {})),
+        merge=_deserialize_merge(raw.get("merge", {})),
         publish=_populate(PublishConfig, raw.get("publish", {})),
         cleanup=_populate(CleanupConfig, raw.get("cleanup", {})),
     )
@@ -163,12 +175,18 @@ def save_config_from_args(args: Any, command: str) -> None:
         mc.repo = str(getattr(args, "repo", mc.repo))
         mc.base_remote_branch = str(getattr(args, "base_remote_branch", mc.base_remote_branch))
         mc.work_branch = getattr(args, "work_branch", None) or None
-        mc.merge_branches = list(getattr(args, "merge_branches", []))
-        mc.continue_current_branch = bool(getattr(args, "continue_current_branch", False))
+        merge_branch = str(getattr(args, "merge_branch", "") or "").strip()
+        if not merge_branch:
+            legacy_branches = [str(value).strip() for value in getattr(args, "merge_branches", []) if str(value).strip()]
+            if len(legacy_branches) == 1:
+                merge_branch = legacy_branches[0]
+        mc.merge_branch = merge_branch
+        mc.use_current_branch = bool(
+            getattr(args, "use_current_branch", getattr(args, "continue_current_branch", False))
+        )
         mc.allow_dirty_submodules = bool(getattr(args, "allow_dirty_submodules", False))
         mc.conflict_tool_command = str(getattr(args, "conflict_tool_command", mc.conflict_tool_command))
         mc.conflict_tool_timeout_seconds = int(getattr(args, "conflict_tool_timeout_seconds", 600))
-        mc.enable_cross_submodule_moves = bool(getattr(args, "enable_cross_submodule_moves", False))
         mc.verbose = bool(getattr(args, "verbose", False))
     elif command == "publish":
         pc = config.publish

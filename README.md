@@ -7,8 +7,8 @@
 - 根仓库引用多个子模块，分支合并时经常出现 `160000` gitlink 冲突。
 - 子模块内部也存在嵌套子模块，需要递归合并。
 - CI 需要自动生成合并候选提交、报告、补丁、冲突材料，并在安全条件下发布。
-- 本地手动合并需要保留未受影响的 dirty submodule，并用外部冲突工具处理普通文件冲突。
-- 多分支按顺序合并，部分分支失败时希望继续合并后续分支并产出可审计结果。
+- 本地手动合并一次只处理一个目标分支，并用外部冲突工具处理普通文件冲突。
+- CI 多分支按顺序合并，部分分支失败时可继续后续分支并产出可审计结果。
 
 ## 快速开始
 
@@ -28,6 +28,14 @@ python -m ci_merge_split --source origin/feature-a --source origin/feature-b --t
 
 ```powershell
 python -m manual_merge_split merge origin/feature --repo C:\path\to\repo --base-remote-branch origin/main
+```
+
+遇到非普通文件/纯 gitlink 冲突时，手动流程会保留现场并返回退出码 2：
+
+```powershell
+python -m manual_merge_split status --repo C:\path\to\repo
+python -m manual_merge_split resume --repo C:\path\to\repo
+python -m manual_merge_split abort --repo C:\path\to\repo --yes
 ```
 
 手动发布当前根仓库 HEAD 以及它引用的子模块提交：
@@ -64,14 +72,14 @@ python ci_merge_review.py record --report C:\path\to\output\merge-report.json --
 
 ## 主要能力
 
-- 自动识别 gitlink 冲突、普通文件冲突、`.gitmodules` 冲突和不完整 index stage。
+- 手动模式严格区分普通文件、纯 gitlink、人工接管和非法索引状态。
 - 对可自动处理的 gitlink 冲突执行递归子模块合并。
 - 对 fast-forward、already-contains、ours/theirs 与真正递归合并场景做不同决策。
 - CI 模式输出 JSON 报告、命令日志、patch、冲突 stage 文件和变更文件材料。
 - CI review 工具可基于 `merge-report.json` 生成离线 HTML review 页面，并导出结构化 review 结论。
 - CI 多分支 batch 默认使用 `continue-success`：失败分支会记录为 failed step，仓库恢复到最近成功提交后继续后续分支。
-- 手动模式支持 dirty submodule 影响分析，只允许“本次合并不会触碰 gitlink”的 dirty submodule 被保留。
-- 手动模式支持 cleanup、guided CLI、GUI 入口和递归 publish。
+- 手动模式要求根仓库和递归子模块在开始前保持干净。
+- 手动模式支持可恢复 session、cleanup、guided CLI、GUI 入口和递归 publish。
 
 ## 目录结构
 

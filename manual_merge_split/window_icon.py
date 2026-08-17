@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-WINDOW_ICON_PNG_NAME = "manual_icon_mac.png"
+WINDOW_ICON_PNG_NAME = "manual_icon_dung_beetle_256.png"
 WINDOW_ICON_PNG_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAABCBklEQVR4nO2dB3gU1RbH/5tskm3p"
     "Cb1IExBBOkqTFghVkKZSRIqKigqKBX0q2BBURJCmiGIFRAGR3quAIr2DFJWSXnazm23vO2d2YsCU"

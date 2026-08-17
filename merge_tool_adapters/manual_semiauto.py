@@ -45,6 +45,8 @@ class ManualWorkflowGitlinkPolicy(MergePolicy):
         prepare_submodule_branch: Callable[[Path, str], None],
         build_submodule_commit_message: Callable[[GitlinkMergeContext], MergeCommitMessage],
         handle_file_conflicts: Callable[[GitExecutionPort, Path, list[Conflict], int], None],
+        on_prepare_recursive_merge: Callable[[GitlinkMergeContext], None] | None = None,
+        on_gitlink_resolved: Callable[[MergeEvent], None] | None = None,
         fetch_missing_commits: bool = False,
     ) -> None:
         super().__init__(
@@ -56,6 +58,8 @@ class ManualWorkflowGitlinkPolicy(MergePolicy):
         self._prepare_submodule_branch = prepare_submodule_branch
         self._build_submodule_commit_message = build_submodule_commit_message
         self._handle_file_conflicts = handle_file_conflicts
+        self._on_prepare_recursive_merge = on_prepare_recursive_merge
+        self._on_gitlink_resolved = on_gitlink_resolved
         self.events: list[str] = []
         self.resolved_paths: list[str] = []
 
@@ -71,6 +75,8 @@ class ManualWorkflowGitlinkPolicy(MergePolicy):
             # reusable work branch in every touched submodule, so restore that
             # branch after the engine has finalized the resolution.
             self._prepare_submodule_branch(event.repo_path / path, result_sha)
+        if self._on_gitlink_resolved is not None:
+            self._on_gitlink_resolved(event)
         if event.repo_path == self.tracked_repo and path and path not in self.resolved_paths:
             self.resolved_paths.append(path)
 
@@ -79,6 +85,8 @@ class ManualWorkflowGitlinkPolicy(MergePolicy):
         actions: GitExecutionPort,
         context: GitlinkMergeContext,
     ) -> None:
+        if self._on_prepare_recursive_merge is not None:
+            self._on_prepare_recursive_merge(context)
         self._prepare_submodule_branch(context.submodule_repo, context.ours_sha)
         if self.update_submodules_before_recursive_merge:
             actions.update_submodules(context.submodule_repo, check=False)

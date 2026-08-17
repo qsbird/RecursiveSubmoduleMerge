@@ -118,12 +118,12 @@ def build_clone_spec(values: dict[str, Any]) -> CloneSpec:
 
 
 def build_merge_argv(values: dict[str, Any]) -> list[str]:
-    branches = parse_branch_tokens(_string_value(values, "merge_branches"))
-    if not branches:
-        raise GuiInputError("At least one merge branch is required.")
+    branches = parse_branch_tokens(_string_value(values, "merge_branch") or _string_value(values, "merge_branches"))
+    if len(branches) != 1:
+        raise GuiInputError("Exactly one merge branch is required.")
 
     repo = _string_value(values, "repo", ".") or "."
-    argv = ["merge", *branches, "--repo", repo]
+    argv = ["merge", branches[0], "--repo", repo]
 
     if _bool_value(values, "clone_enabled"):
         clone_branch = _string_value(values, "clone_branch")
@@ -142,8 +142,8 @@ def build_merge_argv(values: dict[str, Any]) -> list[str]:
             ]
         )
 
-    if _bool_value(values, "continue_current_branch"):
-        argv.append("--continue-current-branch")
+    if _bool_value(values, "use_current_branch") or _bool_value(values, "continue_current_branch"):
+        argv.append("--use-current-branch")
     else:
         base_remote_branch = _string_value(values, "base_remote_branch", ROOT_BASE_REMOTE_BRANCH)
         if not base_remote_branch:
@@ -152,9 +152,6 @@ def build_merge_argv(values: dict[str, Any]) -> list[str]:
         work_branch = _string_value(values, "work_branch")
         if work_branch:
             argv.extend(["--work-branch", work_branch])
-
-    if _bool_value(values, "enable_cross_submodule_moves"):
-        argv.append("--enable-cross-submodule-moves")
 
     report_file = _string_value(values, "report_file", REPORT_FILE_NAME)
     if report_file:
@@ -234,6 +231,18 @@ def build_publish_argv(values: dict[str, Any]) -> list[str]:
     return argv
 
 
+def build_session_argv(action: str, values: dict[str, Any]) -> list[str]:
+    repo = _string_value(values, "repo", ".") or "."
+    argv = [action, "--repo", repo]
+    if action == "abort":
+        # The desktop UI asks for destructive-action confirmation before
+        # launching this argv. The CLI still requires users to pass --yes.
+        argv.append("--yes")
+    if _bool_value(values, "verbose"):
+        argv.append("--verbose")
+    return argv
+
+
 def build_command_spec(action: str, values: dict[str, Any]) -> CommandSpec:
     if action == "merge":
         return CommandSpec(action=action, argv=build_merge_argv(values))
@@ -241,6 +250,8 @@ def build_command_spec(action: str, values: dict[str, Any]) -> CommandSpec:
         return CommandSpec(action=action, argv=build_cleanup_argv(values))
     if action == "publish":
         return CommandSpec(action=action, argv=build_publish_argv(values))
+    if action in {"status", "resume", "abort"}:
+        return CommandSpec(action=action, argv=build_session_argv(action, values))
     raise GuiInputError(f"Unsupported action: {action}")
 
 
@@ -258,6 +269,7 @@ __all__ = [
     "build_command_spec",
     "build_merge_argv",
     "build_publish_argv",
+    "build_session_argv",
     "clone_target_path",
     "parse_branch_tokens",
     "text_lines",

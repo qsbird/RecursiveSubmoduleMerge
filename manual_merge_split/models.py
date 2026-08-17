@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 
@@ -27,6 +28,13 @@ class MergeAutomationError(RuntimeError):
 
 
 ManualSplitError = MergeAutomationError
+
+
+class ManualConflictDisposition(str, Enum):
+    SUPPORTED_FILE = "supported_file"
+    SUPPORTED_GITLINK = "supported_gitlink"
+    MANUAL_TAKEOVER = "manual_takeover"
+    FATAL = "fatal"
 
 
 @dataclass
@@ -97,6 +105,24 @@ class MergeContext:
     enable_cross_submodule_moves: bool = False
     report_entries: list[ConflictEntry] = field(default_factory=list)
     rollback_requested: bool = False
+
+
+@dataclass(frozen=True)
+class ManualConflictRecord:
+    path: str
+    mode: str
+    sha: str
+    stage: int
+
+
+@dataclass(frozen=True)
+class ClassifiedManualConflict:
+    repo_path: Path
+    path: str
+    disposition: ManualConflictDisposition
+    records: tuple[ManualConflictRecord, ...]
+    status_code: str = ""
+    reason: str = ""
 
 
 @dataclass
