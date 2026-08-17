@@ -1025,13 +1025,13 @@ class MergeGuiApp:
         self._localize(
             ttk.Label(self.merge_tab, foreground="#6b7280", wraplength=640),
             "hint_clean_worktree_required",
-        ).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0, 10))
 
         self.advanced_toggle_button = ttk.Button(
             self.merge_tab,
             command=self._toggle_advanced_options,
         )
-        self.advanced_toggle_button.grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        self.advanced_toggle_button.grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         self.advanced_frame = self._localize(ttk.LabelFrame(self.merge_tab, padding=8), "frame_advanced_options")
         self.advanced_frame.columnconfigure(0, weight=1)
@@ -1287,7 +1287,7 @@ class MergeGuiApp:
         expanded = bool(self.advanced_options_var.get())
         if hasattr(self, "advanced_frame"):
             if expanded:
-                self.advanced_frame.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+                self.advanced_frame.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(0, 10))
             else:
                 self.advanced_frame.grid_remove()
         if hasattr(self, "advanced_toggle_button"):
