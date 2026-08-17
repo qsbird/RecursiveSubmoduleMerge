@@ -267,10 +267,14 @@ class ManualMergeSessionService:
                 frame = session.current_frame
                 current_repo = Path(frame.repo_path)
                 if frame.phase == SessionPhase.MERGE_PENDING:
-                    session = self.store.save(root, session)
-                    self.ops.merge_branch(current_repo, frame.theirs_sha or session.target_ref)
-                    session = self._replace_top_frame(session, phase=SessionPhase.MERGE_ACTIVE)
-                    session = self.store.save(root, session)
+                    if self.ops.merge_in_progress(current_repo) or self.ops.get_unmerged_paths(current_repo):
+                        session = self._replace_top_frame(session, phase=SessionPhase.MERGE_ACTIVE)
+                        session = self.store.save(root, session)
+                    else:
+                        session = self.store.save(root, session)
+                        self.ops.merge_branch(current_repo, frame.theirs_sha or session.target_ref)
+                        session = self._replace_top_frame(session, phase=SessionPhase.MERGE_ACTIVE)
+                        session = self.store.save(root, session)
                     frame = session.current_frame
                     assert frame is not None
 

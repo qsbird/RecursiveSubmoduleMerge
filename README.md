@@ -95,6 +95,7 @@ python ci_merge_review.py record --report C:\path\to\output\merge-report.json --
 
 ## 文档索引
 
+- [合并、清理、发布功能说明](docs/MERGE_CLEANUP_PUBLISH.md)（[HTML 版](docs/MERGE_CLEANUP_PUBLISH.html)）
 - [公共核心详细设计](docs/COMMON_CORE_DESIGN.md)
 - [CI 自动合并详细设计](docs/CI_DESIGN.md)
 - [手动/GUI 合并详细设计](docs/MANUAL_DESIGN.md)

@@ -217,7 +217,11 @@ def apply_config_to_args(args: Any) -> Any:
     """
     config = load_config()
     if args.command == "merge":
+        explicit_use_current = bool(getattr(args, "use_current_branch", False))
+        explicit_work_branch = getattr(args, "work_branch", None)
         _apply_values(args, config.merge)
+        if explicit_use_current and explicit_work_branch is None:
+            args.work_branch = None
     elif args.command == "publish":
         _apply_values(args, config.publish)
     elif args.command == "cleanup":

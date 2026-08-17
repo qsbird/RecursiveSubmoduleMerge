@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>递归子模块合并工具 | 合并、清理、发布功能说明</title>
+<style>
+  :root {
+    --blue-900: #002472;
+    --blue-800: #141268;
+    --blue-main: #0069AB;
+    --blue-500: #00B0F0;
+    --teal: #3EA592;
+    --purple: #423EA5;
+    --gray-blue: #768394;
+    --lt: #F0F0F0;
+    --bg: #FFFFFF;
+    --text: #333333;
+    --text-light: #666666;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "Microsoft YaHei", "微软雅黑", "PingFang SC", "Noto Sans CJK SC", Arial, sans-serif;
+    color: var(--text);
+    background: #EEF2F7;
+    line-height: 1.75;
+    font-size: 15px;
+  }
+  .page { max-width: 1000px; margin: 0 auto; padding: 24px 16px 80px; }
+
+  /* ===== 封面头部 ===== */
+  .cover {
+    background: linear-gradient(135deg, var(--blue-900) 0%, var(--blue-800) 45%, var(--blue-main) 100%);
+    border-radius: 12px;
+    color: #fff;
+    padding: 52px 56px 44px;
+    position: relative;
+    overflow: hidden;
+    box-shadow: 0 8px 24px rgba(0,36,114,.25);
+  }
+  .cover::after {
+    content: "";
+    position: absolute;
+    right: -80px; top: -80px;
+    width: 320px; height: 320px;
+    border-radius: 50%;
+    background: rgba(0,176,240,.25);
+  }
+  .cover::before {
+    content: "";
+    position: absolute;
+    right: 60px; bottom: -120px;
+    width: 240px; height: 240px;
+    border-radius: 50%;
+    background: rgba(62,165,146,.28);
+  }
+  .cover .logo-chip {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: #fff;
+    border-radius: 12px;
+    padding: 10px 18px;
+    margin-bottom: 26px;
+    box-shadow: 0 4px 12px rgba(0,0,0,.18);
+    position: relative;
+    z-index: 1;
+    width: fit-content;
+  }
+  .cover .logo-chip img { height: 42px; width: auto; display: block; }
+  .cover h1 {
+    font-size: 38px;
+    font-weight: 700;
+    letter-spacing: 4px;
+    margin-bottom: 10px;
+    position: relative;
+    z-index: 1;
+  }
+  .cover h2 {
+    font-size: 17px;
+    font-weight: 400;
+    color: rgba(255,255,255,.85);
+    letter-spacing: 2px;
+    margin-bottom: 34px;
+    position: relative;
+    z-index: 1;
+  }
+  .cover .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 40px;
+    font-size: 14px;
+    color: rgba(255,255,255,.92);
+    position: relative;
+    z-index: 1;
+  }
+  .cover .meta b { font-weight: 600; color: #fff; }
+
+  /* ===== 导航 ===== */
+  nav {
+    position: sticky; top: 10px; z-index: 50;
+    background: #fff;
+    border-radius: 10px;
+    box-shadow: 0 4px 16px rgba(0,36,114,.10);
+    margin: 22px 0 30px;
+    padding: 10px 16px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  nav a {
+    color: var(--blue-main);
+    text-decoration: none;
+    font-size: 13px;
+    padding: 4px 12px;
+    border-radius: 16px;
+    transition: all .2s;
+  }
+  nav a:hover { background: var(--blue-main); color: #fff; }
+
+  /* ===== 章节 ===== */
+  section { margin-bottom: 40px; }
+  .sec-title {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+  .sec-title .num {
+    flex: 0 0 auto;
+    width: 40px; height: 40px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, var(--blue-main), var(--blue-900));
+    color: #fff;
+    font-size: 18px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4px 10px rgba(0,105,171,.3);
+  }
+  .sec-title h2 {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--blue-900);
+    letter-spacing: 1px;
+  }
+  .sec-title .line { flex: 1; height: 2px; background: linear-gradient(90deg, var(--blue-500), transparent); }
+
+  .card {
+    background: #fff;
+    border-radius: 10px;
+    padding: 26px 30px;
+    box-shadow: 0 4px 14px rgba(0,36,114,.08);
+    border-left: 4px solid var(--blue-main);
+  }
+  .card p { margin-bottom: 10px; }
+  .card p:last-child { margin-bottom: 0; }
+  .card h3 {
+    color: var(--blue-main);
+    font-size: 16px;
+    margin: 18px 0 10px;
+  }
+  .card h3:first-child { margin-top: 0; }
+
+  /* ===== 数据卡片 ===== */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 14px;
+    margin-bottom: 18px;
+  }
+  .stat {
+    background: #fff;
+    border-radius: 10px;
+    padding: 18px 20px;
+    text-align: center;
+    box-shadow: 0 4px 14px rgba(0,36,114,.08);
+    border-top: 4px solid var(--blue-main);
+    transition: transform .2s;
+  }
+  .stat:hover { transform: translateY(-3px); }
+  .stat:nth-child(2) { border-top-color: var(--blue-500); }
+  .stat:nth-child(3) { border-top-color: var(--teal); }
+  .stat .v { font-size: 28px; font-weight: 700; color: var(--blue-900); }
+  .stat .l { font-size: 13px; color: var(--text-light); margin-top: 4px; }
+
+  /* ===== 表格 ===== */
+  .tbl-wrap { overflow-x: auto; margin-top: 12px; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: #fff;
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 4px 14px rgba(0,36,114,.08);
+    font-size: 14px;
+  }
+  th {
+    background: linear-gradient(135deg, var(--blue-main), var(--blue-900));
+    color: #fff;
+    font-weight: 600;
+    padding: 11px 14px;
+    text-align: left;
+    white-space: nowrap;
+  }
+  td {
+    padding: 10px 14px;
+    border-bottom: 1px solid #E8EDF3;
+    vertical-align: top;
+  }
+  tbody tr:nth-child(even) { background: #F6F9FC; }
+  tbody tr:hover { background: #EAF4FB; }
+  code {
+    font-family: Consolas, "SF Mono", Menlo, monospace;
+    font-size: 12.5px;
+    background: #F0F5FA;
+    color: var(--blue-900);
+    padding: 1px 6px;
+    border-radius: 4px;
+    word-break: break-all;
+  }
+  th code { background: rgba(255,255,255,.18); color: #fff; }
+
+  /* ===== 时间线 ===== */
+  .timeline { position: relative; padding-left: 26px; }
+  .timeline::before {
+    content: "";
+    position: absolute;
+    left: 8px; top: 6px; bottom: 6px;
+    width: 3px;
+    border-radius: 2px;
+    background: linear-gradient(180deg, var(--blue-500), var(--blue-main), var(--purple));
+  }
+  .tl-item { position: relative; margin-bottom: 18px; }
+  .tl-item:last-child { margin-bottom: 0; }
+  .tl-item::before {
+    content: "";
+    position: absolute;
+    left: -26px; top: 8px;
+    width: 13px; height: 13px;
+    border-radius: 50%;
+    background: var(--blue-main);
+    border: 3px solid #fff;
+    box-shadow: 0 0 0 2px var(--blue-500);
+  }
+  .tl-item h3 {
+    font-size: 16px;
+    color: var(--blue-900);
+    margin-bottom: 4px;
+  }
+  .tl-item p { color: #444; margin-bottom: 0; }
+
+  /* ===== 列表 ===== */
+  ul.plain { list-style: none; }
+  ul.plain li { position: relative; padding-left: 18px; margin-bottom: 8px; }
+  ul.plain li::before {
+    content: "";
+    position: absolute;
+    left: 2px; top: 10px;
+    width: 7px; height: 7px;
+    border-radius: 2px;
+    background: var(--blue-main);
+  }
+  ul.plain li b { color: var(--blue-900); }
+
+  /* ===== 提示 / 风险 ===== */
+  .risk-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 14px;
+    margin: 14px 0;
+  }
+  .risk {
+    background: #fff;
+    border-radius: 10px;
+    padding: 18px 22px;
+    box-shadow: 0 4px 14px rgba(0,36,114,.08);
+    border-left: 4px solid var(--teal);
+  }
+  .risk.warn { border-left-color: #C0392B; }
+  .risk h4 { color: var(--blue-900); font-size: 15px; margin-bottom: 6px; }
+  .risk p { font-size: 13.5px; color: #555; }
+
+  .plan-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+  .plan {
+    background: #fff;
+    border-radius: 10px;
+    padding: 16px 20px;
+    box-shadow: 0 4px 14px rgba(0,36,114,.08);
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+  }
+  .plan .ic {
+    flex: 0 0 auto;
+    width: 34px; height: 34px;
+    border-radius: 8px;
+    background: linear-gradient(135deg, var(--blue-500), var(--blue-main));
+    color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700;
+  }
+  .plan p { font-size: 14px; color: #444; padding-top: 3px; }
+
+  .status {
+    display: inline-block;
+    padding: 1px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .st-warn { background: #F9E8E8; color: #C0392B; }
+  .st-done { background: #E3F4EE; color: #1E7A5C; }
+  .st-proc { background: #E3F1FB; color: var(--blue-main); }
+
+  .footer {
+    text-align: center;
+    color: var(--gray-blue);
+    font-size: 13px;
+    margin-top: 50px;
+    padding-top: 20px;
+    border-top: 1px dashed #C9D4E0;
+  }
+  .footer .footer-logo {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .footer .footer-logo img { height: 22px; width: auto; }
+  .footer .footer-logo span {
+    font-size: 12px;
+    letter-spacing: 1px;
+    color: var(--gray-blue);
+    font-weight: 600;
+  }
+  .bottom-border {
+    margin: 30px -16px -80px;
+    height: 72px;
+    border-radius: 12px 12px 0 0;
+    overflow: hidden;
+  }
+  .bottom-border img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+
+  @media print {
+    body { background: #fff; }
+    nav { display: none; }
+    .page { padding: 0; max-width: none; }
+    section { break-inside: avoid; }
+    .cover { box-shadow: none; }
+    .card, .stat, .risk, .plan, table { box-shadow: none; border: 1px solid #E0E6EE; }
+    .footer { margin-top: 30px; }
+    .bottom-border { margin: 20px 0 0; border-radius: 0; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="cover">
+    <div class="logo-chip"><img src="assets/ninecube_logo.png" alt="九同方 NINECUBE"></div>
+    <h1>递归子模块合并工具</h1>
+    <h2>合并 · 清理 · 发布 功能说明</h2>
+    <div class="meta">
+      <div>适用对象：<b>工具使用者</b></div>
+      <div>界面入口：<b>合并 / 清理 / 发布</b></div>
+      <div>建议顺序：<b>清理 → 合并 → 发布</b></div>
+    </div>
+  </header>
+
+  <nav>
+    <a href="#s1">一、功能概览</a>
+    <a href="#s2">二、合并</a>
+    <a href="#s3">三、清理</a>
+    <a href="#s4">四、发布</a>
+    <a href="#s5">五、使用提示</a>
+  </nav>
+
+  <section id="s1">
+    <div class="sec-title"><span class="num">一</span><h2>功能概览</h2><span class="line"></span></div>
+    <div class="stats">
+      <div class="stat"><div class="v">合并</div><div class="l">把来源分支合进工作分支</div></div>
+      <div class="stat"><div class="v">清理</div><div class="l">把仓库恢复成可合并状态</div></div>
+      <div class="stat"><div class="v">发布</div><div class="l">把结果推到指定远端分支</div></div>
+    </div>
+    <div class="card">
+      <p>本工具用来处理「根仓库 + 多层子模块」的分支合并。界面上主要有三页：<b>合并</b>、<b>清理</b>、<b>发布</b>（把结果推到远端）。</p>
+      <p>仓库不干净时先清理，再合并；确认本地结果无误后再发布。</p>
+    </div>
+  </section>
+
+  <section id="s2">
+    <div class="sec-title"><span class="num">二</span><h2>合并</h2><span class="line"></span></div>
+    <div class="card">
+      <p>把一条来源分支合进当前工作分支。工具会自动处理子模块指针冲突；普通文件冲突会打开你配置的冲突工具，让你手动改。</p>
+      <p>使用前：根仓库和所有子模块的工作区必须干净（没有未提交改动）。一次只合并一个分支。</p>
+      <h3>大概过程</h3>
+      <div class="timeline">
+        <div class="tl-item"><h3>准备工作分支</h3><p>按你选的基准创建或使用工作分支。</p></div>
+        <div class="tl-item"><h3>合入来源分支</h3><p>把来源分支合进来。</p></div>
+        <div class="tl-item"><h3>处理冲突</h3><p>子模块冲突由工具自动递归处理；普通文件冲突交给冲突工具。</p></div>
+        <div class="tl-item"><h3>生成提交</h3><p>全部解决后，由工具生成合并提交。</p></div>
+        <div class="tl-item"><h3>必要时暂停</h3><p>遇到工具无法自动处理的冲突时，会<b>暂停并保留现场</b>。你改完并执行 <code>git add</code> 后，点「继续合并」。不想继续则点「终止合并」。</p></div>
+      </div>
+      <p style="margin-top:16px;">「终止合并」只把本次合并涉及的仓库恢复到开始前，<b>不会删除未跟踪文件</b>。若要把整个仓库洗干净以便重新合并，请用「清理」。</p>
+    </div>
+    <h3 style="color:var(--blue-main);margin:18px 0 10px;">合并里最关键的 Git 命令</h3>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th style="width:42%">命令</th><th>一句话说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>git merge --no-ff --no-commit</code></td><td>把对方分支合进当前仓库，先不自动提交，方便工具继续处理冲突。</td></tr>
+          <tr><td><code>git mergetool</code>（或你配置的冲突工具）</td><td>打开编辑器，帮你解决普通文件里两边都改过的内容。</td></tr>
+          <tr><td><code>git add</code></td><td>把已经解决好的文件或子模块记入暂存区，表示“这里处理完了”。</td></tr>
+          <tr><td><code>git commit</code></td><td>生成这次合并提交。工具会在冲突全部解决后自动执行，一般不必自己提交。</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="s3">
+    <div class="sec-title"><span class="num">三</span><h2>清理</h2><span class="line"></span></div>
+    <div class="risk-grid">
+      <div class="risk warn">
+        <h4>破坏性操作 <span class="status st-warn">请先确认</span></h4>
+        <p>未提交的修改、已暂存内容和未跟踪文件都可能被丢掉。需要保留的内容请先自行提交或另存。界面会要求确认；命令行非交互模式必须加 <code>--yes</code>。</p>
+      </div>
+      <div class="risk">
+        <h4>和「终止合并」的区别</h4>
+        <p>终止合并只撤销当前这一次合并；清理是整仓强力复位，不依赖是否正在合并，用来把脏仓库恢复成可重新合并的状态。</p>
+      </div>
+    </div>
+    <div class="card">
+      <p>清理会递归处理根仓库和子模块，大致包括：中止进行中的合并/变基、把已跟踪文件打回最近一次提交、删掉多余未跟踪文件，再按当前提交把子模块对齐。某一步不够干净时，会自动用更强的方式再试。</p>
+      <p>可选：清理后重建工作分支。默认还会删掉上次暂停留下的 <code>merge_manual_todo.txt</code>。</p>
+    </div>
+    <h3 style="color:var(--blue-main);margin:18px 0 10px;">清理里最关键的 Git 命令</h3>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th style="width:42%">命令</th><th>一句话说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>git merge --abort</code> / <code>git rebase --abort</code></td><td>取消正在进行的合并或变基，回到该操作开始前。</td></tr>
+          <tr><td><code>git reset --hard HEAD</code></td><td>丢弃已跟踪文件的未提交修改，工作区回到最近一次提交。</td></tr>
+          <tr><td><code>git clean</code></td><td>删除未被 Git 跟踪的文件和目录（默认不删被忽略的文件）。</td></tr>
+          <tr><td><code>git submodule update --init --recursive</code></td><td>按当前提交把各层子模块内容重新下载并对齐。</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="s4">
+    <div class="sec-title"><span class="num">四</span><h2>发布（推送）</h2><span class="line"></span></div>
+    <div class="card">
+      <p>把当前根仓库 HEAD，以及它记录的子模块提交，推到你指定的远端分支。</p>
+      <ul class="plain">
+        <li>发布以<b>根仓库 HEAD</b>为准，不看各子模块工作区当前停在哪。</li>
+        <li>不会切换本地分支，也<b>不会强制推送</b>。</li>
+        <li>远端没有这条分支、已经是同一提交、或只是快进时才允许推送；远端已经分叉则拒绝。</li>
+        <li>有正在进行的合并/变基时，整次发布会直接失败。</li>
+        <li>界面可以先「仅检查」；正式发布时通常会再让你确认要推哪些仓库。</li>
+        <li>子模块从最内层开始推，避免根仓库指着一个远端还不存在的子模块提交。</li>
+      </ul>
+    </div>
+    <h3 style="color:var(--blue-main);margin:18px 0 10px;">发布里最关键的 Git 命令</h3>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th style="width:42%">命令</th><th>一句话说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>git submodule update --init --recursive</code></td><td>先把子模块工作区按根仓库记录补齐，再统计要推什么。</td></tr>
+          <tr><td><code>git push --dry-run</code></td><td>只检查能不能推成功，不会真的改远端。</td></tr>
+          <tr><td><code>git push --recurse-submodules=check</code></td><td>真正推送；若根仓库引用的子模块提交还没在远端，会先拦住。</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="s5">
+    <div class="sec-title"><span class="num">五</span><h2>使用提示</h2><span class="line"></span></div>
+    <div class="plan-grid">
+      <div class="plan"><span class="ic">1</span><p><b>合并不等于发布</b>：合并只在本地生成结果，要上远端请再走发布。</p></div>
+      <div class="plan"><span class="ic">2</span><p><b>仓库脏了先清理</b>：不要直接合并。</p></div>
+      <div class="plan"><span class="ic">3</span><p><b>合并中途卡住</b>：优先「继续合并」或「终止合并」，不要一上来就清理（清理会丢掉未提交改动）。</p></div>
+      <div class="plan"><span class="ic">4</span><p><b>核对推送目标</b>：发布填错目标分支可能把提交推到错误位置，请先确认分支名。</p></div>
+    </div>
+  </section>
+
+  <div class="footer">
+    <div class="footer-logo">
+      <img src="assets/ninecube_logo.png" alt="NINECUBE">
+      <span>NINECUBE CO.,LTD.</span>
+    </div>
+    <p>递归子模块合并工具 · 合并 / 清理 / 发布功能说明</p>
+  </div>
+
+  <div class="bottom-border"><img src="assets/bottom_border.png" alt=""></div>
+
+</div>
+</body>
+</html>

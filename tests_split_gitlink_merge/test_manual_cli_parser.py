@@ -144,6 +144,34 @@ class ConfigPersistenceTests(unittest.TestCase):
         self.assertNotIn("merge_branches", payload["merge"])
         self.assertNotIn("enable_cross_submodule_moves", payload["merge"])
 
+    def test_apply_config_does_not_inject_work_branch_onto_use_current_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "merge_tool_last_run.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "merge": {
+                            "work_branch": "lab-work",
+                            "merge_branch": "theirs",
+                            "use_current_branch": False,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = types.SimpleNamespace(
+                command="merge",
+                use_current_branch=True,
+                work_branch=None,
+                merge_branch="theirs",
+            )
+            with mock.patch("manual_merge_split.config_persistence.config_file_path", return_value=config_path):
+                config_persistence.apply_config_to_args(args)
+
+        self.assertTrue(args.use_current_branch)
+        self.assertIsNone(args.work_branch)
+
 
 if __name__ == "__main__":
     unittest.main()
