@@ -47,7 +47,14 @@ class ManualRepositoryOps:
         return runner(repo_path, args, **kwargs)
 
     def run_cleanup_step(self, repo_path: Path, step: cleanup_steps.CleanupStep, **kwargs: Any) -> Any:
-        return self.run_git(repo_path, list(step.args), **kwargs)
+        # Steps built for a nested repository (level 4 deep submodule cleanup)
+        # carry their own cwd; running them in the parent would point destructive
+        # resets and cleans at the wrong repository.
+        return self.run_git(
+            cleanup_steps.step_cwd(step, repo_path),
+            cleanup_steps.step_args(step),
+            **kwargs,
+        )
 
     def _automation_error_class(self) -> type[Exception]:
         return getattr(self.manual_module, "MergeAutomationError", MergeAutomationError)
@@ -369,7 +376,11 @@ class ManualRepositoryOps:
 
     def get_unmerged_paths(self, repo_path: Path) -> list[str]:
         result = self.run_git(repo_path, ["diff", "--name-only", "--diff-filter=U"])
-        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        return [
+            common.unquote_git_path(line.strip())
+            for line in result.stdout.splitlines()
+            if line.strip()
+        ]
 
     def get_unmerged_status_codes(self, repo_path: Path) -> dict[str, str]:
         result = self.run_git(repo_path, ["status", "--porcelain"], check=False)
@@ -380,10 +391,56 @@ class ManualRepositoryOps:
             if len(line) < 4:
                 continue
             code = line[:2]
-            path = line[3:].strip()
+            path = common.unquote_git_path(line[3:].strip())
             if "U" in code or code in {"AA", "DD", "AU", "UA", "DU", "UD"}:
                 status_by_path[path] = code
         return status_by_path
+
+    def staged_changed_paths(self, repo_path: Path) -> list[str]:
+        """Paths whose index entry differs from HEAD.
+
+        ``T`` (type change) is included: a symlink/file/gitlink conflict that the
+        user resolved into a regular file still stages as ``T``, and that file
+        can carry leftover ``<<<<<<<`` markers.
+        """
+        if not self.head_exists(repo_path):
+            return []
+        result = self.run_git(
+            repo_path,
+            ["diff", "--cached", "--name-only", "--diff-filter=ACMRT"],
+            check=False,
+        )
+        if result.returncode != 0:
+            return []
+        return [
+            common.unquote_git_path(line.strip())
+            for line in result.stdout.splitlines()
+            if line.strip()
+        ]
+
+    def find_staged_conflict_marker_paths(self, repo_path: Path) -> list[str]:
+        """Staged text files that still carry both halves of a 3-way marker pair.
+
+        Restricting the result to paths this merge actually staged keeps
+        documentation and test fixtures that legitimately contain markers out of
+        the way.
+        """
+        candidates = set(self.staged_changed_paths(repo_path))
+        if not candidates:
+            return []
+        marked = common.indexed_paths_with_conflict_markers(
+            repo_path,
+            run_git=self.run_git,
+        )
+        return sorted(candidates & marked)
+
+    def initialized_submodule_paths(self, repo_path: Path) -> list[str]:
+        """Submodule paths that actually hold a checked-out repository."""
+        return [
+            path
+            for path in self.get_submodule_paths(repo_path)
+            if (repo_path / path / ".git").exists()
+        ]
 
     def is_submodule_path(self, repo_path: Path, relative_path: str) -> bool:
         result = self.run_git(repo_path, ["ls-files", "--stage", "--", relative_path], check=False)
@@ -403,7 +460,8 @@ class ManualRepositoryOps:
             parts = line.split(maxsplit=3)
             if len(parts) != 4:
                 continue
-            mode, _sha, stage_token, path = parts
+            mode, _sha, stage_token, quoted_path = parts
+            path = common.unquote_git_path(quoted_path)
             try:
                 stage = int(stage_token)
             except ValueError:
@@ -433,7 +491,8 @@ class ManualRepositoryOps:
             if len(parts) != 4:
                 records.append(ManualConflictRecord(path="<unparseable>", mode="", sha="", stage=0))
                 continue
-            mode, sha, stage_token, path = parts
+            mode, sha, stage_token, quoted_path = parts
+            path = common.unquote_git_path(quoted_path)
             try:
                 stage = int(stage_token)
             except ValueError:
@@ -651,8 +710,14 @@ class ManualRepositoryOps:
         message: ManualCommitMessage | None = None,
         fallback_message: str | None = None,
     ) -> None:
-        if self.get_unmerged_paths(repo_path):
-            return
+        unmerged = self.get_unmerged_paths(repo_path)
+        if unmerged:
+            # Returning quietly here used to let callers report a successful
+            # merge while the repository was still mid-conflict.
+            listed = "\n".join(f"  - {path}" for path in unmerged)
+            raise self._automation_error(
+                f"Cannot commit in {repo_path}: {len(unmerged)} path(s) are still unmerged:\n{listed}"
+            )
 
         if self.merge_in_progress(repo_path):
             commit_args = ["commit", *message.git_args()] if message else ["commit", "--no-edit"]
@@ -843,6 +908,11 @@ class ManualRepositoryOps:
             if preserved_dirty_paths_by_repo is not None
             else set()
         )
+        # Only the root repository can carry caller-declared untracked paths to
+        # ignore (the merge report file); recursion passes an empty tuple.
+        ignored_untracked = tuple(
+            path for path in ignored_root_untracked_paths if str(path).strip()
+        )
         result.visited_repos.append(repo_path)
 
         # --- recurse into submodules first ---
@@ -875,24 +945,37 @@ class ManualRepositoryOps:
 
         if (
             self.head_exists(repo_path)
-            and self.working_tree_has_changes(repo_path, ignored_paths=ignored_dirty_paths)
+            and self.working_tree_has_changes(
+                repo_path,
+                ignored_untracked_paths=ignored_untracked,
+                ignored_paths=ignored_dirty_paths,
+            )
             and resolved_repo_path not in preserved_dirty_repos
         ):
             result.hard_resets.append(repo_path)
 
         # --- multi-level cleanup fallback ---
-        submodule_paths = self.get_submodule_paths(repo_path)
+        # Level 4 runs commands inside each submodule, so only initialized ones
+        # qualify: an empty gitlink directory would make git walk up and apply
+        # the deep reset to this repository instead.
         levels = self._build_cleanup_levels(
-            repo_path, submodule_paths, allow_clean_x, skip_submodule_update, is_root,
+            repo_path,
+            self.initialized_submodule_paths(repo_path),
+            allow_clean_x,
+            skip_submodule_update,
+            is_root,
         )
 
         tried: list[str] = []
         for level_name, steps in levels:
+            if tried:
+                self._announce_cleanup_escalation(repo_path, level_name, steps, result)
             success = self._try_cleanup_level(
                 repo_path,
                 level_name,
                 steps,
                 result,
+                ignored_untracked_paths=ignored_untracked,
                 ignored_paths=ignored_dirty_paths,
             )
             tried.append(level_name)
@@ -916,6 +999,35 @@ class ManualRepositoryOps:
             f"\n  4. If still failing, manually delete and re-clone this repository."
         )
 
+    def _announce_cleanup_escalation(
+        self,
+        repo_path: Path,
+        level_name: str,
+        steps: list[cleanup_steps.CleanupStep],
+        result: Any,
+    ) -> None:
+        """Report an escalation beyond level 1 before it runs.
+
+        The user confirms "cleanup" once, but levels 2-4 add ``git clean -ffd``
+        (which deletes nested git repositories) and per-submodule hard resets.
+        Escalations used to be visible only under ``--verbose``, so a nested repo
+        could disappear without the run ever mentioning it.
+        """
+        escalations = getattr(result, "escalated_levels", None)
+        if escalations is not None:
+            escalations.append((repo_path, level_name))
+        rendered = "; ".join(
+            f"git {' '.join(cleanup_steps.step_args(step))}"
+            for step in steps
+            if not step.allow_failure
+        )
+        message = (
+            f"[cleanup] {repo_path}: escalating to {level_name} because the previous "
+            f"level left the repository unclean.\n"
+            f"[cleanup] {level_name} will run: {rendered}"
+        )
+        execution._safe_write(sys.stderr, message)
+
     def _try_cleanup_level(
         self,
         repo_path: Path,
@@ -923,6 +1035,7 @@ class ManualRepositoryOps:
         steps: list[cleanup_steps.CleanupStep],
         result: Any,
         *,
+        ignored_untracked_paths: Iterable[str] = (),
         ignored_paths: set[str] = frozenset(),
     ) -> bool:
         """Execute one cleanup level; return True if the repo is clean afterward."""
@@ -934,7 +1047,11 @@ class ManualRepositoryOps:
 
         if self.merge_in_progress(repo_path):
             return False
-        if self.working_tree_has_changes(repo_path, ignored_paths=ignored_paths):
+        if self.working_tree_has_changes(
+            repo_path,
+            ignored_untracked_paths=ignored_untracked_paths,
+            ignored_paths=ignored_paths,
+        ):
             return False
         return True
 

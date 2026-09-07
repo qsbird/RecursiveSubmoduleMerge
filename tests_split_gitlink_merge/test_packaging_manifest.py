@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +18,30 @@ VALIDATION_BRIDGES = {
     "ci_merge_sequence_mergecore_bridge.py",
 }
 FORBIDDEN_MACHINE_PATHS = ("D:\\Git", "C:\\Users\\Qs")
+
+
+def _tracked_python_files() -> list[str]:
+    """Python files git tracks, so local lab-run artifacts are not scanned.
+
+    ``rglob`` also walks git-ignored scratch directories (``manual_*_run*/``),
+    which are throwaway local reproductions and legitimately full of absolute
+    paths; only files that actually ship are interesting here.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "-c", "safe.directory=*", "ls-files", "--", "*.py"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError as exc:
+        raise unittest.SkipTest("git executable is required to list tracked Python files") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip() or f"exit {completed.returncode}"
+        raise AssertionError(f"git ls-files failed: {detail}")
+    return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
 
 
 def _extract_string_list_assignment(module: ast.Module, variable_name: str) -> list[str]:
@@ -62,10 +87,13 @@ class PackagingManifestTests(unittest.TestCase):
 
     def test_non_test_python_files_do_not_embed_developer_machine_paths(self) -> None:
         offenders: list[str] = []
-        for path in REPO_ROOT.rglob("*.py"):
+        for relative_path in _tracked_python_files():
+            path = REPO_ROOT / relative_path
+            if not path.is_file():
+                continue
             if path.is_relative_to(REPO_ROOT / "tests_split_gitlink_merge"):
                 continue
             text = path.read_text(encoding="utf-8")
             if any(marker in text for marker in FORBIDDEN_MACHINE_PATHS):
-                offenders.append(str(path.relative_to(REPO_ROOT)))
+                offenders.append(relative_path)
         self.assertEqual([], offenders)

@@ -181,11 +181,13 @@ UI_TEXT: dict[str, dict[str, str]] = {
         LANGUAGE_EN: (
             "Publishes root HEAD and submodule commits recorded by root HEAD. "
             "It runs git submodule update --init --recursive first, never checks out branches, "
-            "and never force-pushes. The push target is intentionally blank by default."
+            "and never force-pushes. Submodules that are not on any remote are pushed first. "
+            "The push target is intentionally blank by default."
         ),
         LANGUAGE_ZH: (
             "发布以根仓 HEAD 为准，并使用根仓 HEAD 记录的子模块 commit。"
             "发布前会先执行 git submodule update --init --recursive，不切换分支，也不会强制推送。"
+            "还不在任何远端上的子模块会先推，再推父仓库。"
             "推送目标默认留空，请手动确认后填写。"
         ),
     },

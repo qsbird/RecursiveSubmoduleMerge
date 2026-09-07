@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -38,6 +39,80 @@ class SessionLockError(SessionStoreError):
 GitPathResolver = Callable[[Path, str], str | Path]
 GitRunner = Callable[[Path, list[str]], Any]
 SessionMutator = Callable[[MergeSession | None], MergeSession | None]
+
+
+def process_is_alive(pid: int) -> bool:
+    """Best-effort liveness probe for a lock owner.
+
+    ``os.kill(pid, 0)`` must not be used on Windows: CPython maps every signal
+    other than CTRL_* to ``TerminateProcess``, so probing would kill the owner.
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        error_invalid_parameter = 87
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            # 87 = the PID is not a process (dead / never existed).  Any other
+            # OpenProcess failure, including ACCESS_DENIED (5), only means this
+            # caller cannot inspect the owner — it does not mean the owner is gone.
+            return ctypes.get_last_error() != error_invalid_parameter
+        try:
+            exit_code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)) == 0:
+                return True
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def read_lock_owner_pid(lock_path: Path) -> int | None:
+    try:
+        raw = lock_path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not raw:
+        return None
+    try:
+        return int(raw.splitlines()[0])
+    except ValueError:
+        return None
+
+
+def _break_stale_lock(lock_path: Path) -> bool:
+    """Remove a lock whose owning process is gone; return True if it was removed.
+
+    Without this a merge command killed mid-run (or a crashed GUI) leaves a lock
+    file that blocks every later merge, status, resume and abort until the user
+    finds and deletes it by hand.  A lock file without a readable pid is left
+    alone: it did not come from this code path, so breaking it would be a guess.
+    """
+    pid = read_lock_owner_pid(lock_path)
+    if pid is None or process_is_alive(pid):
+        return False
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    print(
+        f"Released a stale merge lock left by pid {pid}: {lock_path}",
+        file=sys.stderr,
+    )
+    return True
 
 
 class MergeSessionStore:
@@ -212,11 +287,20 @@ class MergeSessionStore:
     def _exclusive_lock(self, lock_path: Path, *, message: str) -> Iterator[None]:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            fd = self._create_lock_file(lock_path)
         except FileExistsError as exc:
-            raise SessionLockError(f"{message}: {lock_path}") from exc
+            if not _break_stale_lock(lock_path):
+                raise SessionLockError(
+                    f"{message}: {lock_path}\n"
+                    "If no merge command is running, delete that file to release the lock."
+                ) from exc
+            try:
+                fd = self._create_lock_file(lock_path)
+            except FileExistsError as retry_exc:
+                raise SessionLockError(f"{message}: {lock_path}") from retry_exc
         try:
             os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
+            os.fsync(fd)
             yield
         finally:
             os.close(fd)
@@ -224,6 +308,10 @@ class MergeSessionStore:
                 lock_path.unlink()
             except FileNotFoundError:
                 pass
+
+    @staticmethod
+    def _create_lock_file(lock_path: Path) -> int:
+        return os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
 
     def _atomic_write(self, session_path: Path, payload: dict[str, Any]) -> None:
         session_path.parent.mkdir(parents=True, exist_ok=True)

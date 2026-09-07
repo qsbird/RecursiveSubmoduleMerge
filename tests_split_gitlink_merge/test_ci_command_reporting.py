@@ -96,8 +96,12 @@ class CiCommandReportingTests(unittest.TestCase):
             self.assertEqual(batch["status"], "failed")
 
     def test_serialization_and_manual_publish_helpers(self) -> None:
+        # The serializers render paths with str(Path(...)), so the expected form
+        # has to be built the same way instead of hardcoding POSIX separators.
+        repo_path = Path("/tmp/repo")
+        rendered_repo_path = str(repo_path)
         conflict = types.SimpleNamespace(
-            repo_path=Path("/tmp/repo"),
+            repo_path=repo_path,
             path="libs/child",
             kind="gitmodules",
             stages=[
@@ -107,7 +111,7 @@ class CiCommandReportingTests(unittest.TestCase):
         self.assertEqual(
             command_reporting.serialize_non_gitlink_conflict(conflict),
             {
-                "repo_path": "/tmp/repo",
+                "repo_path": rendered_repo_path,
                 "path": "libs/child",
                 "type": "gitmodules_conflict",
                 "kind": "gitmodules",
@@ -129,7 +133,7 @@ class CiCommandReportingTests(unittest.TestCase):
 
         plain_result = types.SimpleNamespace(
             args=["status"],
-            cwd=Path("/tmp/repo"),
+            cwd=repo_path,
             returncode=3,
             stdout="stdout",
             stderr="stderr",
@@ -138,7 +142,7 @@ class CiCommandReportingTests(unittest.TestCase):
             command_reporting.command_result_to_dict(plain_result),
             {
                 "args": ["status"],
-                "cwd": "/tmp/repo",
+                "cwd": rendered_repo_path,
                 "returncode": 3,
                 "stdout": "stdout",
                 "stderr": "stderr",

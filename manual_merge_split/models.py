@@ -135,6 +135,9 @@ class CleanupResult:
     rebuilt_branches: list[Path] = field(default_factory=list)
     failed_steps: list[str] = field(default_factory=list)
     not_clean_repos: list[Path] = field(default_factory=list)
+    #: ``(repo_path, level_name)`` for every cleanup level beyond level 1 that
+    #: had to be applied, so callers can report what was escalated to.
+    escalated_levels: list[tuple[Path, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -228,3 +231,4 @@ class PublishCandidate:
     remote_state: str = "unknown"
     depth: int = 0
     selected: bool = True
+    reachable_on_remote: bool = False

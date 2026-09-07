@@ -6,7 +6,7 @@ import codecs
 import datetime as dt
 import difflib
 from pathlib import Path, PurePosixPath
-from typing import Iterable
+from typing import Any, Iterable
 
 from .models import (
     CROSS_SUBMODULE_MOVE_CONTENT_SAMPLE_BYTES,
@@ -72,8 +72,105 @@ def resolve_clone_target_path(
     return target
 
 
+#: Anchored patterns for the opening and closing halves of a 3-way conflict
+#: marker pair.  Both are needed: matching only one would flag documentation and
+#: test fixtures that merely mention a marker.
+CONFLICT_MARKER_OPEN_PATTERN = "^<<<<<<< "
+CONFLICT_MARKER_CLOSE_PATTERN = "^>>>>>>> "
+
+
+def indexed_paths_with_conflict_markers(
+    repo_path: Path,
+    *,
+    run_git: Any,
+    pathspec: Iterable[str] = (),
+) -> set[str]:
+    """Index entries carrying both halves of a conflict marker pair.
+
+    ``git grep --cached`` reads the index, so this reports what a commit would
+    actually record.  Unlike ``git diff --check`` it does not depend on git's
+    localized diagnostics: ``leftover conflict marker`` never appears when git
+    runs under a non-English locale.
+    """
+    selected = [path for path in pathspec if str(path).strip()]
+    matches: set[str] | None = None
+    for pattern in (CONFLICT_MARKER_OPEN_PATTERN, CONFLICT_MARKER_CLOSE_PATTERN):
+        args = ["grep", "--cached", "-I", "-l", "-E", pattern]
+        if selected:
+            args.extend(["--", *selected])
+        result = run_git(repo_path, args, check=False)
+        # git grep exits 1 when nothing matched.
+        if int(getattr(result, "returncode", 0)) not in (0, 1):
+            return set()
+        found = {
+            unquote_git_path(line.strip())
+            for line in str(getattr(result, "stdout", "")).splitlines()
+            if line.strip()
+        }
+        if not found:
+            return set()
+        matches = found if matches is None else (matches & found)
+        if not matches:
+            return set()
+    return matches or set()
+
+
+_C_QUOTE_ESCAPES = {
+    "a": 0x07,
+    "b": 0x08,
+    "f": 0x0C,
+    "n": 0x0A,
+    "r": 0x0D,
+    "t": 0x09,
+    "v": 0x0B,
+    "\\": 0x5C,
+    '"': 0x22,
+}
+
+
+def unquote_git_path(path: str) -> str:
+    """Decode git's C-style quoted path form into a plain string.
+
+    Runs are configured with ``core.quotePath=false``, but git still quotes paths
+    containing a double quote, a backslash or a control character, so porcelain
+    output can carry escapes such as ``"a\\303\\251b"`` regardless of that
+    setting.  Anything that is not a quoted path is returned unchanged.
+    """
+    value = path.strip()
+    if len(value) < 2 or not value.startswith('"') or not value.endswith('"'):
+        return path
+    body = value[1:-1]
+    decoded = bytearray()
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char != "\\":
+            decoded.extend(char.encode("utf-8"))
+            index += 1
+            continue
+        index += 1
+        if index >= len(body):
+            decoded.extend(b"\\")
+            break
+        escape = body[index]
+        if escape in _C_QUOTE_ESCAPES:
+            decoded.append(_C_QUOTE_ESCAPES[escape])
+            index += 1
+            continue
+        octal = body[index : index + 3]
+        if len(octal) == 3 and all(digit in "01234567" for digit in octal):
+            decoded.append(int(octal, 8))
+            index += 3
+            continue
+        # Not a recognised escape: keep the backslash and the following char.
+        decoded.extend(b"\\")
+        decoded.extend(escape.encode("utf-8"))
+        index += 1
+    return decoded.decode("utf-8", errors="replace")
+
+
 def normalize_status_relative_path(path: str) -> str:
-    normalized = path.replace("\\", "/").strip()
+    normalized = unquote_git_path(path).replace("\\", "/").strip()
     if " -> " in normalized:
         normalized = normalized.split(" -> ", maxsplit=1)[-1].strip()
     return normalized.rstrip("/")

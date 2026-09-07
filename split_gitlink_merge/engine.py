@@ -79,11 +79,19 @@ class RecursiveGitlinkMergeEngine:
                     result.gitlinks.append(self.resolve_gitlink_conflict(repo, conflict, depth))
                 continue
 
-            result.file_conflicts.extend(groups.non_gitlinks)
-            self.policy.handle_file_conflicts(self.actions, repo, list(groups.non_gitlinks), depth)
+            pending = list(groups.non_gitlinks)
+            result.file_conflicts.extend(pending)
+            self.policy.handle_file_conflicts(self.actions, repo, pending, depth)
             remaining = [conflict for conflict in self.actions.read_conflicts(repo) if conflict.kind != "gitlink"]
-            if remaining:
-                self.policy.handle_file_conflicts(self.actions, repo, remaining, depth)
+            if remaining and {conflict.path for conflict in remaining} == {
+                conflict.path for conflict in pending
+            }:
+                # A handler that neither resolves nor raises would spin here
+                # forever; require progress on every round instead.
+                paths = ", ".join(sorted(conflict.path for conflict in remaining))
+                raise GitlinkMergeError(
+                    f"file conflict handler made no progress in {repo}: {paths}"
+                )
 
     def merge_commits(
         self,

@@ -292,6 +292,21 @@ class ThreeLevelPublishOps(FakePublishOps):
         return super().run_git(repo_path, args, **kwargs)
 
 
+class UnchangedIntermediatePublishOps(ThreeLevelPublishOps):
+    def run_git(self, repo_path: Path, args: list[str], **kwargs: Any) -> FakeGitResult:
+        repo = self._repo_key(repo_path)
+        if args == ["ls-tree", ROOT_PARENT_SHA, "--", "sub"]:
+            self.calls.append((repo, tuple(args)))
+            return FakeGitResult(stdout=f"160000 commit {CHILD_SHA}\tsub\n")
+        if args == ["rev-list", "--max-count=1", CHILD_SHA, "--not", "--remotes"]:
+            self.calls.append((repo, tuple(args)))
+            return FakeGitResult()
+        if args == ["rev-list", "--max-count=1", GRANDCHILD_SHA, "--not", "--remotes"]:
+            self.calls.append((repo, tuple(args)))
+            return FakeGitResult(stdout=f"{GRANDCHILD_SHA}\n")
+        return super().run_git(repo_path, args, **kwargs)
+
+
 class RecursivePublishCliTests(unittest.TestCase):
     def test_check_only_initializes_and_checks_three_nested_levels(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -326,6 +341,42 @@ class RecursivePublishCliTests(unittest.TestCase):
                 checked_repositories,
                 [grandchild.resolve(), submodule.resolve(), root.resolve()],
             )
+            self.assertTrue(
+                all(
+                    command[2] == "--recurse-submodules=no"
+                    for _repo, command in ops.calls
+                    if command[:2] == ("push", "--dry-run")
+                )
+            )
+
+    def test_unchanged_reachable_intermediate_still_checks_unpublished_nested_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "root"
+            submodule = root / "sub"
+            grandchild = submodule / "nested"
+            (root / ".git").mkdir(parents=True)
+            (submodule / ".git").mkdir(parents=True)
+            ops = UnchangedIntermediatePublishOps(root, submodule, grandchild)
+            args = SimpleNamespace(
+                repo=str(root),
+                remote="origin",
+                push_target="publish-target",
+                check_only=True,
+                no_interactive=True,
+                no_sync_local_branches=True,
+                no_branch_suffix=False,
+                verbose=False,
+            )
+
+            exit_code = run_publish(args, ops=ops)
+
+            self.assertEqual(exit_code, 0)
+            checked_repositories = [
+                repo
+                for repo, command in ops.calls
+                if command[:2] == ("push", "--dry-run")
+            ]
+            self.assertEqual(checked_repositories, [grandchild.resolve(), root.resolve()])
 
 class PublishPlanItemTests(unittest.TestCase):
     def test_plan_item_fields(self) -> None:
@@ -364,6 +415,7 @@ class PublishPlanItemTests(unittest.TestCase):
         self.assertFalse(item.dry_run_ok)
         self.assertFalse(item.pushed)
         self.assertFalse(item.skipped)
+        self.assertFalse(item.reachable_on_remote)
         self.assertEqual(item.messages, [])
 
 

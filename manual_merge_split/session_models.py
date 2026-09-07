@@ -89,6 +89,7 @@ class RepositoryFrame:
     phase: SessionPhase = SessionPhase.MERGE_PENDING
     commit_title: str = ""
     commit_body: str = ""
+    was_initialized: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -106,6 +107,7 @@ class RepositoryFrame:
             "phase": self.phase.value,
             "commit_title": self.commit_title,
             "commit_body": self.commit_body,
+            "was_initialized": self.was_initialized,
         }
 
     @classmethod
@@ -127,6 +129,7 @@ class RepositoryFrame:
             phase=SessionPhase(payload.get("phase", SessionPhase.MERGE_PENDING.value)),
             commit_title=str(payload.get("commit_title", "")),
             commit_body=str(payload.get("commit_body", "")),
+            was_initialized=bool(payload.get("was_initialized", True)),
         )
 
 

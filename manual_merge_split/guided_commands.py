@@ -162,6 +162,7 @@ def run_guided(
         allow_clean_x=prompt_yes_no("Allow git clean -x (remove ignored files) during cleanup", cc.allow_clean_x, input_func=input_func),
         verbose=prompt_yes_no("Enable verbose command output", getattr(args, "verbose", False), input_func=input_func),
         yes=False,
+        force=False,
     )
     if not prompt_yes_no(
         "Cleanup discards uncommitted local changes. Continue? You are responsible for any data loss",

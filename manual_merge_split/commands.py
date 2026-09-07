@@ -43,6 +43,7 @@ from .preflight import (
 )
 from .publish import ManualPublishService
 from .repository_ops import ManualRepositoryOps
+from .session_store import MergeSessionStore, SessionStoreError
 from .session_workflow import ManualMergeSessionService
 
 
@@ -767,6 +768,57 @@ def run_abort(args: Any, *, manual_module: ModuleType | None, ops: ManualReposit
     return session_service.abort(args)
 
 
+def _session_store_for_ops(ops: ManualRepositoryOps) -> MergeSessionStore:
+    return MergeSessionStore(runner=lambda repo, cmd: ops.run_git(repo, cmd, check=False))
+
+
+def _discard_session_for_cleanup(
+    repo_path: Path,
+    ops: ManualRepositoryOps,
+    *,
+    store: MergeSessionStore | None = None,
+    force: bool = False,
+) -> bool:
+    """Delete a saved merge session before cleanup rewrites the repositories.
+
+    A session that cannot be loaded is a hard stop unless ``force`` is set:
+    otherwise cleanup would reset the tree and leave a visible, invalid session
+    behind.  ``force`` unlinks that file because cleanup is the recovery hatch
+    when the session itself is the blocker.
+    """
+    store = store or _session_store_for_ops(ops)
+    try:
+        session_path = store.session_path(repo_path)
+    except SessionStoreError:
+        if not force:
+            raise
+        print(
+            "Could not resolve the merge session path; --force continues without discarding it.",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        if store.load(repo_path) is None:
+            return False
+        return store.clear(repo_path)
+    except SessionStoreError:
+        if not force:
+            raise
+        try:
+            if not session_path.exists():
+                return False
+            session_path.unlink()
+        except OSError as exc:
+            raise SessionStoreError(
+                f"Could not delete the saved manual merge session at {session_path}: {exc}"
+            ) from exc
+        print(
+            f"Forced removal of an unreadable manual merge session: {session_path}",
+            file=sys.stderr,
+        )
+        return True
+
+
 def run_cleanup(args: Any, *, manual_module: ModuleType | None, ops: ManualRepositoryOps) -> int:
     set_verbose(manual_module, getattr(args, "verbose", False))
     if args.rebuild_work_branch and not (args.base_remote_branch or "").strip():
@@ -802,6 +854,51 @@ def run_cleanup(args: Any, *, manual_module: ModuleType | None, ops: ManualRepos
     report_file_name = getattr(args, "report_file", REPORT_FILE_NAME)
     report_path = repo_path / report_file_name
     result = CleanupResult()
+    store = _session_store_for_ops(ops)
+    try:
+        with store.command_lock(repo_path):
+            return _run_cleanup_locked(
+                args,
+                ops=ops,
+                repo_path=repo_path,
+                report_file_name=report_file_name,
+                report_path=report_path,
+                result=result,
+                store=store,
+            )
+    except SessionStoreError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+def _run_cleanup_locked(
+    args: Any,
+    *,
+    ops: ManualRepositoryOps,
+    repo_path: Path,
+    report_file_name: str,
+    report_path: Path,
+    result: CleanupResult,
+    store: MergeSessionStore,
+) -> int:
+    # Cleanup resets every repository to HEAD, which invalidates the frames a
+    # saved session would later try to resume from.  Drop it up front so a stale
+    # session cannot send resume into a repository that no longer matches it.
+    try:
+        cleared_session = _discard_session_for_cleanup(
+            repo_path,
+            ops,
+            store=store,
+            force=bool(getattr(args, "force", False)),
+        )
+    except SessionStoreError as exc:
+        print(
+            f"Could not discard the saved manual merge session: {exc}\n"
+            "Cleanup aborted so a live or unreadable session is not reset underneath. "
+            "Re-run with --force to delete an unreadable session and continue.",
+            file=sys.stderr,
+        )
+        return 1
 
     try:
         ops.cleanup_repository(
@@ -827,7 +924,13 @@ def run_cleanup(args: Any, *, manual_module: ModuleType | None, ops: ManualRepos
         return 1
 
     print("Cleanup completed successfully.")
+    if cleared_session:
+        print("Discarded the saved manual merge session (cleanup invalidated it).")
     print(f"Visited repositories: {len(result.visited_repos)}")
+    if result.escalated_levels:
+        print(f"Escalated cleanup levels: {len(result.escalated_levels)}")
+        for escalated_repo, level_name in result.escalated_levels:
+            print(f"  - {escalated_repo}: {level_name}", file=sys.stderr)
     print(f"Merges aborted/reset: {len(result.aborted_merges)}")
     print(f"Hard resets: {len(result.hard_resets)}")
     if not args.skip_submodule_update:

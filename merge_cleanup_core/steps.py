@@ -52,7 +52,10 @@ def step_cwd(step: CleanupStep | Mapping[str, Any], default_repo_path: Path) -> 
     resolved_step = coerce_cleanup_step(step)
     if resolved_step.cwd is None:
         return default_repo_path
-    return Path(resolved_step.cwd)
+    candidate = Path(resolved_step.cwd)
+    if candidate.is_absolute():
+        return candidate
+    return default_repo_path / candidate
 
 
 def git_clean_flag(allow_clean_x: bool, *, remove_nested_git_repos: bool = False) -> str:
@@ -218,55 +221,7 @@ def ci_batch_continue_restore_steps(target_sha: str, allow_clean_x: bool) -> tup
     )
 
 
-def manual_merge_todo_file_step(*, allow_failure: bool = True) -> CleanupStep:
-    """Remove the manual merge todo report file (merge_manual_todo.txt)."""
-    return cleanup_step(
-        ["clean", "-f", "--", "merge_manual_todo.txt"],
-        allow_failure=allow_failure,
-    )
-
-
-def manual_prepare_cleanup_levels(allow_clean_x: bool) -> tuple[CleanupLevel, ...]:
-    """Cleanup levels for the manual workflow.
-
-    These levels mirror the CI ``ci_prepare_cleanup_levels`` but add handling
-    for the ``merge_manual_todo.txt`` report file that the manual workflow
-    may leave behind during an interrupted merge.
-
-    Level 1: Basic cleanup + report file removal.
-    Level 2: Abort in-progress operations + recursive cleanup.
-    Level 3: Sync + force update (fallback for stubborn states).
-    """
-    return (
-        CleanupLevel(
-            "level_1_basic_and_report_cleanup",
-            (
-                reset_hard_step(),
-                clean_step(allow_clean_x),
-                manual_merge_todo_file_step(),
-                submodule_update_step(),
-            ),
-        ),
-        CleanupLevel(
-            "level_2_abort_and_recursive_cleanup",
-            (
-                abort_operation_step("merge"),
-                abort_operation_step("rebase"),
-                abort_operation_step("cherry-pick"),
-                reset_hard_step(),
-                clean_step(allow_clean_x, remove_nested_git_repos=True),
-                manual_merge_todo_file_step(),
-                foreach_reset_hard_step(),
-                foreach_clean_step(allow_clean_x, remove_nested_git_repos=True),
-            ),
-        ),
-        CleanupLevel(
-            "level_3_sync_and_force_update",
-            (
-                submodule_sync_step(),
-                fetch_all_prune_step(),
-                submodule_update_step(force=True),
-                manual_merge_todo_file_step(),
-            ),
-        ),
-    )
+# The manual workflow builds its own four-level ladder in
+# ``ManualRepositoryOps._build_cleanup_levels`` and removes its report file
+# through ``_safe_unlink_report``.  A second, unexported manual ladder used to
+# live here; it had no callers and could only drift away from the one that runs.

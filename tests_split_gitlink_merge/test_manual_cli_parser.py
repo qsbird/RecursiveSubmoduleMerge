@@ -75,6 +75,12 @@ class ManualCliParserTests(unittest.TestCase):
         self.assertIn("resume", stderr.getvalue())
         self.assertIn("not available", stderr.getvalue())
 
+    def test_cleanup_parser_accepts_force(self) -> None:
+        parsed = manual_runtime.parse_args(["cleanup", "--yes", "--force"])
+        self.assertEqual(parsed.command, "cleanup")
+        self.assertTrue(parsed.yes)
+        self.assertTrue(parsed.force)
+
 
 class ConfigPersistenceTests(unittest.TestCase):
     def test_load_config_migrates_single_legacy_branch(self) -> None:

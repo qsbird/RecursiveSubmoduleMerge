@@ -211,9 +211,11 @@ class ManualMergeSessionService:
             session = self.store.save(repo, session)
             context = self._context_from_session(session)
             session = self._resolve_active(repo, session, context, display_path=".", target_ref=target_ref)
+            session = self._guard_staged_conflict_markers(session, repo)
             self._commit_frame(repo, session.current_frame)
         except ManualMergePause as pause:
             self._write_pause_report(pause.session)
+            print(str(pause), file=sys.stderr)
             print("Manual merge paused. Resolve all conflicts, stage the result, then run resume.")
             return 2
         except (MergeAutomationError, GitlinkMergeError, SessionStoreError) as exc:
@@ -252,13 +254,14 @@ class ManualMergeSessionService:
                 f"Root branch changed since pause: expected {session.work_branch}, found {current_root_branch or 'detached HEAD'}."
             )
 
+        # The previous pause diagnostics stay on the session until resume either
+        # finishes (session is deleted) or pauses again with fresh records: a
+        # resume that dies halfway must not leave the user with an empty report.
         session = replace(
             session,
             status=SessionStatus.RUNNING,
             phase=SessionPhase.RESUMING,
             outcome=None,
-            paused_conflicts=(),
-            paused_reason=None,
         )
         context = self._context_from_session(session)
 
@@ -301,6 +304,7 @@ class ManualMergeSessionService:
                             f"MERGE_HEAD changed in {current_repo}: expected {frame.expected_merge_head}, found {merge_head}."
                         )
                     session = self.store.save(root, session)
+                    session = self._guard_staged_conflict_markers(session, current_repo)
                     self._commit_frame(current_repo, frame)
                 else:
                     head = self.ops.current_head(current_repo)
@@ -345,8 +349,12 @@ class ManualMergeSessionService:
                 return 0
         except ManualMergePause as pause:
             self._write_pause_report(pause.session)
+            print(str(pause), file=sys.stderr)
             print("Manual merge is still waiting for conflict resolution.")
             return 2
+        except (MergeAutomationError, GitlinkMergeError, SessionStoreError) as exc:
+            self._mark_resume_blocked(root, exc)
+            raise
 
         self.store.clear(root)
         self._remove_pause_report(session)
@@ -394,7 +402,7 @@ class ManualMergeSessionService:
             return 1
         session = replace(session, phase=SessionPhase.ABORTING)
         session = self.store.save(root, session)
-        for frame in reversed(session.touched_frames or session.repo_stack):
+        for frame in self._frames_to_restore(session):
             self._restore_frame(frame)
         self.store.clear(root)
         self._remove_pause_report(session)
@@ -466,6 +474,40 @@ class ManualMergeSessionService:
                     current_repo_path=str(child),
                 )
             )
+
+        def on_gitlink_conflict(event: Any) -> None:
+            """Snapshot a submodule before the engine changes it, so abort can undo it.
+
+            ``on_prepare_recursive_merge`` only fires for gitlinks that need a
+            recursive merge.  Fast-forward and take-theirs resolutions still
+            check the submodule out at a new commit and move its work branch, so
+            without this hook ``abort`` would leave them behind.
+            """
+            path = str(event.data.get("path", "")).strip()
+            if not path:
+                return
+            child = (event.repo_path / path).resolve(strict=False)
+            existing = state[0].touched_frames
+            if any(frame.repo_path == str(child) for frame in existing):
+                return
+            was_initialized = (child / ".git").exists()
+            original_head = None
+            original_branch = None
+            if was_initialized:
+                original_head = self.ops.current_head(child)
+                original_branch = self.ops.current_branch_name(child)
+            frame = RepositoryFrame(
+                repo_path=str(child),
+                display_path=manual_messages.join_display_path(display_path, path),
+                depth=len(state[0].repo_stack),
+                parent_repo_path=str(event.repo_path.resolve(strict=False)),
+                parent_gitlink_path=path,
+                original_head=original_head,
+                original_branch=original_branch,
+                was_initialized=was_initialized,
+                phase=SessionPhase.MERGE_PENDING,
+            )
+            persist(replace(state[0], touched_frames=(*existing, frame)))
 
         def on_gitlink_resolved(event: Any) -> None:
             top = state[0].current_frame
@@ -545,6 +587,7 @@ class ManualMergeSessionService:
             build_submodule_commit_message=build_submodule_commit_message,
             handle_file_conflicts=handle_file_conflicts,
             on_prepare_recursive_merge=on_prepare_recursive_merge,
+            on_gitlink_conflict=on_gitlink_conflict,
             on_gitlink_resolved=on_gitlink_resolved,
         )
         engine = RecursiveGitlinkMergeEngine(GitActionExecutor(_ManualOpsGitBackend(self.ops)), policy=policy)
@@ -553,6 +596,56 @@ class ManualMergeSessionService:
         except NonGitlinkConflictError as exc:
             raise self.ops._automation_error(str(exc)) from exc
         return state[0]
+
+    def _guard_staged_conflict_markers(self, session: MergeSession, repo_path: Path) -> MergeSession:
+        """Pause instead of committing when the staged result still has markers.
+
+        ``git`` happily records ``<<<<<<<`` / ``>>>>>>>`` lines: a user who runs
+        ``git add`` on a half-resolved file and then ``resume`` would otherwise
+        get a successful merge commit containing the markers.
+        """
+        marked = self.ops.find_staged_conflict_marker_paths(repo_path)
+        if not marked:
+            return session
+        records = tuple(
+            PausedConflictRecord(
+                repo_path=str(repo_path.resolve(strict=False)),
+                path=path,
+                disposition=ManualConflictDisposition.MANUAL_TAKEOVER.value,
+                detail="staged content still contains conflict markers",
+            )
+            for path in marked
+        )
+        reason = "staged conflict markers remain"
+        paused = self.store.save(
+            Path(session.root_repo_path),
+            self._pause_session(session, repo_path, records, reason),
+        )
+        listed = ", ".join(marked)
+        raise ManualMergePause(
+            paused,
+            f"Refusing to commit in {repo_path}: staged content still contains conflict markers ({listed}).",
+        )
+
+    def _mark_resume_blocked(self, root: Path, error: Exception) -> None:
+        """Record a failed resume as a pause so status and the report stay honest."""
+        try:
+            current = self.store.load(root)
+            if current is None or current.status == SessionStatus.FAILED_FATAL:
+                return
+            self.store.save(
+                root,
+                replace(
+                    current,
+                    status=SessionStatus.PAUSED_MANUAL,
+                    phase=SessionPhase.MANUAL_RESOLUTION,
+                    outcome=SessionOutcome.PAUSED_MANUAL,
+                    paused_reason=str(error),
+                    last_error=str(error),
+                ),
+            )
+        except (MergeAutomationError, GitlinkMergeError, SessionStoreError):
+            return
 
     def _pause_current(self, session: MergeSession, repo_path: Path, reason: str) -> MergeSession:
         records = tuple(
@@ -655,7 +748,28 @@ class ManualMergeSessionService:
             message=ManualCommitMessage(title=frame.commit_title, body=frame.commit_body),
         )
 
+    @staticmethod
+    def _frames_to_restore(session: MergeSession) -> list[RepositoryFrame]:
+        """Every repository abort must undo, deepest first.
+
+        The root lives on ``repo_stack``; submodules live on ``touched_frames``.
+        ``touched_frames`` is snapshotted at ``gitlink.conflict``, before the
+        engine initializes or checks out the submodule, so it wins when the same
+        path later appears on the stack with a post-init head.
+        """
+        by_path: dict[str, RepositoryFrame] = {}
+        for frame in (*session.touched_frames, *session.repo_stack):
+            by_path.setdefault(frame.repo_path, frame)
+        return sorted(
+            by_path.values(),
+            key=lambda frame: len(Path(frame.repo_path).parts),
+            reverse=True,
+        )
+
     def _restore_frame(self, frame: RepositoryFrame) -> None:
+        if not frame.was_initialized:
+            self._deinit_merge_initialized_submodule(frame)
+            return
         repo = Path(frame.repo_path)
         if self.ops.merge_in_progress(repo):
             self.ops.abort_merge(repo)
@@ -665,6 +779,31 @@ class ManualMergeSessionService:
             self.ops.checkout_detached(repo, frame.original_head)
         if frame.original_head:
             self.ops.reset_hard(repo, frame.original_head)
+
+    def _deinit_merge_initialized_submodule(self, frame: RepositoryFrame) -> None:
+        parent = frame.parent_repo_path
+        path = frame.parent_gitlink_path
+        if not parent or not path:
+            raise self.ops._automation_error(
+                f"Abort cannot deinitialize {frame.repo_path}: missing parent gitlink metadata. "
+                "The manual merge session was preserved so the repository can be restored manually "
+                "and abort retried."
+            )
+        print(
+            f"Abort is deinitializing {path} because this merge initialized it.",
+            file=sys.stderr,
+        )
+        result = self.ops.run_git(
+            Path(parent),
+            ["submodule", "deinit", "-f", "--", path],
+            check=False,
+        )
+        if int(getattr(result, "returncode", 0)) != 0:
+            raise self.ops._automation_error(
+                f"Abort could not deinitialize {frame.repo_path}. "
+                "The manual merge session was preserved so abort can be retried.\n"
+                f"{self.ops._format_git_failure(result)}"
+            )
 
     def _write_pause_report(self, session: MergeSession) -> None:
         report_name = str(session.metadata.get("report_file", "merge_manual_todo.txt"))

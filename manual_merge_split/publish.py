@@ -3,10 +3,16 @@
 The publish source of truth is the root repository HEAD.  Submodule commits are
 read from the parent commit's gitlink entries, not from each submodule worktree
 HEAD.  The workflow never checks out branches and never force-pushes.
+
+Check dry-runs each repository with ``--recurse-submodules=no``.  Git's
+``--recurse-submodules=check`` is an execute-time safety net after descendants
+have been pushed; it is not a pre-condition of dry-run, because dry-run never
+uploads submodule objects.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
@@ -43,6 +49,7 @@ class PublishPlanItem:
     dry_run_ok: bool = False
     pushed: bool = False
     skipped: bool = False
+    reachable_on_remote: bool = False
     messages: list[str] = field(default_factory=list)
 
 
@@ -222,8 +229,6 @@ def collect_publish_plan(
                 f"Could not resolve gitlink commit for submodule {submodule_path} at {repo_path}:{desired_sha}"
             )
         child_baseline_sha = gitlink_baseline_sha(repo_path, parent_baseline_sha, submodule_path, ops)
-        if child_baseline_sha == child_sha:
-            continue
         child_repo = repo_path / submodule_path
         if not child_repo.exists():
             raise ops._automation_error(
@@ -231,18 +236,19 @@ def collect_publish_plan(
                 "Run git submodule update --init --recursive and retry."
             )
         ops.ensure_git_repo(child_repo)
-        items.extend(
-            collect_publish_plan(
-                child_repo,
-                child_sha,
-                ops,
-                display_path=normalize_display_path(display_path, submodule_path),
-                depth=depth + 1,
-                baseline_sha=child_baseline_sha,
-                infer_baseline=False,
-                seen=seen_items,
-            )
+        child_items = collect_publish_plan(
+            child_repo,
+            child_sha,
+            ops,
+            display_path=normalize_display_path(display_path, submodule_path),
+            depth=depth + 1,
+            baseline_sha=child_baseline_sha,
+            infer_baseline=False,
+            seen=seen_items,
         )
+        if child_baseline_sha == child_sha and gitlink_reachable_on_any_remote(child_repo, child_sha, ops):
+            child_items = child_items[1:]
+        items.extend(child_items)
     return items
 
 
@@ -372,15 +378,119 @@ def classify_remote_state(
     )
 
 
+def gitlink_reachable_on_any_remote(repo_path: Path, sha: str, ops: ManualRepositoryOps) -> bool:
+    """Return True when *sha* is already reachable from some remote-tracking ref.
+
+    This matches Git's ``--recurse-submodules=check`` question: whether the
+    commit can be found on a remote of this repository, not whether it is
+    already on the publish target branch.
+    """
+    result = ops.run_git(
+        repo_path,
+        ["rev-list", "--max-count=1", sha, "--not", "--remotes"],
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    return not result.stdout.strip()
+
+
+def parse_missing_submodule_paths(output: str) -> list[str]:
+    """Parse submodule paths from ``git push --recurse-submodules=check`` output.
+
+    The markers are English because ``_run_checked_push`` pins ``LC_ALL=C``.
+    Localized git output is not a supported input.
+    """
+    marker = re.compile(
+        r"The following submodule paths contain changes that can\s+not be found on any remote:"
+    )
+    match = marker.search(output)
+    if match is None:
+        return []
+    rest = output[match.end() :]
+    paths: list[str] = []
+    for line in rest.splitlines():
+        stripped = line.strip().replace("\\", "/")
+        if not stripped:
+            if paths:
+                break
+            continue
+        lowered = stripped.lower()
+        if lowered.startswith(("fatal:", "please try", "or cd ", "to push ", "git push")):
+            break
+        paths.append(stripped)
+    return paths
+
+
+def is_strict_descendant_display_path(parent: str, child: str) -> bool:
+    parent_norm = parent.replace("\\", "/").strip("/") or "."
+    child_norm = child.replace("\\", "/").strip("/") or "."
+    if child_norm == parent_norm:
+        return False
+    if parent_norm == ".":
+        return child_norm != "."
+    return child_norm.startswith(parent_norm + "/")
+
+
+def required_descendant_display_paths(items: list[PublishPlanItem], parent_path: str) -> list[str]:
+    required: list[str] = []
+    for item in items:
+        if not is_strict_descendant_display_path(parent_path, item.display_path):
+            continue
+        if item.skipped:
+            continue
+        if item.reachable_on_remote:
+            continue
+        required.append(item.display_path)
+    return required
+
+
+def ensure_required_descendants_selected(
+    items: list[PublishPlanItem],
+    selected_display_paths: set[str] | None,
+    ops: ManualRepositoryOps,
+) -> None:
+    if selected_display_paths is None:
+        return
+    pushing = {
+        item.display_path
+        for item in items
+        if not item.skipped and item.display_path in selected_display_paths
+    }
+    blocked: list[str] = []
+    for item in items:
+        if item.display_path not in pushing:
+            continue
+        missing = [
+            path
+            for path in required_descendant_display_paths(items, item.display_path)
+            if path not in pushing
+        ]
+        if missing:
+            blocked.append(f"{item.display_path} requires {', '.join(missing)}")
+    if blocked:
+        raise ops._automation_error(
+            "Cannot publish a parent repository without also pushing submodule "
+            "commits that are not on any remote:\n"
+            + "\n".join(f"  - {line}" for line in blocked)
+        )
+
+
 def run_push_check(
     item: PublishPlanItem,
     remote: str,
     push_target: str,
     ops: ManualRepositoryOps,
 ) -> None:
+    """Dry-run this repository only.
+
+    ``--recurse-submodules=no`` is required: Git's ``check`` would fail a parent
+    whose child SHA is not already on a remote, even when that child is part of
+    the same publish plan and will be pushed first.
+    """
     result = ops.run_git(
         item.repo_path,
-        ["push", "--dry-run", "--recurse-submodules=check", remote, f"{item.desired_sha}:{target_ref(push_target)}"],
+        ["push", "--dry-run", "--recurse-submodules=no", remote, f"{item.desired_sha}:{target_ref(push_target)}"],
         check=False,
         stream_output=ops._verbose(),
     )
@@ -389,20 +499,69 @@ def run_push_check(
     item.dry_run_ok = True
 
 
+def _push_spec(item: PublishPlanItem, push_target: str) -> str:
+    return f"{item.desired_sha}:{target_ref(push_target)}"
+
+
+def _run_checked_push(
+    item: PublishPlanItem,
+    remote: str,
+    push_target: str,
+    ops: ManualRepositoryOps,
+) -> Any:
+    return ops.run_git(
+        item.repo_path,
+        ["push", "--recurse-submodules=check", remote, _push_spec(item, push_target)],
+        check=False,
+        stream_output=ops._verbose(),
+        env_overrides={"LC_ALL": "C", "LANG": "C", "LANGUAGE": "C"},
+    )
+
+
 def push_item(
     item: PublishPlanItem,
     remote: str,
     push_target: str,
     ops: ManualRepositoryOps,
+    *,
+    plan_items: list[PublishPlanItem] | None = None,
 ) -> None:
-    result = ops.run_git(
-        item.repo_path,
-        ["push", "--recurse-submodules=check", remote, f"{item.desired_sha}:{target_ref(push_target)}"],
-        check=False,
-        stream_output=ops._verbose(),
-    )
+    result = _run_checked_push(item, remote, push_target, ops)
     if result.returncode != 0:
-        raise ops._automation_error(ops._format_git_failure(result))
+        missing_paths = parse_missing_submodule_paths(f"{result.stderr}\n{result.stdout}")
+        if missing_paths:
+            pushed_missing = False
+            for relative_path in missing_paths:
+                child_repo = (item.repo_path / relative_path).resolve(strict=False)
+                child = None
+                if plan_items is not None:
+                    child = next(
+                        (
+                            candidate
+                            for candidate in plan_items
+                            if candidate.repo_path.resolve(strict=False) == child_repo
+                        ),
+                        None,
+                    )
+                if child is not None:
+                    if child.skipped:
+                        raise ops._automation_error(
+                            f"Cannot publish {item.display_path}: submodule {relative_path} "
+                            "is not on any remote and was excluded from this publish."
+                        )
+                    if not child.pushed:
+                        push_item(child, remote, push_target, ops, plan_items=plan_items)
+                        pushed_missing = True
+                    continue
+                raise ops._automation_error(
+                    f"Cannot publish {item.display_path}: submodule {relative_path} is not on any remote "
+                    "but was not included in the checked publish plan. Refusing an unconfirmed ad-hoc push; "
+                    "run the publish check again."
+                )
+            if pushed_missing:
+                result = _run_checked_push(item, remote, push_target, ops)
+        if result.returncode != 0:
+            raise ops._automation_error(ops._format_git_failure(result))
     item.pushed = True
 
 
@@ -460,6 +619,11 @@ def run_publish_check(
     for item in result.items:
         if not ops.remote_exists(item.repo_path, remote):
             raise ops._automation_error(f"Remote does not exist in repository {item.repo_path}: {remote}")
+        item.reachable_on_remote = gitlink_reachable_on_any_remote(item.repo_path, item.desired_sha, ops)
+        if not item.reachable_on_remote:
+            item.messages.append(
+                "Commit is not on any remote yet; it will be pushed before parent repositories."
+            )
         classify_remote_state(item, remote, push_target, ops)
 
     for item in result.items:
@@ -473,6 +637,10 @@ def run_publish_check(
             )
 
     for item in result.items:
+        if item.skipped:
+            print_publish_item(item)
+            result.warnings.extend(item.messages)
+            continue
         run_push_check(item, remote, push_target, ops)
         print_publish_item(item)
         result.warnings.extend(item.messages)
@@ -528,6 +696,7 @@ def discover_publish_candidates(
             remote_before_sha=remote_before,
             remote_state=remote_state,
             depth=item.depth,
+            reachable_on_remote=item.reachable_on_remote,
         )
 
     # also include repos that collect_publish_plan skipped so the user
@@ -589,6 +758,53 @@ def display_publish_plan(candidates: list[PublishCandidate]) -> None:
     print("=" * 60)
 
 
+def _candidates_as_plan_items(candidates: list[PublishCandidate]) -> list[PublishPlanItem]:
+    return [
+        PublishPlanItem(
+            repo_path=candidate.repo_path,
+            display_path=candidate.display_path,
+            desired_sha=candidate.commit_sha,
+            depth=candidate.depth,
+            reachable_on_remote=candidate.reachable_on_remote,
+        )
+        for candidate in candidates
+    ]
+
+
+def missing_required_selection_messages(candidates: list[PublishCandidate]) -> list[str]:
+    selected = {candidate.display_path for candidate in candidates if candidate.selected}
+    items = _candidates_as_plan_items(candidates)
+    blocked: list[str] = []
+    for candidate in candidates:
+        if not candidate.selected:
+            continue
+        missing = [
+            path
+            for path in required_descendant_display_paths(items, candidate.display_path)
+            if path not in selected
+        ]
+        if missing:
+            blocked.append(f"{candidate.display_path} requires {', '.join(missing)}")
+    return blocked
+
+
+def apply_candidate_toggle(candidates: list[PublishCandidate], index: int) -> None:
+    if not 0 <= index < len(candidates):
+        return
+    candidates[index].selected = not candidates[index].selected
+    items = _candidates_as_plan_items(candidates)
+    path = candidates[index].display_path
+    if candidates[index].selected:
+        required = set(required_descendant_display_paths(items, path))
+        for candidate in candidates:
+            if candidate.display_path in required:
+                candidate.selected = True
+        return
+    for candidate in candidates:
+        if path in required_descendant_display_paths(items, candidate.display_path):
+            candidate.selected = False
+
+
 def confirm_publish_plan_interactive(
     candidates: list[PublishCandidate],
     *,
@@ -638,6 +854,15 @@ def confirm_publish_plan_interactive(
         if choice in {"q", "quit", "exit"}:
             return None
         if choice == "c":
+            blocked = missing_required_selection_messages(local)
+            if blocked:
+                output_func(
+                    "Cannot publish a parent repository without also pushing "
+                    "submodule commits that are not on any remote:"
+                )
+                for line in blocked:
+                    output_func(f"  - {line}")
+                continue
             return local
         if choice == "a":
             for c in local:
@@ -648,9 +873,7 @@ def confirm_publish_plan_interactive(
                 c.selected = False
             continue
         try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(local):
-                local[idx].selected = not local[idx].selected
+            apply_candidate_toggle(local, int(choice) - 1)
         except ValueError:
             pass
 
@@ -689,7 +912,7 @@ def _run_publish_workflow_with_candidates(
             )
         run_push_check(item, remote, push_target, ops)
         if not check_only and not item.skipped:
-            push_item(item, remote, push_target, ops)
+            push_item(item, remote, push_target, ops, plan_items=result.items)
         print_publish_item(item)
         result.items.append(item)
         result.warnings.extend(item.messages)
@@ -715,14 +938,20 @@ def run_publish_execute(
     result.items = list(check_result.items)
     result.warnings = list(check_result.warnings)
 
+    ensure_required_descendants_selected(result.items, selected_display_paths, ops)
+
+    if selected_display_paths is not None:
+        for item in result.items:
+            if item.display_path not in selected_display_paths:
+                item.skipped = True
+                item.messages.append("Excluded by user selection.")
+
     for item in result.items:
-        if selected_display_paths is not None and item.display_path not in selected_display_paths:
-            item.skipped = True
-            item.messages.append("Excluded by user selection.")
+        if item.skipped:
             print_publish_item(item)
             continue
 
-        if item.skipped:
+        if item.pushed:
             print_publish_item(item)
             continue
 
@@ -735,7 +964,7 @@ def run_publish_execute(
                 dry_run=False,
             )
 
-        push_item(item, remote, push_target, ops)
+        push_item(item, remote, push_target, ops, plan_items=result.items)
         print_publish_item(item)
         result.warnings.extend(item.messages)
 
@@ -818,6 +1047,7 @@ def run_publish(
                         remote_before_sha=item.remote_before_sha,
                         remote_state=item.remote_state,
                         depth=item.depth,
+                        reachable_on_remote=item.reachable_on_remote,
                     )
                     for item in pushable_items
                 ]

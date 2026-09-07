@@ -30,80 +30,84 @@ def classify_conflict_records(
     for path in paths:
         path_records = tuple(sorted(grouped.get(path, []), key=lambda item: (item.stage, item.mode, item.sha)))
         status_code = (status_by_path or {}).get(path, "")
+        disposition, reason = evaluate_conflict(
+            repo_path,
+            path,
+            path_records,
+            status_code=status_code,
+            is_binary_path=is_binary_path,
+        )
         classified[path] = ClassifiedManualConflict(
             repo_path=repo_path.resolve(strict=False),
             path=path,
-            disposition=_classify_one(
-                repo_path,
-                path,
-                path_records,
-                status_code=status_code,
-                is_binary_path=is_binary_path,
-            ),
+            disposition=disposition,
             records=path_records,
             status_code=status_code,
-            reason=_reason_for(path, path_records, status_code=status_code, is_binary_path=is_binary_path, repo_path=repo_path),
+            reason=reason,
         )
     return classified
 
 
-def _classify_one(
+TEXT_FILE_MODES = {"100644", "100755"}
+GITLINK_MODE = "160000"
+
+
+def evaluate_conflict(
     repo_path: Path,
     path: str,
     records: tuple[ManualConflictRecord, ...],
     *,
     status_code: str,
     is_binary_path: Callable[[Path, str, tuple[ManualConflictRecord, ...]], bool] | None,
-) -> ManualConflictDisposition:
-    if path == "<unparseable>" or not records:
-        return ManualConflictDisposition.FATAL
+) -> tuple[ManualConflictDisposition, str]:
+    """Classify one unmerged path and explain the verdict in one pass.
 
-    stages = [record.stage for record in records]
-    if any(stage not in {1, 2, 3} for stage in stages):
-        return ManualConflictDisposition.FATAL
-    if len(set(stages)) != len(stages):
-        return ManualConflictDisposition.FATAL
+    Disposition and reason are decided together on purpose: they used to be two
+    parallel ladders with slightly different mode sets, so a mixed
+    file/gitlink conflict came out as MANUAL_TAKEOVER with an empty reason and
+    the pause report showed a path with no explanation.
+    """
+    stages = ",".join(str(record.stage) for record in records) or "none"
+    modes_text = ",".join(sorted({record.mode for record in records})) or "unknown"
+    shape = f"(stages={stages}, modes={modes_text})"
+
+    if path == "<unparseable>" or not records:
+        return ManualConflictDisposition.FATAL, "unparseable unmerged index entry"
+
+    stage_list = [record.stage for record in records]
+    if any(stage not in {1, 2, 3} for stage in stage_list):
+        return ManualConflictDisposition.FATAL, f"unmerged stage outside 1-3 {shape}"
+    if len(set(stage_list)) != len(stage_list):
+        return ManualConflictDisposition.FATAL, f"duplicate index stage detected {shape}"
 
     modes = {record.mode for record in records}
-    stage_set = set(stages)
-    if modes == {"160000"} and {2, 3}.issubset(stage_set):
-        return ManualConflictDisposition.SUPPORTED_GITLINK
+    stage_set = set(stage_list)
+    if modes == {GITLINK_MODE} and {2, 3}.issubset(stage_set):
+        return ManualConflictDisposition.SUPPORTED_GITLINK, ""
 
     if path == ".gitmodules":
-        return ManualConflictDisposition.MANUAL_TAKEOVER
+        return (
+            ManualConflictDisposition.MANUAL_TAKEOVER,
+            ".gitmodules conflicts must be resolved manually",
+        )
     if status_code and status_code not in {"UU", "AA"}:
-        return ManualConflictDisposition.MANUAL_TAKEOVER
+        return (
+            ManualConflictDisposition.MANUAL_TAKEOVER,
+            f"unsupported conflict status {status_code}",
+        )
     if not {2, 3}.issubset(stage_set):
-        return ManualConflictDisposition.MANUAL_TAKEOVER
-    if not modes.issubset({"100644", "100755"}):
-        return ManualConflictDisposition.MANUAL_TAKEOVER
+        return (
+            ManualConflictDisposition.MANUAL_TAKEOVER,
+            f"unsupported stage combination {shape}",
+        )
+    if not modes.issubset(TEXT_FILE_MODES):
+        return (
+            ManualConflictDisposition.MANUAL_TAKEOVER,
+            f"unsupported mode combination {shape}",
+        )
     if is_binary_path is not None and is_binary_path(repo_path, path, records):
-        return ManualConflictDisposition.MANUAL_TAKEOVER
-    return ManualConflictDisposition.SUPPORTED_FILE
-
-
-def _reason_for(
-    path: str,
-    records: tuple[ManualConflictRecord, ...],
-    *,
-    status_code: str,
-    is_binary_path: Callable[[Path, str, tuple[ManualConflictRecord, ...]], bool] | None,
-    repo_path: Path,
-) -> str:
-    stages = ",".join(str(record.stage) for record in records) or "none"
-    modes = ",".join(sorted({record.mode for record in records})) or "unknown"
-    if path == "<unparseable>" or not records:
-        return "unparseable unmerged index entry"
-    if len({record.stage for record in records}) != len(records):
-        return f"duplicate index stage detected (stages={stages}, modes={modes})"
-    if path == ".gitmodules":
-        return ".gitmodules conflicts must be resolved manually"
-    if status_code and status_code not in {"UU", "AA"}:
-        return f"unsupported conflict status {status_code}"
-    if not {2, 3}.issubset({record.stage for record in records}):
-        return f"unsupported stage combination (stages={stages}, modes={modes})"
-    if not {record.mode for record in records}.issubset({"100644", "100755", "160000"}):
-        return f"unsupported mode combination (stages={stages}, modes={modes})"
-    if is_binary_path is not None and is_binary_path(repo_path, path, records):
-        return "binary conflict must be resolved manually"
-    return ""
+        return (
+            ManualConflictDisposition.MANUAL_TAKEOVER,
+            "binary conflict must be resolved manually",
+        )
+    return ManualConflictDisposition.SUPPORTED_FILE, ""

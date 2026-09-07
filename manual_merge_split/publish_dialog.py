@@ -10,7 +10,11 @@ from __future__ import annotations
 from tkinter import ttk
 from typing import Any
 
-from .publish import PublishPlanItem, PublishResult
+from .publish import (
+    PublishPlanItem,
+    PublishResult,
+    required_descendant_display_paths,
+)
 
 
 LANGUAGE_EN = "en"
@@ -61,6 +65,18 @@ DIALOG_TEXT: dict[str, dict[str, str]] = {
         LANGUAGE_EN: "No repositories selected for push.",
         LANGUAGE_ZH: "没有选中任何仓库进行推送。",
     },
+    "message_required_descendants": {
+        LANGUAGE_EN: "Cannot publish {parent} without also pushing: {children}",
+        LANGUAGE_ZH: "发布 {parent} 前必须同时推送：{children}",
+    },
+    "hint_required_children": {
+        LANGUAGE_EN: "A parent cannot be published until submodule commits that are not on any remote have been selected.",
+        LANGUAGE_ZH: "父仓库引用的子模块提交如果不在任何远端上，必须一并勾选后才能发布。",
+    },
+    "status_not_on_remote": {
+        LANGUAGE_EN: "not on remote yet",
+        LANGUAGE_ZH: "尚未在远端",
+    },
     "status_up_to_date": {
         LANGUAGE_EN: "up to date",
         LANGUAGE_ZH: "已是最新",
@@ -88,13 +104,16 @@ def _t(key: str, language: str = LANGUAGE_EN, **kwargs: Any) -> str:
     return template.format(**kwargs)
 
 
-def _remote_state_display(state: str, language: str = LANGUAGE_EN) -> str:
+def _remote_state_display(item: PublishPlanItem, language: str = LANGUAGE_EN) -> str:
     mapping = {
         "up_to_date": _t("status_up_to_date", language),
         "fast_forward": _t("status_fast_forward", language),
         "missing": _t("status_missing", language),
     }
-    return mapping.get(state, _t("status_unknown", language))
+    display = mapping.get(item.remote_state, _t("status_unknown", language))
+    if not item.skipped and not item.reachable_on_remote:
+        return f"{display} / {_t('status_not_on_remote', language)}"
+    return display
 
 
 def short_sha(value: str) -> str:
@@ -132,7 +151,8 @@ class PublishConfirmDialog:
         self.top.transient(parent)
         self.top.grab_set()
 
-        self._push_vars: dict[str, tk.BooleanVar] = {}
+        self._syncing = False
+        self._push_vars: dict[str, Any] = {}
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -144,6 +164,12 @@ class PublishConfirmDialog:
 
         # Label
         ttk_module.Label(main, text=_t("label_repos_to_push", self.language)).pack(anchor="w")
+        ttk_module.Label(
+            main,
+            text=_t("hint_required_children", self.language),
+            wraplength=680,
+            foreground="#6b7280",
+        ).pack(anchor="w", pady=(4, 0))
 
         # Treeview with checkboxes
         tree_frame = ttk_module.Frame(main)
@@ -175,14 +201,15 @@ class PublishConfirmDialog:
 
         # Insert items
         for item in self.check_result.items:
-            remote_display = _remote_state_display(item.remote_state, self.language)
-            iid = self.tree.insert(
+            remote_display = _remote_state_display(item, self.language)
+            self.tree.insert(
                 "",
                 "end",
                 values=(item.display_path, short_sha(item.desired_sha), remote_display),
             )
             var = tk.BooleanVar(value=not item.skipped)
             self._push_vars[item.display_path] = var
+            var.trace_add("write", lambda *_args, path=item.display_path: self._on_toggle(path))
 
             cb = ttk_module.Checkbutton(
                 check_frame,
@@ -213,16 +240,50 @@ class PublishConfirmDialog:
             side="right"
         )
 
+    def _on_toggle(self, display_path: str) -> None:
+        if self._syncing:
+            return
+        var = self._push_vars.get(display_path)
+        if var is None:
+            return
+        self._syncing = True
+        try:
+            if var.get():
+                for required in required_descendant_display_paths(self.check_result.items, display_path):
+                    child_var = self._push_vars.get(required)
+                    if child_var is not None:
+                        child_var.set(True)
+            else:
+                for item in self.check_result.items:
+                    if display_path not in required_descendant_display_paths(
+                        self.check_result.items, item.display_path
+                    ):
+                        continue
+                    parent_var = self._push_vars.get(item.display_path)
+                    if parent_var is not None:
+                        parent_var.set(False)
+        finally:
+            self._syncing = False
+
     def _select_all(self) -> None:
-        for var in self._push_vars.values():
-            var.set(True)
+        self._syncing = True
+        try:
+            for var in self._push_vars.values():
+                var.set(True)
+        finally:
+            self._syncing = False
 
     def _deselect_all(self) -> None:
-        for var in self._push_vars.values():
-            var.set(False)
+        self._syncing = True
+        try:
+            for var in self._push_vars.values():
+                var.set(False)
+        finally:
+            self._syncing = False
 
     def _confirm(self) -> None:
-        if not self.selected_display_paths():
+        selected = self.selected_display_paths()
+        if not selected:
             from tkinter import messagebox
 
             messagebox.showwarning(
@@ -231,6 +292,28 @@ class PublishConfirmDialog:
                 parent=self.top,
             )
             return
+        for item in self.check_result.items:
+            if item.display_path not in selected or item.skipped:
+                continue
+            missing = [
+                path
+                for path in required_descendant_display_paths(self.check_result.items, item.display_path)
+                if path not in selected
+            ]
+            if missing:
+                from tkinter import messagebox
+
+                messagebox.showwarning(
+                    _t("dialog_title", self.language),
+                    _t(
+                        "message_required_descendants",
+                        self.language,
+                        parent=item.display_path,
+                        children=", ".join(missing),
+                    ),
+                    parent=self.top,
+                )
+                return
         self.confirmed = True
         self.top.destroy()
 

@@ -139,7 +139,11 @@ def record_file_conflicts(
 
 def get_unmerged_paths(repo_path: Path, *, run_git: Any) -> list[str]:
     result = run_git(repo_path, ["diff", "--name-only", "--diff-filter=U"])
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return [
+        common.unquote_git_path(line.strip())
+        for line in result.stdout.splitlines()
+        if line.strip()
+    ]
 
 
 def emit_line(output_func: Any, message: str) -> None:
@@ -274,17 +278,11 @@ def resolve_single_file_conflict(
     was_unmerged = relative_path in get_unmerged_paths(repo_path, run_git=run_git)
     run_git(repo_path, ["add", "--", relative_path], check=False)
 
-    marker_check = run_git(
+    if common.indexed_paths_with_conflict_markers(
         repo_path,
-        ["diff", "--check", "--cached", "--", relative_path],
-        check=False,
-    )
-    marker_output = "\n".join(
-        value.strip()
-        for value in (marker_check.stdout, marker_check.stderr)
-        if value and value.strip()
-    )
-    if "leftover conflict marker" in marker_output.lower():
+        run_git=run_git,
+        pathspec=[relative_path],
+    ):
         failure_reasons.append("file still contains conflict markers after the tool closed")
 
     if was_unmerged and relative_path in get_unmerged_paths(repo_path, run_git=run_git):

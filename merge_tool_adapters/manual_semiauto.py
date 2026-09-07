@@ -46,6 +46,7 @@ class ManualWorkflowGitlinkPolicy(MergePolicy):
         build_submodule_commit_message: Callable[[GitlinkMergeContext], MergeCommitMessage],
         handle_file_conflicts: Callable[[GitExecutionPort, Path, list[Conflict], int], None],
         on_prepare_recursive_merge: Callable[[GitlinkMergeContext], None] | None = None,
+        on_gitlink_conflict: Callable[[MergeEvent], None] | None = None,
         on_gitlink_resolved: Callable[[MergeEvent], None] | None = None,
         fetch_missing_commits: bool = False,
     ) -> None:
@@ -59,12 +60,20 @@ class ManualWorkflowGitlinkPolicy(MergePolicy):
         self._build_submodule_commit_message = build_submodule_commit_message
         self._handle_file_conflicts = handle_file_conflicts
         self._on_prepare_recursive_merge = on_prepare_recursive_merge
+        self._on_gitlink_conflict = on_gitlink_conflict
         self._on_gitlink_resolved = on_gitlink_resolved
         self.events: list[str] = []
         self.resolved_paths: list[str] = []
 
     def on_event(self, event: MergeEvent) -> None:
         self.events.append(f"[{event.repo_path}] {event.message}")
+        if event.name == "gitlink.conflict":
+            # Fires before the engine touches the submodule, so this is the only
+            # place where its pre-merge state can still be recorded.  Every
+            # gitlink resolution passes through here, not just recursive ones.
+            if self._on_gitlink_conflict is not None:
+                self._on_gitlink_conflict(event)
+            return
         if event.name != "gitlink.resolved":
             return
         path = str(event.data.get("path", "")).strip()
@@ -89,7 +98,15 @@ class ManualWorkflowGitlinkPolicy(MergePolicy):
             self._on_prepare_recursive_merge(context)
         self._prepare_submodule_branch(context.submodule_repo, context.ours_sha)
         if self.update_submodules_before_recursive_merge:
-            actions.update_submodules(context.submodule_repo, check=False)
+            result = actions.update_submodules(context.submodule_repo, check=False)
+            if int(getattr(result, "returncode", 0)) != 0:
+                # Deliberately non-fatal: the engine re-checks initialization
+                # before descending and can still fetch a missing nested commit.
+                # Record it so a later "submodule is not initialized" is traceable.
+                self.events.append(
+                    f"[{context.submodule_repo}] submodule update before recursive merge failed: "
+                    f"{format_git_failure(result)}"
+                )
 
     def build_submodule_commit_message(
         self,

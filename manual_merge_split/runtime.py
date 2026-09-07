@@ -261,6 +261,14 @@ def add_cleanup_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Continue cleanup even if the saved merge session cannot be discarded "
+            "(for example a corrupt session file). Does not override a live command lock."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print executed commands and key progress information.",
