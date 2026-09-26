@@ -298,7 +298,11 @@ def add_publish_arguments(parser: argparse.ArgumentParser) -> None:
         "--check_only",
         dest="check_only",
         action="store_true",
-        help="Run all publish checks and dry-run pushes without changing local branch refs or pushing.",
+        help=(
+            "Run all publish checks and dry-run pushes without changing local branch refs or pushing. "
+            "Still runs git submodule update --init --recursive so nested gitlinks can be planned; "
+            "that can initialize submodules and move their worktrees."
+        ),
     )
     parser.add_argument(
         "--no-sync-local-branches",

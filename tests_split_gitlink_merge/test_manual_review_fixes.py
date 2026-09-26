@@ -821,6 +821,85 @@ class AbortUninitializedSubmoduleTests(unittest.TestCase):
         service._restore_frame(frame)
         self.assertFalse((parent / "sub" / ".git").exists())
 
+    def test_abort_restores_parent_before_deinit(self) -> None:
+        sub_src = init_repo(self.base / "sub_src")
+        (sub_src / "file.txt").write_text("sub\n", encoding="utf-8")
+        git(sub_src, "add", "-A")
+        git(sub_src, "commit", "-q", "-m", "sub base")
+
+        parent = init_repo(self.base / "parent")
+        git(parent, "config", "protocol.file.allow", "always")
+        git(
+            parent,
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            str(sub_src).replace("\\", "/"),
+            "sub",
+        )
+        git(parent, "commit", "-q", "-m", "add submodule")
+        original_head = git(parent, "rev-parse", "HEAD").stdout.strip()
+        (parent / ".gitmodules").write_text(
+            "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> other\n",
+            encoding="utf-8",
+        )
+        git(parent, "add", ".gitmodules")
+
+        class OrderOps(ManualRepositoryOps):
+            def __init__(self) -> None:
+                super().__init__()
+                self.order: list[str] = []
+
+            def reset_hard(self, repo_path: Path, sha: str) -> None:
+                self.order.append("reset")
+                super().reset_hard(repo_path, sha)
+
+            def run_git(self, repo_path: Path, args: list[str], **kwargs: object) -> object:
+                if list(args[:3]) == ["submodule", "deinit", "-f"]:
+                    self.order.append("deinit")
+                return super().run_git(repo_path, args, **kwargs)
+
+        ops = OrderOps()
+        service = ManualMergeSessionService(
+            ops=ops,
+            preflight_service=ManualPreflightService(),
+            file_conflicts_service=ManualFileConflictService(),
+        )
+        root_frame = RepositoryFrame(
+            repo_path=str(parent.resolve(strict=False)),
+            display_path=".",
+            depth=0,
+            original_head=original_head,
+            original_branch="main",
+            phase=SessionPhase.MERGE_PENDING,
+        )
+        sub_frame = RepositoryFrame(
+            repo_path=str((parent / "sub").resolve(strict=False)),
+            display_path="sub",
+            depth=1,
+            parent_repo_path=str(parent.resolve(strict=False)),
+            parent_gitlink_path="sub",
+            was_initialized=False,
+            phase=SessionPhase.MERGE_PENDING,
+        )
+        session = MergeSession.new(
+            root_repo_path=str(parent.resolve(strict=False)),
+            work_branch="main",
+            target_ref="feature",
+            repo_stack=[root_frame],
+            touched_frames=[sub_frame],
+        )
+        service.store.save(parent, session)
+
+        code = service.abort(argparse.Namespace(repo=str(parent), yes=True))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(ops.order, ["reset", "deinit"])
+        self.assertIsNone(service.store.load(parent))
+        self.assertFalse((parent / "sub" / ".git").exists())
+        self.assertNotIn("<<<<<<<", (parent / ".gitmodules").read_text(encoding="utf-8"))
+
     def test_failed_deinit_returns_failure_and_preserves_session(self) -> None:
         sub_src = init_repo(self.base / "sub_src")
         (sub_src / "file.txt").write_text("sub\n", encoding="utf-8")

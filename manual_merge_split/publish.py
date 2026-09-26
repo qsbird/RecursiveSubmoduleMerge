@@ -602,6 +602,12 @@ def run_publish_check(
         raise ops._automation_error(f"Remote does not exist in root repository: {remote}")
 
     ensure_no_in_progress_operations(collect_existing_repositories(repo_path, ops), ops)
+    print(
+        "Publish check runs git submodule update --init --recursive before building the plan. "
+        "That can initialize missing submodules and move existing submodule worktrees to the "
+        "gitlink commits recorded by HEAD; --check-only does not skip this step.",
+        file=_sys.stderr,
+    )
     update_result = ops.run_git(
         repo_path,
         ["submodule", "update", "--init", "--recursive"],

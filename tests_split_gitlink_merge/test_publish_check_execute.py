@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 from manual_merge_split.models import MergeAutomationError
 from manual_merge_split.publish import (
@@ -161,6 +163,23 @@ class PublishCheckTests(unittest.TestCase):
             self.assertTrue(result.success)
             self.assertTrue(result.check_only)
             self.assertGreaterEqual(len(result.items), 1)
+
+    def test_run_publish_check_warns_that_submodule_update_changes_worktrees(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, _submodule, ops = self.make_ops(temp_dir)
+            stderr = StringIO()
+            with mock.patch("manual_merge_split.publish._sys.stderr", stderr):
+                run_publish_check(
+                    root,
+                    remote="origin",
+                    push_target="publish-target",
+                    sync_local_branches=False,
+                    allow_suffix_branch=True,
+                    ops=ops,
+                )
+            warning = stderr.getvalue()
+            self.assertIn("git submodule update --init --recursive", warning)
+            self.assertIn("--check-only", warning)
 
     def test_run_publish_check_includes_display_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

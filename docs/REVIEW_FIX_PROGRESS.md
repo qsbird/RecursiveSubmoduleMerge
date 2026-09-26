@@ -31,13 +31,14 @@
 | 16 | P3 | `_classify_one` 与 `_reason_for` 的 mode 集合不一致，导致空 reason | 报告可读性 | 极低 | `[x]` |
 | 17 | P3 | 2 个测试在 Windows 上失败，套件常红 | 掩盖回归 | 极低 | `[x]` |
 | 18 | P3 | `test_remaining_split_facades` 66/77 测试默认静默 skip | 假覆盖 | 低 | `[-]` |
-| 19 | P3 | publish 的"仅检查"会执行 `submodule update` 改动工作树 | 意外副作用 | 低 | `[ ]` 暂缓 |
+| 19 | P3 | publish 的"仅检查"会执行 `submodule update` 改动工作树 | 意外副作用 | 低 | `[x]` |
 | 20 | P3 | `parse_missing_submodule_paths` 匹配 git 英文文案 | 恢复逻辑失效（fail-safe） | 低 | `[x]` |
 | 21 | HIGH | `staged_changed_paths` 用 `ACMR` 漏掉 type change（`T`） | 数据完整性 | 极低 | `[x]` |
 | 22 | HIGH | `run_cleanup` 不持 `command_lock`，session 失效失败仍继续 | 并发破坏 | 低 | `[x]` |
 | 23 | MEDIUM | abort 不记录/不还原最初未初始化的子模块 | 恢复不完整 | 中 | `[x]` |
 | 24 | MEDIUM | Windows `OpenProcess` 失败一律当死亡，可能误删活跃锁 | 并发破坏 | 极低 | `[x]` |
 | 25 | LOW | 打包路径检查在 `git ls-files` 失败时 SkipTest | 假覆盖 | 极低 | `[x]` |
+| 26 | MEDIUM | abort 的 deinit 忽略返回码，失败仍清 session 报成功 | 恢复不完整 | 低 | `[x]` |
 
 ## 已驳回的候选问题
 
@@ -277,12 +278,13 @@ OK
 唯一需要记住的是：套件标题里的用例总数**包含**这些不会在本仓库跑的对比测试，
 不要把它当作本仓库的覆盖度。
 
-### #19 publish 的"仅检查"会 `submodule update` — 仍暂缓
+### 已完成 #19 — publish 检查阶段不再静默改工作树
 
-需要改 `run_publish_check` 的用户可见行为，而 `publish.py` 在本轮开始前就有大量未提交改动。
-本轮只动了 `_run_checked_push` 的 locale 注入（#20），没有改 check 路径的工作树副作用。
+原先暂缓是因为 `publish.py` 有大量未提交改动。那些改动已提交（`publish.py` 工作树干净），本项落地。
 
-修法仍然是：check 模式下明确告知用户这一步会初始化子模块，而不是静默执行。
+- 影响分析：`impact("run_publish_check", upstream)` = **LOW**。
+- 行为不变：检查阶段仍必须 `submodule update --init --recursive` 才能看到嵌套 gitlink。
+- 改为在执行前向 stderr 说明这一点，`--check-only` 帮助文本、GUI「仅检查」选项和用户文档同步写明：仅检查仍会初始化子模块并可能移动其工作区。
 
 ---
 
@@ -339,6 +341,14 @@ OK
 
 - `git ls-files` 加上 `-c safe.directory=*`。
 - git 可执行文件不存在 → `SkipTest`；git 在场但命令失败 → `AssertionError`。
+
+### 已完成 #26 — abort deinit 失败不再假装成功
+
+- `_deinit_merge_initialized_submodule` 检查 `deinit` 返回码；非 0 或缺少 parent gitlink
+  元数据时抛错。`_abort` 在 `store.clear` 之前抛出，session 留在 `ABORTING` 供重试。
+- `_abort` 改为两遍恢复：先最深优先还原 `was_initialized=True` 的仓库（父仓库
+  `reset --hard` 会把冲突的 `.gitmodules` 还原），再 deinit 未初始化子模块。
+  影响分析：`impact("_abort", upstream)` = **LOW**。
 
 ---
 

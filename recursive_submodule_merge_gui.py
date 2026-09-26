@@ -166,8 +166,8 @@ UI_TEXT: dict[str, dict[str, str]] = {
     "label_publish_remote": {LANGUAGE_EN: "Remote", LANGUAGE_ZH: "远端"},
     "label_publish_target": {LANGUAGE_EN: "Push target branch (required)", LANGUAGE_ZH: "推送目标分支（必填）"},
     "option_publish_check_only": {
-        LANGUAGE_EN: "Check only",
-        LANGUAGE_ZH: "仅检查",
+        LANGUAGE_EN: "Check only (still initializes submodules)",
+        LANGUAGE_ZH: "仅检查（仍会初始化子模块）",
     },
     "option_publish_sync_local_branches": {
         LANGUAGE_EN: "Sync local branch refs",

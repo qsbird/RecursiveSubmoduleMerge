@@ -402,7 +402,13 @@ class ManualMergeSessionService:
             return 1
         session = replace(session, phase=SessionPhase.ABORTING)
         session = self.store.save(root, session)
-        for frame in self._frames_to_restore(session):
+        # Restore initialized repositories first so a parent ``reset --hard``
+        # can put ``.gitmodules`` back before ``submodule deinit`` runs.
+        # Uninitialized frames are deinitialized afterwards, still deepest-first.
+        frames = self._frames_to_restore(session)
+        for frame in [item for item in frames if item.was_initialized]:
+            self._restore_frame(frame)
+        for frame in [item for item in frames if not item.was_initialized]:
             self._restore_frame(frame)
         self.store.clear(root)
         self._remove_pause_report(session)
